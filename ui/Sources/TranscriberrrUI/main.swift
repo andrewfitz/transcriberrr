@@ -328,16 +328,19 @@ final class AppState: ObservableObject {
 
     func setSelection(for item: AudioItem, _ selected: Bool) {
         item.selected = selected
+        objectWillChange.send()
         saveQueue()
     }
 
     func setDiarization(for item: AudioItem, enabled: Bool) {
         item.diarize = enabled
+        objectWillChange.send()
         saveQueue()
     }
 
     func setSpeakerCount(for item: AudioItem, _ value: Int?) {
         item.speakerCount = value
+        objectWillChange.send()
         saveQueue()
     }
 
@@ -367,6 +370,7 @@ final class AppState: ObservableObject {
 
     func selectAll(_ visibleItems: [AudioItem], selected: Bool) {
         visibleItems.forEach { $0.selected = selected }
+        objectWillChange.send()
         saveQueue()
     }
 
