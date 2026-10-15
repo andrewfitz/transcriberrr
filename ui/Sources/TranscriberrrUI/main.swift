@@ -41,6 +41,7 @@ enum ItemState: Equatable {
     case queued
     case processing
     case done
+    case canceled
     case failed(String)
 
     var label: String {
@@ -48,6 +49,7 @@ enum ItemState: Equatable {
         case .queued: "Queued"
         case .processing: "Transcribing"
         case .done: "Complete"
+        case .canceled: "Canceled"
         case .failed(let message): message
         }
     }
@@ -57,6 +59,7 @@ enum ItemState: Equatable {
         case .queued: "queued"
         case .processing: "processing"
         case .done: "done"
+        case .canceled: "canceled"
         case .failed: "failed"
         }
     }
@@ -207,10 +210,12 @@ final class AppState: ObservableObject {
     @Published var modelActivityProgress: Double?
     @Published var modelActivityCanDismiss = false
     @Published var modelActivitySucceeded = false
+    @Published var isCancelling = false
 
     private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "mp3", "ogg", "wav", "webm"]
     private var pendingSave: Task<Void, Never>?
     private var cachedModelStatusValue: String?
+    private var activeProcess: Process?
 
     private var queueFile: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -225,7 +230,8 @@ final class AppState: ObservableObject {
     var completedCount: Int { items.filter { if case .done = $0.state { return true }; return false }.count }
     var totalDuration: TimeInterval { items.reduce(0) { $0 + $1.duration } }
     var activeStatus: String {
-        items.first(where: { $0.state == .processing })?.resultSummary ?? "Preparing…"
+        if isCancelling { return "Stopping safely…" }
+        return items.first(where: { $0.state == .processing })?.resultSummary ?? "Preparing…"
     }
     var queueProgress: Double {
         guard !items.isEmpty else { return 0 }
@@ -413,9 +419,27 @@ final class AppState: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url { completion(url) }
     }
 
+    func cancelTranscription() {
+        guard isRunning else { return }
+        isCancelling = true
+        modelActivityMessage = "Stopping safely and cleaning temporary queue files…"
+        activeProcess?.terminate()
+    }
+
+    private func markCanceled(_ pending: [AudioItem]) {
+        for item in pending where item.state != .done {
+            item.state = .canceled
+            item.progress = 0
+            item.resultSummary = "Canceled"
+        }
+        objectWillChange.send()
+        saveQueue()
+    }
+
     func transcribe() {
         guard !items.isEmpty, !isRunning else { return }
         isRunning = true
+        isCancelling = false
         Task { @MainActor in
             if outputDestination == .folder {
                 try? FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
@@ -435,14 +459,19 @@ final class AppState: ObservableObject {
                 modelActivityLog = modelDownloads.map { "Model: \($0)" }
                 let result = await downloadModels(modelDownloads)
                 if result.status != 0 {
-                    pending.forEach {
-                        $0.state = .failed("Model setup failed")
-                        $0.resultSummary = "Model setup failed; see the model activity window."
+                    if isCancelling {
+                        markCanceled(pending)
+                    } else {
+                        pending.forEach {
+                            $0.state = .failed("Model setup failed")
+                            $0.resultSummary = "Model setup failed; see the model activity window."
+                        }
                     }
                     modelActivityMessage = result.message.isEmpty ? "Model setup failed." : result.message
                     modelActivityCanDismiss = true
                     modelActivitySucceeded = false
                     isRunning = false
+                    isCancelling = false
                     saveQueue()
                     return
                 }
@@ -474,15 +503,23 @@ final class AppState: ObservableObject {
                     saveQueue()
                     let output = uniqueOutput(expectedOutput(for: item), reserved: &reservedOutputs)
                     let result = await runCLI(for: item, outputOverride: output)
+                    if isCancelling { break }
                     apply(result, to: item)
                     saveQueue()
                 }
             } else if !pending.isEmpty {
                 let result = await runBulkCLI(for: pending)
-                applyBulk(result, to: pending)
+                if isCancelling {
+                    markCanceled(pending)
+                } else {
+                    applyBulk(result, to: pending)
+                }
                 saveQueue()
             }
+            if isCancelling { markCanceled(pending) }
             isRunning = false
+            isCancelling = false
+            activeProcess = nil
             saveQueue()
         }
     }
@@ -580,14 +617,17 @@ final class AppState: ObservableObject {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let message = String(data: data, encoding: .utf8) ?? ""
                 Task { @MainActor in
+                    if self.activeProcess === process { self.activeProcess = nil }
                     if !message.isEmpty { self.appendModelActivity(message) }
                     continuation.resume(returning: (process.terminationStatus, message))
                 }
             }
             do {
+                activeProcess = process
                 try process.run()
             } catch {
                 pipe.fileHandleForReading.readabilityHandler = nil
+                activeProcess = nil
                 continuation.resume(returning: (1, error.localizedDescription))
             }
         }
@@ -695,10 +735,17 @@ final class AppState: ObservableObject {
             process.terminationHandler = { process in
                 let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
                 let message = String(data: data, encoding: .utf8) ?? ""
+                Task { @MainActor in
+                    if self.activeProcess === process { self.activeProcess = nil }
+                }
                 continuation.resume(returning: (process.terminationStatus, message, output))
             }
-            do { try process.run() } catch {
+            do {
+                activeProcess = process
+                try process.run()
+            } catch {
                 process.terminationHandler = nil
+                activeProcess = nil
                 continuation.resume(returning: (1, error.localizedDescription, nil))
             }
         }
@@ -766,10 +813,17 @@ final class AppState: ObservableObject {
             let result = await withCheckedContinuation { continuation in
                 process.terminationHandler = { process in
                     let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    Task { @MainActor in
+                        if self.activeProcess === process { self.activeProcess = nil }
+                    }
                     continuation.resume(returning: (process.terminationStatus, String(data: data, encoding: .utf8) ?? ""))
                 }
-                do { try process.run() } catch {
+                do {
+                    activeProcess = process
+                    try process.run()
+                } catch {
                     process.terminationHandler = nil
+                    activeProcess = nil
                     continuation.resume(returning: (1, error.localizedDescription))
                 }
             }
@@ -777,9 +831,11 @@ final class AppState: ObservableObject {
             await progressPoller.value
             let events = progressReader.read(from: progressURL)
             try? FileManager.default.removeItem(at: temporaryRoot)
+            try? FileManager.default.removeItem(at: temporaryRoot.deletingLastPathComponent())
             return (result.0, result.1, events)
         } catch {
             try? FileManager.default.removeItem(at: temporaryRoot)
+            try? FileManager.default.removeItem(at: temporaryRoot.deletingLastPathComponent())
             return (1, error.localizedDescription, [:])
         }
     }
@@ -808,7 +864,7 @@ final class AppState: ObservableObject {
             guard FileManager.default.fileExists(atPath: url.path) else { return nil }
             let item = AudioItem(url: url, id: value.id, duration: value.duration, diarize: value.diarize,
                                  speakerCount: value.diarize ? value.speakerCount : nil)
-            item.state = value.state == "done" ? .done : value.state == "processing" ? .queued : value.state == "failed" ? .failed(value.error ?? "Transcription failed") : .queued
+            item.state = value.state == "done" ? .done : value.state == "processing" ? .queued : value.state == "canceled" ? .canceled : value.state == "failed" ? .failed(value.error ?? "Transcription failed") : .queued
             item.progress = value.progress
             item.selected = value.selected
             item.outputURL = value.outputPath.map(URL.init(fileURLWithPath:))
@@ -943,11 +999,19 @@ private struct ModelActivitySheet: View {
             }
             HStack {
                 Spacer()
-                Button(state.modelActivityCanDismiss ? "Close" : "Working…") {
-                    state.showModelActivity = false
+                if state.isRunning {
+                    Button(state.isCancelling ? "Stopping…" : "Cancel") {
+                        state.cancelTranscription()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(state.isCancelling)
                 }
-                .keyboardShortcut(.defaultAction)
-                .disabled(!state.modelActivityCanDismiss)
+                if state.modelActivityCanDismiss {
+                    Button("Close") {
+                        state.showModelActivity = false
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
             }
         }
         .padding(24)
@@ -1270,9 +1334,12 @@ struct ContentView: View {
                         Text(state.activeStatus).font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                Button(state.isRunning ? "Transcribing…" : "Transcribe") { state.transcribe() }
+                Button(state.isRunning ? (state.isCancelling ? "Stopping…" : "Cancel") : "Transcribe") {
+                    if state.isRunning { state.cancelTranscription() } else { state.transcribe() }
+                }
+                .keyboardShortcut(state.isRunning ? .cancelAction : .defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .disabled(state.items.isEmpty || state.isRunning)
+                    .disabled(state.items.isEmpty || state.isCancelling)
             }
             if state.timestamps != "none" {
                 Text("JSON stores each word with start and end seconds; SRT and VTT write one cue per word.")
