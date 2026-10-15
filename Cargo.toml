@@ -8,7 +8,7 @@ license = "MIT"
 
 [features]
 default = []
-## Enable the Parakeet v3 Burn/Metal backend.  Diarization reuses the same crate but remains
+## Enable the Parakeet Unified Burn/Metal backend. Diarization reuses the same crate but remains
 ## independently optional for users who only need the ASR engine.
 parakeet = ["dep:parakeet-rs"]
 diarization = ["parakeet"]

@@ -4,7 +4,7 @@ Offline English transcription for Apple Silicon Macs. Transcriberrr ships a nati
 
 ## Features
 
-- Qwen3-ASR 1.7B (default), Parakeet TDT v3, or Apple SpeechTranscriber (macOS 26+).
+- Qwen3-ASR 1.7B (default), the latest English Parakeet Unified 0.6B export, or Apple SpeechTranscriber (macOS 26+).
 - Metal GPU execution on Apple Silicon, with a CPU fallback for the Rust engines.
 - Word-level or sentence timestamps in JSON, SRT, and WebVTT; plain TXT is available without timestamps.
 - Optional Sortformer speaker diarization, including a per-job speaker limit.
@@ -22,7 +22,7 @@ Release archives should be built on an Apple Silicon Mac and distributed with a 
 Requirements: Apple Silicon macOS, Xcode Command Line Tools, Swift 6, and Rust 1.99 or newer. `rust-toolchain.toml` selects the stable Rust toolchain.
 
 ```bash
-# CLI with Parakeet v3 and Sortformer support
+# CLI with Parakeet Unified and Sortformer support
 cargo build --release --features diarization
 
 # Native app bundle; also embeds the matching CLI and SpeechTranscriber helper
@@ -30,7 +30,7 @@ cargo build --release --features diarization
 open dist/Transcriberrr.app
 ```
 
-The build script refuses non-`Darwin arm64` hosts. For a CLI-only build, use `cargo build --release`; add `--features parakeet` for Parakeet v3 without diarization. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` are the required checks.
+The build script refuses non-`Darwin arm64` hosts. For a CLI-only build, use `cargo build --release`; add `--features parakeet` for the Parakeet Unified engine without diarization. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` are the required checks.
 
 ## CLI quick start
 
@@ -45,7 +45,7 @@ The build script refuses non-`Darwin arm64` hosts. For a CLI-only build, use `ca
 ./target/release/transcriberrr --input-dir recordings --recursive \
   --output-dir transcripts --progress-file transcripts.jsonl --resume
 
-# Parakeet v3 or Apple system model
+# Latest English Parakeet Unified model or Apple system model
 ./target/release/transcriberrr interview.wav --engine parakeet-v3
 ./target/release/transcriberrr interview.wav --engine apple-native
 ```
@@ -74,7 +74,7 @@ The ONNX graph must be a Sortformer v3 export with `preds_diar` and `preds_hires
 
 ## Model and audio notes
 
-Supported inputs are AAC, AIFF/AIF, CAF, FLAC, M4A, MP3, OGG, WAV, and WebM. Qwen3-ASR and the forced aligner are downloaded from their Hugging Face repositories. Parakeet v3 uses [istupakov/parakeet-tdt-0.6b-v3-onnx](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx). Sortformer and Parakeet exports are third-party artifacts; review and accept each repository license before downloading or redistributing them. Transcriberrr does not bundle model weights or grant rights to redistribute them. Source code is MIT licensed; see [LICENSE](LICENSE).
+Supported inputs are AAC, AIFF/AIF, CAF, FLAC, M4A, MP3, OGG, WAV, and WebM. Qwen3-ASR and the forced aligner are downloaded from their Hugging Face repositories. The default Parakeet engine uses the newer English Unified model, [nvidia/parakeet-unified-en-0.6b](https://huggingface.co/nvidia/parakeet-unified-en-0.6b), through the Rust-compatible [eschmidbauer/parakeet-unified-en-0.6b-onnx](https://huggingface.co/eschmidbauer/parakeet-unified-en-0.6b-onnx) export. The previous TDT v3 export remains available for compatibility with `--model istupakov/parakeet-tdt-0.6b-v3-onnx`. Sortformer and Parakeet exports are third-party artifacts; review and accept each repository license before downloading or redistributing them. Transcriberrr does not bundle model weights or grant rights to redistribute them. Source code is MIT licensed; see [LICENSE](LICENSE).
 
 The Rust Qwen and Parakeet backends use Metal; they do not use the Apple Neural Engine. `--device coreml` reports an explicit unsupported-device error for those engines. Apple-native mode uses Apple on-device Speech framework.
 

@@ -15,8 +15,10 @@ use std::path::{Path, PathBuf};
 pub const QWEN3_ASR_17B: &str = "Qwen/Qwen3-ASR-1.7B";
 pub const QWEN3_ASR_06B: &str = "Qwen/Qwen3-ASR-0.6B";
 pub const QWEN3_ALIGNER_06B: &str = "Qwen/Qwen3-ForcedAligner-0.6B";
-/// ONNX Parakeet v3 model distributed by the community for parakeet-rs.
-pub const PARAKEET_V3: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
+/// Latest English Parakeet Unified RNNT ONNX export compatible with parakeet-rs.
+pub const PARAKEET_UNIFIED_EN: &str = "eschmidbauer/parakeet-unified-en-0.6b-onnx";
+/// Legacy multilingual TDT v3 ONNX export, retained for explicit `--model` overrides.
+pub const PARAKEET_TDT_V3: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
 /// Sortformer v3 ONNX export compatible with parakeet-rs. The repository also contains unrelated
 /// exports, so the downloader below fetches only the compatible graph.
 pub const SORTFORMER_4SPK: &str = "altunenes/parakeet-rs";
@@ -46,9 +48,9 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         description: "Qwen3 word-level forced aligner 0.6B",
     },
     ModelSpec {
-        id: PARAKEET_V3,
+        id: PARAKEET_UNIFIED_EN,
         kind: "asr",
-        description: "Parakeet TDT v3 ONNX (optional engine)",
+        description: "Parakeet Unified English 0.6B ONNX (latest)",
     },
     ModelSpec {
         id: SORTFORMER_4SPK,
@@ -108,6 +110,23 @@ impl ModelCache {
             return repo
                 .get(SORTFORMER_FILE)
                 .with_context(|| format!("downloading {id_or_path}/{SORTFORMER_FILE}"));
+        }
+        if id_or_path == PARAKEET_UNIFIED_EN {
+            let files = [
+                "onnx_fp32/encoder.onnx",
+                "onnx_fp32/encoder.onnx.data",
+                "onnx_fp32/decoder_joint.onnx",
+                "onnx_fp32/decoder_joint.onnx.data",
+                "onnx_fp32/tokenizer.model",
+            ];
+            for file in files {
+                repo.get(file)
+                    .with_context(|| format!("downloading {id_or_path}/{file}"))?;
+            }
+            return repo
+                .get("onnx_fp32/encoder.onnx")
+                .map(|file| file.parent().map(Path::to_path_buf).unwrap_or(file))
+                .with_context(|| format!("model {id_or_path:?} has no unified ONNX entry point"));
         }
         let info = repo
             .info()
@@ -177,6 +196,20 @@ impl ModelCache {
         {
             return Some(file);
         }
+        if id == PARAKEET_UNIFIED_EN {
+            let files = [
+                "onnx_fp32/encoder.onnx",
+                "onnx_fp32/encoder.onnx.data",
+                "onnx_fp32/decoder_joint.onnx",
+                "onnx_fp32/decoder_joint.onnx.data",
+                "onnx_fp32/tokenizer.model",
+            ];
+            if files.iter().all(|file| repo.get(file).is_some()) {
+                return repo
+                    .get("onnx_fp32/encoder.onnx")
+                    .and_then(|file| file.parent().map(Path::to_path_buf));
+            }
+        }
         None
     }
 }
@@ -209,7 +242,11 @@ pub fn canonical_id(value: &str) -> String {
         "qwen3-asr-1.7b" | "qwen-1.7b" => QWEN3_ASR_17B.to_owned(),
         "qwen3-asr-0.6b" | "qwen-0.6b" => QWEN3_ASR_06B.to_owned(),
         "qwen3-forced-aligner-0.6b" | "forced-aligner" => QWEN3_ALIGNER_06B.to_owned(),
-        "parakeet-v3" | "parakeet-tdt-v3" => PARAKEET_V3.to_owned(),
+        "parakeet-v3"
+        | "parakeet-unified"
+        | "parakeet-unified-en"
+        | "nvidia/parakeet-unified-en-0.6b" => PARAKEET_UNIFIED_EN.to_owned(),
+        "parakeet-tdt-v3" => PARAKEET_TDT_V3.to_owned(),
         "sortformer-4spk" | "sortformer" => SORTFORMER_4SPK.to_owned(),
         other => other.to_owned(),
     }
@@ -231,7 +268,11 @@ mod tests {
 
     #[test]
     fn aliases_are_stable() {
-        assert_eq!(canonical_id("parakeet-v3"), PARAKEET_V3);
+        assert_eq!(canonical_id("parakeet-v3"), PARAKEET_UNIFIED_EN);
+        assert_eq!(
+            canonical_id("nvidia/parakeet-unified-en-0.6b"),
+            PARAKEET_UNIFIED_EN
+        );
         assert_eq!(canonical_id("qwen3-asr-1.7b"), QWEN3_ASR_17B);
     }
 }

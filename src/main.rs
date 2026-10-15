@@ -55,7 +55,8 @@ struct Cli {
     /// Hugging Face model ID or local directory. Defaults to the newest 2026 1.7B model.
     #[arg(long, default_value = "Qwen/Qwen3-ASR-1.7B")]
     model: String,
-    /// Recognition backend. Parakeet v3 expects a local/cache directory containing its ONNX export.
+    /// Recognition backend. Parakeet uses the latest English Unified ONNX export by default;
+    /// pass an explicit legacy TDT model path with `--model` when needed.
     #[arg(long, value_enum, default_value_t = EngineKind::Qwen3)]
     engine: EngineKind,
     /// Root directory for downloaded model snapshots. Defaults to the macOS application-support cache.
@@ -381,9 +382,7 @@ fn main() -> Result<()> {
     }
     #[cfg(not(feature = "parakeet"))]
     if matches!(cli.engine, EngineKind::ParakeetV3) {
-        bail!(
-            "Parakeet v3 support is not included in this build; rebuild with --features parakeet"
-        );
+        bail!("Parakeet support is not included in this build; rebuild with --features parakeet");
     }
     if matches!(cli.format, OutputFormat::Txt)
         && !matches!(cli.timestamps, TimestampGranularity::None)

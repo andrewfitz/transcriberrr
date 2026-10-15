@@ -265,8 +265,8 @@ final class AppState: ObservableObject {
 
     func selectEngine(_ value: String) {
         if value == "parakeet-v3" && modelID == "Qwen/Qwen3-ASR-1.7B" {
-            modelID = "istupakov/parakeet-tdt-0.6b-v3-onnx"
-        } else if value == "qwen" && modelID == "istupakov/parakeet-tdt-0.6b-v3-onnx" {
+            modelID = "eschmidbauer/parakeet-unified-en-0.6b-onnx"
+        } else if value == "qwen" && (modelID == "eschmidbauer/parakeet-unified-en-0.6b-onnx" || modelID == "istupakov/parakeet-tdt-0.6b-v3-onnx") {
             modelID = "Qwen/Qwen3-ASR-1.7B"
         }
         if value == "apple-native" {
@@ -289,11 +289,18 @@ final class AppState: ObservableObject {
 
     private func cachedModel(_ id: String) -> Bool {
         guard !id.isEmpty, !id.hasPrefix("/") else { return false }
+        let normalizedID: String
+        switch id {
+        case "parakeet-v3", "parakeet-unified", "parakeet-unified-en", "nvidia/parakeet-unified-en-0.6b":
+            normalizedID = "eschmidbauer/parakeet-unified-en-0.6b-onnx"
+        default:
+            normalizedID = id
+        }
         let root = ProcessInfo.processInfo.environment["TRANSCRIBERRR_MODEL_CACHE"]
             .map(URL.init(fileURLWithPath:))
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/Transcriberrr/models/hub")
-        let encoded = id.replacingOccurrences(of: "/", with: "--")
+        let encoded = normalizedID.replacingOccurrences(of: "/", with: "--")
         let snapshots = root.appendingPathComponent("models--\(encoded)/snapshots", isDirectory: true)
         guard let revisions = try? FileManager.default.contentsOfDirectory(
             at: snapshots,
@@ -304,6 +311,11 @@ final class AppState: ObservableObject {
         // behind by an interrupted download and must not be shown as ready.
         return revisions.contains { revision in
             guard (try? revision.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return false }
+            if normalizedID == "eschmidbauer/parakeet-unified-en-0.6b-onnx" {
+                let unified = revision.appendingPathComponent("onnx_fp32", isDirectory: true)
+                return ["encoder.onnx", "encoder.onnx.data", "decoder_joint.onnx", "decoder_joint.onnx.data", "tokenizer.model"]
+                    .allSatisfy { FileManager.default.fileExists(atPath: unified.appendingPathComponent($0).path) }
+            }
             let config = revision.appendingPathComponent("config.json")
             guard FileManager.default.fileExists(atPath: config.path) else { return false }
             let markers = [
@@ -699,7 +711,7 @@ final class AppState: ObservableObject {
         let process = Process()
         let isNative = engine == "apple-native"
         if isNative && item.diarize {
-            return (1, "Apple SpeechTranscriber does not provide diarization; choose Qwen3 or Parakeet v3 for speaker labels.", nil)
+            return (1, "Apple SpeechTranscriber does not provide diarization; choose Qwen3 or Parakeet Unified for speaker labels.", nil)
         }
         let executableURL = isNative ? nativeURL : cliURL
         guard let executableURL else {
@@ -1234,7 +1246,7 @@ struct ContentView: View {
                         Picker("", selection: $state.engine) {
                             Text("Qwen3 ASR (Metal)").tag("qwen")
                             Text("Apple SpeechTranscriber").tag("apple-native")
-                            Text("Parakeet v3").tag("parakeet-v3")
+                            Text("Parakeet Unified EN (latest)").tag("parakeet-v3")
                         }
                         .labelsHidden().pickerStyle(.menu).frame(width: 190)
                     }

@@ -1,4 +1,4 @@
-//! Parakeet v3 (FastConformer-TDT) backend.
+//! Parakeet Unified English and legacy TDT backends.
 //!
 //! This module deliberately keeps model loading separate from the CLI.  Parakeet's
 //! model files are downloaded into the user's cache at runtime (rather than being
@@ -10,11 +10,13 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetTDT, TimestampMode, Transcriber};
+use parakeet_rs::{
+    ExecutionConfig, ExecutionProvider, ParakeetTDT, ParakeetUnified, TimestampMode, Transcriber,
+};
 
-/// NVIDIA Parakeet TDT v3 ONNX export.  The directory must contain
-/// `encoder-model.onnx`, `decoder_joint-model.onnx`, and `vocab.txt`.
-pub const DEFAULT_MODEL_ID: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
+/// Latest English Parakeet Unified ONNX export. The directory must contain
+/// `encoder.onnx`, `decoder_joint.onnx`, and `tokenizer.model`.
+pub const DEFAULT_MODEL_ID: &str = crate::model_cache::PARAKEET_UNIFIED_EN;
 
 /// A timestamped item returned by Parakeet.  Times are seconds from the start of
 /// the input and are suitable for the common JSON/SRT/VTT writers.
@@ -32,11 +34,17 @@ pub struct ParakeetTranscript {
 }
 
 pub struct ParakeetEngine {
-    model: ParakeetTDT,
+    model: ParakeetBackend,
+}
+
+enum ParakeetBackend {
+    Unified(ParakeetUnified),
+    Tdt(ParakeetTDT),
 }
 
 impl ParakeetEngine {
-    /// Load a v3 TDT export from a local cache directory.
+    /// Load the Unified export by default, while retaining compatibility with
+    /// the older TDT v3 directory layout when an explicit legacy path is used.
     ///
     /// `use_metal` selects Burn's WGPU backend (Metal on macOS).  The CPU
     /// fallback is useful for diagnostics and machines without a GPU.
@@ -47,8 +55,20 @@ impl ParakeetEngine {
             ExecutionProvider::BurnCpu
         };
         let config = ExecutionConfig::new().with_execution_provider(provider);
-        let model = ParakeetTDT::from_pretrained(path, Some(config))
-            .with_context(|| format!("loading Parakeet v3 model from {}", path.display()))?;
+        let model = if path.join("tokenizer.model").is_file() && path.join("encoder.onnx").is_file()
+        {
+            ParakeetBackend::Unified(
+                ParakeetUnified::from_pretrained(path, Some(config)).with_context(|| {
+                    format!("loading Parakeet Unified model from {}", path.display())
+                })?,
+            )
+        } else {
+            ParakeetBackend::Tdt(
+                ParakeetTDT::from_pretrained(path, Some(config)).with_context(|| {
+                    format!("loading legacy Parakeet TDT model from {}", path.display())
+                })?,
+            )
+        };
         Ok(Self { model })
     }
 
@@ -63,10 +83,15 @@ impl ParakeetEngine {
             // consistent with Qwen's no-timestamp path.
             TimestampMode::Words
         };
-        let result = self
-            .model
-            .transcribe_samples(samples.to_vec(), 16_000, 1, Some(mode))
-            .context("Parakeet v3 transcription failed")?;
+        let result = match &mut self.model {
+            ParakeetBackend::Unified(model) => {
+                model.transcribe_samples(samples.to_vec(), 16_000, 1, Some(mode))
+            }
+            ParakeetBackend::Tdt(model) => {
+                model.transcribe_samples(samples.to_vec(), 16_000, 1, Some(mode))
+            }
+        }
+        .context("Parakeet transcription failed")?;
         let words = result
             .tokens
             .into_iter()
