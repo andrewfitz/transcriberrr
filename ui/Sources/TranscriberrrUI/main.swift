@@ -871,9 +871,15 @@ struct ContentView: View {
     private func queueRow(_ item: AudioItem) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
-                Toggle("", isOn: Binding(get: { item.selected }, set: { state.setSelection(for: item, $0) }))
-                    .labelsHidden().toggleStyle(.checkbox)
+                Button {
+                    state.setSelection(for: item, !item.selected)
+                } label: {
+                    Image(systemName: item.selected ? "checkmark.square.fill" : "square")
+                }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(item.selected ? .primary : .secondary)
                     .accessibilityLabel("Include \(item.url.lastPathComponent) in transcription")
+                    .accessibilityValue(item.selected ? "On" : "Off")
                     .disabled(state.isRunning)
                 Image(systemName: item.diarize ? "person.2.wave.2" : "waveform")
                     .foregroundStyle(.tint).frame(width: 22)
@@ -918,7 +924,7 @@ struct ContentView: View {
                         Text("Auto").tag(0)
                         ForEach(1...8, id: \.self) { count in Text("\(count)").tag(count) }
                     }
-                    .pickerStyle(.menu).font(.caption).frame(width: 100)
+                    .pickerStyle(.menu).font(.caption).frame(width: 140)
                 }
                 Spacer()
             }
@@ -929,75 +935,88 @@ struct ContentView: View {
 
     private var footer: some View {
         VStack(spacing: 12) {
-            HStack(spacing: 16) {
-                setting("Engine") {
-                    Picker("", selection: $state.engine) {
-                        Text("Qwen3 ASR (Metal)").tag("qwen")
-                        Text("Apple SpeechTranscriber").tag("apple-native")
-                        Text("Parakeet v3").tag("parakeet-v3")
-                    }
-                    .labelsHidden().pickerStyle(.menu)
-                }
-                setting("Model") {
-                    TextField("Hugging Face ID or local path", text: $state.modelID)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 210)
-                }
-                Text(state.modelStatus)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                setting("Output") {
-                    Picker("", selection: $state.outputDestination) {
-                        ForEach(OutputDestination.allCases) { destination in Text(destination.title).tag(destination) }
-                    }
-                    .labelsHidden().pickerStyle(.menu)
-                }
-                if state.outputDestination == .folder {
-                    Button(state.outputFolder.path) { state.chooseFolder(state.outputFolder) { state.outputFolder = $0; state.saveQueue() } }
-                        .buttonStyle(.borderless).lineLimit(1).frame(maxWidth: 180, alignment: .leading)
-                }
-                setting("Acceleration") {
-                    Picker("", selection: $state.device) { Text("Metal GPU").tag("metal"); Text("CPU").tag("cpu") }
-                        .labelsHidden().pickerStyle(.menu)
-                }
-                setting("Format") {
-                    Picker("", selection: Binding(
-                        get: { state.format },
-                        set: { format in
-                            state.format = format
-                            if format == "txt" { state.timestamps = "none" }
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 16) {
+                    setting("Engine") {
+                        Picker("", selection: $state.engine) {
+                            Text("Qwen3 ASR (Metal)").tag("qwen")
+                            Text("Apple SpeechTranscriber").tag("apple-native")
+                            Text("Parakeet v3").tag("parakeet-v3")
                         }
-                    )) {
-                        Text("JSON").tag("json")
-                        Text("Text").tag("txt")
-                        Text("SRT").tag("srt")
-                        Text("VTT").tag("vtt")
+                        .labelsHidden().pickerStyle(.menu).frame(width: 190)
                     }
-                        .labelsHidden().pickerStyle(.menu)
+                    setting("Model") {
+                        TextField("Hugging Face ID or local path", text: $state.modelID)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 300)
+                    }
+                    Text(state.modelStatus).font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
                 }
-                Toggle("Include timestamps", isOn: Binding(
-                    get: { state.timestamps != "none" },
-                    set: { enabled in
-                        if enabled {
-                            if state.format == "txt" { state.format = "json" }
-                            state.timestamps = "words"
-                        } else {
-                            state.timestamps = "none"
+                HStack(spacing: 16) {
+                    setting("Output") {
+                        Picker("", selection: $state.outputDestination) {
+                            ForEach(OutputDestination.allCases) { destination in Text(destination.title).tag(destination) }
                         }
+                        .labelsHidden().pickerStyle(.menu).frame(width: 170)
                     }
-                ))
-                .toggleStyle(.checkbox)
-                if state.timestamps != "none" {
-                    setting("Timestamp level") {
-                        Picker("", selection: $state.timestamps) {
-                            Text("Word level").tag("words")
-                            Text("Sentence level").tag("sentences")
-                        }
-                        .labelsHidden().pickerStyle(.menu)
+                    if state.outputDestination == .folder {
+                        Button(state.outputFolder.path) { state.chooseFolder(state.outputFolder) { state.outputFolder = $0; state.saveQueue() } }
+                            .buttonStyle(.borderless).lineLimit(1).frame(maxWidth: 300, alignment: .leading)
                     }
+                    Spacer()
                 }
-                Toggle("Diarization default", isOn: Binding(get: { state.diarize }, set: { state.diarize = $0; state.saveQueue() }))
+                HStack(spacing: 16) {
+                    setting("Acceleration") {
+                        Picker("", selection: $state.device) { Text("Metal GPU").tag("metal"); Text("CPU").tag("cpu") }
+                            .labelsHidden().pickerStyle(.menu).frame(width: 130)
+                    }
+                    setting("Format") {
+                        Picker("", selection: Binding(
+                            get: { state.format },
+                            set: { format in
+                                state.format = format
+                                if format == "txt" { state.timestamps = "none" }
+                            }
+                        )) {
+                            Text("JSON").tag("json")
+                            Text("Text").tag("txt")
+                            Text("SRT").tag("srt")
+                            Text("VTT").tag("vtt")
+                        }
+                        .labelsHidden().pickerStyle(.menu).frame(width: 100)
+                    }
+                    Toggle("Include timestamps", isOn: Binding(
+                        get: { state.timestamps != "none" },
+                        set: { enabled in
+                            if enabled {
+                                if state.format == "txt" { state.format = "json" }
+                                state.timestamps = "words"
+                            } else {
+                                state.timestamps = "none"
+                            }
+                        }
+                    ))
                     .toggleStyle(.checkbox)
+                    if state.timestamps != "none" {
+                        setting("Timestamp level") {
+                            Picker("", selection: $state.timestamps) {
+                                Text("Word level").tag("words")
+                                Text("Sentence level").tag("sentences")
+                            }
+                            .labelsHidden().pickerStyle(.menu).frame(width: 150)
+                        }
+                    }
+                    Button {
+                        state.diarize.toggle()
+                        state.saveQueue()
+                    } label: {
+                        Label("Diarization default", systemImage: state.diarize ? "checkmark.square.fill" : "square")
+                    }
+                        .buttonStyle(.borderless)
+                        .accessibilityValue(state.diarize ? "On" : "Off")
+                    Spacer()
+                }
             }
             .disabled(state.isRunning)
             if state.diarize {
