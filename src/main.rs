@@ -906,16 +906,16 @@ fn decode_audio(path: &Path) -> Result<Audio> {
     if sample_rate == 0 {
         bail!("audio stream has an invalid zero sample rate");
     }
-    let channels = track
+    // Some AAC/M4A files omit the channel layout in container metadata even though the
+    // decoder provides it on the first decoded buffer. Keep that case recoverable.
+    let declared_channels = track
         .codec_params
         .channels
-        .context("audio stream has no channel count")?
-        .count();
-    if channels == 0 {
-        bail!("audio stream has an invalid zero channel count");
-    }
+        .map(|value| value.count())
+        .unwrap_or(0);
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
     let mut interleaved = Vec::new();
+    let mut decoded_channels = declared_channels;
     loop {
         let packet = match format.next_packet() {
             Ok(packet) if packet.track_id() == track_id => packet,
@@ -932,12 +932,19 @@ fn decode_audio(path: &Path) -> Result<Audio> {
             Err(SymphoniaError::IoError(error)) => return Err(error.into()),
             Err(error) => return Err(error.into()),
         };
-        append_decoded(decoder.decode(&packet)?, &mut interleaved);
+        append_decoded(
+            decoder.decode(&packet)?,
+            &mut interleaved,
+            &mut decoded_channels,
+        );
     }
     // Consume each intermediate buffer where possible.  Long recordings can contain
     // millions of samples; avoiding clones here keeps peak RSS substantially lower
     // before the model receives the waveform.
-    let mono = downmix(interleaved, channels);
+    if decoded_channels == 0 {
+        bail!("audio stream has no decodable channel count");
+    }
+    let mono = downmix(interleaved, decoded_channels);
     let samples = resample_linear(mono, sample_rate, TARGET_SAMPLE_RATE);
     Ok(Audio {
         duration_seconds: samples.len() as f32 / TARGET_SAMPLE_RATE as f32,
@@ -945,7 +952,10 @@ fn decode_audio(path: &Path) -> Result<Audio> {
     })
 }
 
-fn append_decoded(buffer: AudioBufferRef<'_>, output: &mut Vec<f32>) {
+fn append_decoded(buffer: AudioBufferRef<'_>, output: &mut Vec<f32>, channels: &mut usize) {
+    if *channels == 0 {
+        *channels = buffer.spec().channels.count();
+    }
     let mut sample_buffer = SampleBuffer::<f32>::new(buffer.frames() as u64, *buffer.spec());
     sample_buffer.copy_interleaved_ref(buffer);
     output.extend_from_slice(sample_buffer.samples());
