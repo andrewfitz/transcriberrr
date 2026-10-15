@@ -222,6 +222,9 @@ final class AppState: ObservableObject {
 
     var completedCount: Int { items.filter { if case .done = $0.state { return true }; return false }.count }
     var totalDuration: TimeInterval { items.reduce(0) { $0 + $1.duration } }
+    var activeStatus: String {
+        items.first(where: { $0.state == .processing })?.resultSummary ?? "Preparing…"
+    }
 
     var modelStatus: String {
         if let cachedModelStatusValue { return cachedModelStatusValue }
@@ -409,11 +412,12 @@ final class AppState: ObservableObject {
                 try? FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
             }
             let pending = items.filter { $0.selected && $0.state != .done }
-            pending.forEach {
-                $0.state = .processing
-                $0.progress = 0.05
-                $0.resultSummary = "Queued…"
+            for (index, item) in pending.enumerated() {
+                item.state = .queued
+                item.progress = 0
+                item.resultSummary = index == 0 ? "Waiting for model setup…" : "Waiting…"
             }
+            objectWillChange.send()
             saveQueue()
 
             let modelDownloads = requiredModelDownloads(for: pending)
@@ -440,12 +444,25 @@ final class AppState: ObservableObject {
                 modelActivityProgress = 1
             }
 
+            if engine != "apple-native", let first = pending.first {
+                first.state = .processing
+                first.progress = 0.05
+                first.resultSummary = "Starting transcription…"
+                objectWillChange.send()
+                saveQueue()
+            }
+
             // Qwen and Parakeet keep their weights in process memory. Run the
             // whole queue through one manifest so a 5,000-track queue does not
             // repeatedly pay model startup and Metal pipeline compilation.
             if engine == "apple-native" {
                 var reservedOutputs = Set<String>()
                 for item in pending {
+                    item.state = .processing
+                    item.progress = 0.05
+                    item.resultSummary = "Transcribing…"
+                    objectWillChange.send()
+                    saveQueue()
                     let output = uniqueOutput(expectedOutput(for: item), reserved: &reservedOutputs)
                     let result = await runCLI(for: item, outputOverride: output)
                     apply(result, to: item)
@@ -703,6 +720,7 @@ final class AppState: ObservableObject {
                         let key = self?.progressKey(item.url.path) ?? item.url.path
                         if let event = events[key] {
                             if event.status == "running" {
+                                item.state = .processing
                                 item.progress = max(item.progress, 0.1)
                                 item.resultSummary = "Transcribing…"
                             } else if event.status == "completed" {
@@ -1208,7 +1226,12 @@ struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if state.isRunning { ProgressView().frame(width: 130) }
+                if state.isRunning {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(state.activeStatus).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 Button(state.isRunning ? "Transcribing…" : "Transcribe") { state.transcribe() }
                     .buttonStyle(.borderedProminent)
                     .disabled(state.items.isEmpty || state.isRunning)
