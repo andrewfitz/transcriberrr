@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+
+# Swift Package Manager build output
+/ui/.build/
+
+# Local release bundles and archives
+/dist/
+
+# Downloaded model weights and caches
+/.cache/
+/models/
+*.safetensors
+*.onnx
+*.nemo
+*.pt
+*.pth
+
+# Audio/video fixtures and generated transcripts
+*.wav
+*.aiff
+*.aif
+*.caf
+*.m4a
+*.mp3
+*.flac
+*.ogg
+*.webm
+*.jsonl
+
+# macOS and local environment files
+.DS_Store
+.env
+.env.*
+!.env.example
