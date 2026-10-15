@@ -204,6 +204,7 @@ final class AppState: ObservableObject {
     @Published var modelActivityLog: [String] = []
     @Published var modelActivityProgress: Double?
     @Published var modelActivityCanDismiss = false
+    @Published var modelActivitySucceeded = false
 
     private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "mp3", "ogg", "wav", "webm"]
     private var pendingSave: Task<Void, Never>?
@@ -427,14 +428,16 @@ final class AppState: ObservableObject {
                     }
                     modelActivityMessage = result.message.isEmpty ? "Model setup failed." : result.message
                     modelActivityCanDismiss = true
+                    modelActivitySucceeded = false
                     isRunning = false
                     saveQueue()
                     return
                 }
                 invalidateModelStatus()
-                modelActivityMessage = "Models are ready. Starting transcription…"
+                modelActivityMessage = "Models are ready. Transcription is starting…"
                 modelActivityCanDismiss = true
-                showModelActivity = false
+                modelActivitySucceeded = true
+                modelActivityProgress = 1
             }
 
             // Qwen and Parakeet keep their weights in process memory. Run the
@@ -487,6 +490,7 @@ final class AppState: ObservableObject {
         modelActivityLog = []
         modelActivityProgress = nil
         modelActivityCanDismiss = false
+        modelActivitySucceeded = false
         showModelActivity = true
     }
 
@@ -853,9 +857,9 @@ private struct ModelActivitySheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
-                Image(systemName: state.modelActivityCanDismiss ? "checkmark.circle.fill" : "arrow.down.circle.fill")
+                Image(systemName: state.modelActivitySucceeded ? "checkmark.circle.fill" : (state.modelActivityCanDismiss ? "exclamationmark.triangle.fill" : "arrow.down.circle.fill"))
                     .font(.system(size: 28))
-                    .foregroundStyle(state.modelActivityCanDismiss ? .green : Color.accentColor)
+                    .foregroundStyle(state.modelActivitySucceeded ? .green : (state.modelActivityCanDismiss ? .orange : Color.accentColor))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(state.modelActivityTitle).font(.title3.weight(.semibold))
                     Text(state.modelActivityMessage).font(.callout).foregroundStyle(.secondary).lineLimit(2)
@@ -1066,13 +1070,7 @@ struct ContentView: View {
                 }
                 Spacer(minLength: 8)
                 if item.state == .processing {
-                    Group {
-                        if state.engine == "apple-native" {
-                            ProgressView()
-                        } else {
-                            ProgressView(value: item.progress)
-                        }
-                    }
+                    ProgressView()
                         .frame(width: 72)
                         .accessibilityLabel("Transcribing \(item.url.lastPathComponent)")
                 }
@@ -1210,7 +1208,7 @@ struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if state.isRunning { ProgressView(value: Double(state.completedCount), total: Double(max(state.items.count, 1))).frame(width: 130) }
+                if state.isRunning { ProgressView().frame(width: 130) }
                 Button(state.isRunning ? "Transcribing…" : "Transcribe") { state.transcribe() }
                     .buttonStyle(.borderedProminent)
                     .disabled(state.items.isEmpty || state.isRunning)
