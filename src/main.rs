@@ -195,6 +195,10 @@ struct ProgressEvent {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     elapsed_seconds: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
 }
 
 struct ProgressLog {
@@ -433,6 +437,8 @@ fn main() -> Result<()> {
                 output: Some(output_path(&cli, job).display().to_string()),
                 error: None,
                 elapsed_seconds: None,
+                progress: Some(1.0),
+                phase: Some("Skipped".to_owned()),
             })?;
         }
         return Ok(());
@@ -514,6 +520,8 @@ fn main() -> Result<()> {
                 output: Some(predicted_output.display().to_string()),
                 error: None,
                 elapsed_seconds: None,
+                progress: Some(1.0),
+                phase: Some("Skipped".to_owned()),
             })?;
             continue;
         }
@@ -523,8 +531,21 @@ fn main() -> Result<()> {
             output: Some(predicted_output.display().to_string()),
             error: None,
             elapsed_seconds: None,
+            progress: Some(0.0),
+            phase: Some("Starting".to_owned()),
         })?;
         let started = Instant::now();
+        let mut report = |value: f32, phase: &str| {
+            progress.record(ProgressEvent {
+                input: key.clone(),
+                status: "running".to_owned(),
+                output: Some(predicted_output.display().to_string()),
+                error: None,
+                elapsed_seconds: Some(started.elapsed().as_secs_f32()),
+                progress: Some(value),
+                phase: Some(phase.to_owned()),
+            })
+        };
         match process_one(
             &cli,
             &job,
@@ -532,6 +553,7 @@ fn main() -> Result<()> {
             aligner.as_ref(),
             parakeet.as_mut(),
             &mut diarizer,
+            &mut report,
         ) {
             Ok(output) => progress.record(ProgressEvent {
                 input: key,
@@ -539,6 +561,8 @@ fn main() -> Result<()> {
                 output: Some(output.display().to_string()),
                 error: None,
                 elapsed_seconds: Some(started.elapsed().as_secs_f32()),
+                progress: Some(1.0),
+                phase: Some("Complete".to_owned()),
             })?,
             Err(error) => {
                 eprintln!("error processing {}: {error:#}", job.input.display());
@@ -549,6 +573,8 @@ fn main() -> Result<()> {
                     output: Some(predicted_output.display().to_string()),
                     error: Some(format!("{error:#}")),
                     elapsed_seconds: Some(started.elapsed().as_secs_f32()),
+                    progress: None,
+                    phase: Some("Failed".to_owned()),
                 })?;
                 if cli.fail_fast {
                     return Err(error);
@@ -580,11 +606,16 @@ fn process_one(
     aligner: Option<&Qwen3ForcedAligner>,
     parakeet: Option<&mut ParakeetEngine>,
     diarizer: &mut Option<Diarizer>,
+    report: &mut dyn FnMut(f32, &str) -> Result<()>,
 ) -> Result<PathBuf> {
     if matches!(cli.engine, EngineKind::AppleNative) {
-        return process_apple_native(cli, job);
+        report(0.1, "Starting Apple SpeechTranscriber")?;
+        let output = process_apple_native(cli, job)?;
+        report(0.95, "Writing output")?;
+        return Ok(output);
     }
     let started = Instant::now();
+    report(0.05, "Decoding audio")?;
     let audio =
         decode_audio(&job.input).with_context(|| format!("decoding {}", job.input.display()))?;
     if audio.samples.is_empty() {
@@ -593,6 +624,7 @@ fn process_one(
             job.input.display()
         );
     }
+    report(0.2, "Transcribing")?;
     let want_timestamps = cli.timestamps != TimestampGranularity::None;
     let (text, language, aligned) = if let Some(parakeet) = parakeet {
         #[cfg(feature = "parakeet")]
@@ -651,7 +683,9 @@ fn process_one(
             .unwrap_or_default();
         (result.text, result.language, aligned)
     };
+    report(0.75, "Building timestamps")?;
     let speaker_segments = if job.diarize {
+        report(0.82, "Diarizing")?;
         run_diarization(diarizer, &audio.samples, job.speakers.unwrap_or(8))?
     } else {
         None
@@ -699,6 +733,7 @@ fn process_one(
         segments,
     };
     let output_path = output_path(cli, job);
+    report(0.95, "Writing output")?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating output directory {}", parent.display()))?;

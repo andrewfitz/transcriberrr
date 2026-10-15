@@ -132,6 +132,8 @@ private struct ProgressEvent: Decodable {
     var status: String
     var output: String?
     var error: String?
+    var progress: Double?
+    var phase: String?
 }
 
 /// Incrementally consumes the CLI's JSONL progress file. Reading the complete
@@ -224,6 +226,13 @@ final class AppState: ObservableObject {
     var totalDuration: TimeInterval { items.reduce(0) { $0 + $1.duration } }
     var activeStatus: String {
         items.first(where: { $0.state == .processing })?.resultSummary ?? "Preparing…"
+    }
+    var queueProgress: Double {
+        guard !items.isEmpty else { return 0 }
+        return items.reduce(0) { total, item in
+            if item.state == .done { return total + 1 }
+            return total + min(max(item.progress, 0), 1)
+        } / Double(items.count)
     }
 
     var modelStatus: String {
@@ -743,14 +752,15 @@ final class AppState: ObservableObject {
                         if let event = events[key] {
                             if event.status == "running" {
                                 item.state = .processing
-                                item.progress = max(item.progress, 0.1)
-                                item.resultSummary = "Transcribing…"
+                                item.progress = event.progress ?? max(item.progress, 0.05)
+                                item.resultSummary = event.phase ?? "Transcribing…"
                             } else if event.status == "completed" {
                                 item.progress = 0.95
                                 item.resultSummary = "Transcription complete; saving…"
                             }
                         }
                     }
+                    self?.objectWillChange.send()
                 }
             }
             let result = await withCheckedContinuation { continuation in
@@ -1110,7 +1120,13 @@ struct ContentView: View {
                 }
                 Spacer(minLength: 8)
                 if item.state == .processing {
-                    ProgressView()
+                    Group {
+                        if state.engine == "apple-native" {
+                            ProgressView()
+                        } else {
+                            ProgressView(value: item.progress)
+                        }
+                    }
                         .frame(width: 72)
                         .accessibilityLabel("Transcribing \(item.url.lastPathComponent)")
                 }
@@ -1250,7 +1266,7 @@ struct ContentView: View {
                 Spacer()
                 if state.isRunning {
                     HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
+                        ProgressView(value: state.queueProgress).frame(width: 130)
                         Text(state.activeStatus).font(.caption).foregroundStyle(.secondary)
                     }
                 }
