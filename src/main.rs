@@ -599,6 +599,67 @@ fn wants_diarization_jobs(jobs: &[Job]) -> bool {
     jobs.iter().any(|job| job.diarize || job.speakers.is_some())
 }
 
+fn transcribe_qwen_chunks(
+    cli: &Cli,
+    asr: &Qwen3Asr,
+    aligner: Option<&Qwen3ForcedAligner>,
+    samples: &[f32],
+    want_timestamps: bool,
+    report: &mut dyn FnMut(f32, &str) -> Result<()>,
+) -> Result<(String, String, Vec<AlignedWord>)> {
+    let chunk_samples = (cli.chunk_seconds * TARGET_SAMPLE_RATE as f32)
+        .round()
+        .max(1.0) as usize;
+    let chunks: Vec<&[f32]> = samples.chunks(chunk_samples).collect();
+    let total = chunks.len().max(1);
+    let mut text_parts = Vec::with_capacity(chunks.len());
+    let mut language = "English".to_owned();
+    let mut aligned = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let audio_input = AudioInput::Waveform {
+            samples: chunk,
+            sample_rate: TARGET_SAMPLE_RATE,
+        };
+        let opts = TranscribeOptions {
+            context: Batch::one(String::new()),
+            language: Batch::one(Some("English".to_owned())),
+            return_timestamps: want_timestamps,
+            max_new_tokens: 0,
+            max_batch_size: 1,
+            chunk_max_sec: Some(cli.chunk_seconds),
+            bucket_by_length: false,
+        };
+        let result = if let Some(aligner) = aligner {
+            asr.transcribe_with_forced_aligner(aligner, vec![audio_input], opts)?
+        } else {
+            asr.transcribe(vec![audio_input], opts)?
+        }
+        .into_iter()
+        .next()
+        .context("Qwen3 returned no transcription")?;
+        language = result.language;
+        if !result.text.trim().is_empty() {
+            text_parts.push(result.text);
+        }
+        let offset = index as f32 * cli.chunk_seconds;
+        if let Some(value) = result.timestamps {
+            let envelope = serde_json::from_value::<TimestampEnvelope>(value)
+                .context("Qwen3 returned timestamps in an unexpected format")?;
+            aligned.extend(envelope.items.into_iter().map(|mut word| {
+                word.start_time += offset;
+                word.end_time += offset;
+                word
+            }));
+        }
+        let progress = 0.2 + 0.52 * (index + 1) as f32 / total as f32;
+        report(
+            progress,
+            &format!("Transcribing chunk {}/{}", index + 1, total),
+        )?;
+    }
+    Ok((text_parts.join(" "), language, aligned))
+}
+
 fn process_one(
     cli: &Cli,
     job: &Job,
@@ -629,7 +690,12 @@ fn process_one(
     let (text, language, aligned) = if let Some(parakeet) = parakeet {
         #[cfg(feature = "parakeet")]
         {
-            let result = parakeet.transcribe(&audio.samples, want_timestamps)?;
+            let result = parakeet.transcribe_with_progress(
+                &audio.samples,
+                want_timestamps,
+                cli.chunk_seconds,
+                report,
+            )?;
             let parakeet_engine::ParakeetTranscript { text, words } = result;
             let aligned = words
                 .into_iter()
@@ -648,40 +714,7 @@ fn process_one(
         }
     } else {
         let asr = asr.context("Qwen3 engine was not initialized")?;
-        let audio_input = AudioInput::Waveform {
-            samples: &audio.samples,
-            sample_rate: TARGET_SAMPLE_RATE,
-        };
-        let opts = TranscribeOptions {
-            context: Batch::one(String::new()),
-            language: Batch::one(Some("English".to_owned())),
-            return_timestamps: want_timestamps,
-            max_new_tokens: 0,
-            max_batch_size: 1,
-            chunk_max_sec: Some(cli.chunk_seconds),
-            bucket_by_length: false,
-        };
-        let result = if let Some(aligner) = aligner {
-            asr.transcribe_with_forced_aligner(aligner, vec![audio_input], opts)?
-                .into_iter()
-                .next()
-                .context("Qwen3 returned no transcription")?
-        } else {
-            asr.transcribe(vec![audio_input], opts)?
-                .into_iter()
-                .next()
-                .context("Qwen3 returned no transcription")?
-        };
-        let aligned = result
-            .timestamps
-            .map(|value| {
-                serde_json::from_value::<TimestampEnvelope>(value)
-                    .context("Qwen3 returned timestamps in an unexpected format")
-            })
-            .transpose()?
-            .map(|envelope| envelope.items)
-            .unwrap_or_default();
-        (result.text, result.language, aligned)
+        transcribe_qwen_chunks(cli, asr, aligner, &audio.samples, want_timestamps, report)?
     };
     report(0.75, "Building timestamps")?;
     let speaker_segments = if job.diarize {

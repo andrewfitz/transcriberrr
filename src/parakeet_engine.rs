@@ -82,4 +82,41 @@ impl ParakeetEngine {
             words,
         })
     }
+
+    /// Transcribe bounded chunks so callers can report truthful completion as each model call
+    /// finishes. The model is reused for every chunk; timestamps are offset back into source time.
+    pub fn transcribe_with_progress(
+        &mut self,
+        samples: &[f32],
+        timestamps: bool,
+        chunk_seconds: f32,
+        report: &mut dyn FnMut(f32, &str) -> Result<()>,
+    ) -> Result<ParakeetTranscript> {
+        let chunk_samples = (chunk_seconds * 16_000.0).round().max(1.0) as usize;
+        let chunks: Vec<&[f32]> = samples.chunks(chunk_samples).collect();
+        let total = chunks.len().max(1);
+        let mut text_parts = Vec::with_capacity(chunks.len());
+        let mut words = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut result = self.transcribe(chunk, timestamps)?;
+            let offset = index as f32 * chunk_seconds;
+            for word in &mut result.words {
+                word.start += offset;
+                word.end += offset;
+            }
+            if !result.text.trim().is_empty() {
+                text_parts.push(result.text);
+            }
+            words.extend(result.words);
+            let progress = 0.2 + 0.52 * (index + 1) as f32 / total as f32;
+            report(
+                progress,
+                &format!("Transcribing chunk {}/{}", index + 1, total),
+            )?;
+        }
+        Ok(ParakeetTranscript {
+            text: text_parts.join(" "),
+            words,
+        })
+    }
 }
