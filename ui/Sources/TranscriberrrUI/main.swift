@@ -227,18 +227,24 @@ final class AppState: ObservableObject {
         loadQueue()
     }
 
-    var completedCount: Int { items.filter { if case .done = $0.state { return true }; return false }.count }
-    var totalDuration: TimeInterval { items.reduce(0) { $0 + $1.duration } }
+    var selectedItems: [AudioItem] { items.filter(\.selected) }
+    var selectedCount: Int { selectedItems.count }
+    var completedItemCount: Int { items.filter { if case .done = $0.state { return true }; return false }.count }
+    var completedCount: Int {
+        selectedItems.filter { if case .done = $0.state { return true }; return false }.count
+    }
+    var totalDuration: TimeInterval { selectedItems.reduce(0) { $0 + $1.duration } }
     var activeStatus: String {
         if isCancelling { return "Stopping safely…" }
         return items.first(where: { $0.state == .processing })?.resultSummary ?? "Preparing…"
     }
     var queueProgress: Double {
-        guard !items.isEmpty else { return 0 }
-        return items.reduce(0) { total, item in
+        let tracked = selectedItems
+        guard !tracked.isEmpty else { return 0 }
+        return tracked.reduce(0) { total, item in
             if item.state == .done { return total + 1 }
             return total + min(max(item.progress, 0), 1)
-        } / Double(items.count)
+        } / Double(tracked.count)
     }
 
     var modelStatus: String {
@@ -380,6 +386,11 @@ final class AppState: ObservableObject {
         item.speakerCount = value
         objectWillChange.send()
         saveQueue()
+    }
+
+    func revealOutput(for item: AudioItem) {
+        guard let outputURL = item.outputURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([outputURL])
     }
 
     /// AVAudioFile can spend noticeable time probing compressed media. Do that
@@ -1128,7 +1139,7 @@ struct ContentView: View {
                     .buttonStyle(.borderless)
                 Button("Clear completed") { state.clearCompleted() }
                     .buttonStyle(.borderless)
-                    .disabled(state.completedCount == 0 || state.isRunning)
+                .disabled(state.completedItemCount == 0 || state.isRunning)
             }
             .padding(.horizontal, 20)
             .padding(.top, 18)
@@ -1192,7 +1203,22 @@ struct ContentView: View {
                     Text(item.url.lastPathComponent).lineLimit(1)
                     Text("\(formatDuration(item.duration))  •  \(item.url.deletingLastPathComponent().path)")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    if !item.resultSummary.isEmpty { Text(item.resultSummary).font(.caption2).foregroundStyle(.secondary).lineLimit(1) }
+                    if let outputURL = item.outputURL {
+                        Button {
+                            state.revealOutput(for: item)
+                        } label: {
+                            Text(item.resultSummary.isEmpty ? outputURL.path : item.resultSummary)
+                                .font(.caption2)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.tint)
+                        .accessibilityLabel("Show saved transcript in Finder")
+                        .help("Reveal \(outputURL.path) in Finder")
+                    } else if !item.resultSummary.isEmpty {
+                        Text(item.resultSummary).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
                 }
                 Spacer(minLength: 8)
                 if item.state == .processing {
@@ -1335,7 +1361,7 @@ struct ContentView: View {
             }
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("\(state.completedCount) of \(state.items.count) complete")
+                    Text("\(state.completedCount) of \(state.selectedCount) selected complete")
                     Text("\(formatDuration(state.totalDuration)) queued")
                         .font(.caption).foregroundStyle(.secondary)
                 }
