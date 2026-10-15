@@ -483,6 +483,7 @@ final class AppState: ObservableObject {
         var values: [String] = []
         func append(_ value: String) {
             guard !value.isEmpty, !value.hasPrefix("/"), !values.contains(value) else { return }
+            guard modelNeedsDownload(value) else { return }
             values.append(value)
         }
         append(modelID)
@@ -493,6 +494,27 @@ final class AppState: ObservableObject {
             append(diarizationModelArgument)
         }
         return values
+    }
+
+    private func modelNeedsDownload(_ value: String) -> Bool {
+        if value == "sortformer" || value == "/sortformer" {
+            return !cachedSortformer()
+        }
+        return !cachedModel(value)
+    }
+
+    private func cachedSortformer() -> Bool {
+        let root = ProcessInfo.processInfo.environment["TRANSCRIBERRR_MODEL_CACHE"]
+            .map(URL.init(fileURLWithPath:))
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/Transcriberrr/models/hub")
+        let repo = root.appendingPathComponent("models--altunenes--parakeet-rs/snapshots", isDirectory: true)
+        guard let enumerator = FileManager.default.enumerator(at: repo, includingPropertiesForKeys: [.isRegularFileKey]) else {
+            return false
+        }
+        return enumerator.compactMap { $0 as? URL }.contains { url in
+            url.lastPathComponent == "nemotron3_diar_v3.onnx"
+        }
     }
 
     var diarizationModelArgument: String {
