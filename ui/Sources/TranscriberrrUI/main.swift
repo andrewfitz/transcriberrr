@@ -198,6 +198,12 @@ final class AppState: ObservableObject {
     @Published var timestamps = "words"
     @Published var diarize = false
     @Published var isRunning = false
+    @Published var showModelActivity = false
+    @Published var modelActivityTitle = "Preparing models"
+    @Published var modelActivityMessage = "Checking the local model cache…"
+    @Published var modelActivityLog: [String] = []
+    @Published var modelActivityProgress: Double?
+    @Published var modelActivityCanDismiss = false
 
     private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "mp3", "ogg", "wav", "webm"]
     private var pendingSave: Task<Void, Never>?
@@ -334,6 +340,7 @@ final class AppState: ObservableObject {
 
     func setDiarization(for item: AudioItem, enabled: Bool) {
         item.diarize = enabled
+        if !enabled { item.speakerCount = nil }
         objectWillChange.send()
         saveQueue()
     }
@@ -408,6 +415,28 @@ final class AppState: ObservableObject {
             }
             saveQueue()
 
+            let modelDownloads = requiredModelDownloads(for: pending)
+            if !modelDownloads.isEmpty {
+                beginModelActivity(title: "Preparing models", message: "Checking and downloading model files…")
+                modelActivityLog = modelDownloads.map { "Model: \($0)" }
+                let result = await downloadModels(modelDownloads)
+                if result.status != 0 {
+                    pending.forEach {
+                        $0.state = .failed("Model setup failed")
+                        $0.resultSummary = "Model setup failed; see the model activity window."
+                    }
+                    modelActivityMessage = result.message.isEmpty ? "Model setup failed." : result.message
+                    modelActivityCanDismiss = true
+                    isRunning = false
+                    saveQueue()
+                    return
+                }
+                invalidateModelStatus()
+                modelActivityMessage = "Models are ready. Starting transcription…"
+                modelActivityCanDismiss = true
+                showModelActivity = false
+            }
+
             // Qwen and Parakeet keep their weights in process memory. Run the
             // whole queue through one manifest so a 5,000-track queue does not
             // repeatedly pay model startup and Metal pipeline compilation.
@@ -426,6 +455,89 @@ final class AppState: ObservableObject {
             }
             isRunning = false
             saveQueue()
+        }
+    }
+
+    private func requiredModelDownloads(for pending: [AudioItem]) -> [String] {
+        guard engine != "apple-native" else { return [] }
+        var values: [String] = []
+        func append(_ value: String) {
+            guard !value.isEmpty, !value.hasPrefix("/"), !values.contains(value) else { return }
+            values.append(value)
+        }
+        append(modelID)
+        if engine == "qwen" && timestamps != "none" {
+            append("Qwen/Qwen3-ForcedAligner-0.6B")
+        }
+        if pending.contains(where: { $0.diarize || $0.speakerCount != nil }) {
+            append(diarizationModelArgument)
+        }
+        return values
+    }
+
+    var diarizationModelArgument: String {
+        // URL(fileURLWithPath: "sortformer") normalizes the alias to "/sortformer".
+        // Preserve the CLI alias so model_cache canonicalizes it to the compatible ONNX export.
+        diarizationModel.path == "/sortformer" ? "sortformer" : diarizationModel.path
+    }
+
+    private func beginModelActivity(title: String, message: String) {
+        modelActivityTitle = title
+        modelActivityMessage = message
+        modelActivityLog = []
+        modelActivityProgress = nil
+        modelActivityCanDismiss = false
+        showModelActivity = true
+    }
+
+    private func appendModelActivity(_ text: String) {
+        let normalized = text.replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalized.split(whereSeparator: { $0 == "\n" }).map(String.init)
+        guard !lines.isEmpty else { return }
+        modelActivityLog.append(contentsOf: lines.suffix(80))
+        if modelActivityLog.count > 160 {
+            modelActivityLog.removeFirst(modelActivityLog.count - 160)
+        }
+        if let last = lines.last, !last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            modelActivityMessage = last.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let match = normalized.range(of: #"\b(\d{1,3})%\b"#, options: .regularExpression),
+           let percent = Double(normalized[match].dropLast()) {
+            modelActivityProgress = min(max(percent / 100, 0), 1)
+        }
+    }
+
+    private func downloadModels(_ ids: [String]) async -> (status: Int32, message: String) {
+        guard let executableURL = cliURL else {
+            return (1, "The transcriberrr executable is not bundled. Rebuild the app with scripts/build-macos-app.sh.")
+        }
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = ids.flatMap { ["--download-model", $0] }
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        return await withCheckedContinuation { continuation in
+            pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                Task { @MainActor in self?.appendModelActivity(text) }
+            }
+            process.terminationHandler = { process in
+                pipe.fileHandleForReading.readabilityHandler = nil
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let message = String(data: data, encoding: .utf8) ?? ""
+                Task { @MainActor in
+                    if !message.isEmpty { self.appendModelActivity(message) }
+                    continuation.resume(returning: (process.terminationStatus, message))
+                }
+            }
+            do {
+                try process.run()
+            } catch {
+                pipe.fileHandleForReading.readabilityHandler = nil
+                continuation.resume(returning: (1, error.localizedDescription))
+            }
         }
     }
 
@@ -518,7 +630,7 @@ final class AppState: ObservableObject {
             let backend = engine == "parakeet-v3" ? "parakeet-v3" : "qwen3"
             arguments = [item.url.path, "--output-dir", destination.path, "--engine", backend, "--model", modelID, "--device", device, "--format", format, "--timestamps", timestamps, "--overwrite"]
             if item.diarize {
-                arguments += ["--diarize", "--diarization-model", diarizationModel.path]
+                arguments += ["--diarize", "--diarization-model", diarizationModelArgument]
                 if let speakerCount = item.speakerCount {
                     arguments += ["--speakers", String(speakerCount)]
                 }
@@ -569,8 +681,8 @@ final class AppState: ObservableObject {
                              "--engine", engine == "parakeet-v3" ? "parakeet-v3" : "qwen3",
                              "--model", modelID, "--device", device, "--format", format,
                              "--timestamps", timestamps, "--progress-file", progressURL.path, "--overwrite"]
-            if items.contains(where: { $0.diarize }) {
-                arguments += ["--diarization-model", diarizationModel.path]
+            if items.contains(where: { $0.diarize || $0.speakerCount != nil }) {
+                arguments += ["--diarization-model", diarizationModelArgument]
             }
             let process = Process()
             process.executableURL = executableURL
@@ -640,7 +752,8 @@ final class AppState: ObservableObject {
         items = saved.items.compactMap { value in
             let url = URL(fileURLWithPath: value.path)
             guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-            let item = AudioItem(url: url, id: value.id, duration: value.duration, diarize: value.diarize, speakerCount: value.speakerCount)
+            let item = AudioItem(url: url, id: value.id, duration: value.duration, diarize: value.diarize,
+                                 speakerCount: value.diarize ? value.speakerCount : nil)
             item.state = value.state == "done" ? .done : value.state == "processing" ? .queued : value.state == "failed" ? .failed(value.error ?? "Transcription failed") : .queued
             item.progress = value.progress
             item.selected = value.selected
@@ -677,7 +790,7 @@ final class AppState: ObservableObject {
             outputFolder: outputFolder.path,
             outputDestination: outputDestination.rawValue,
             modelID: modelID,
-            diarizationModel: diarizationModel.path,
+            diarizationModel: diarizationModelArgument,
             device: device,
             format: format,
             timestamps: timestamps,
@@ -734,6 +847,61 @@ final class AppState: ObservableObject {
     }
 }
 
+private struct ModelActivitySheet: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                Image(systemName: state.modelActivityCanDismiss ? "checkmark.circle.fill" : "arrow.down.circle.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(state.modelActivityCanDismiss ? .green : Color.accentColor)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(state.modelActivityTitle).font(.title3.weight(.semibold))
+                    Text(state.modelActivityMessage).font(.callout).foregroundStyle(.secondary).lineLimit(2)
+                }
+                Spacer()
+            }
+            if let progress = state.modelActivityProgress {
+                ProgressView(value: progress)
+                    .tint(.accentColor)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            Text("Models are stored in the local Transcriberrr cache. This may take several minutes on a first run.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(state.modelActivityLog.isEmpty ? "Waiting for the model manager…" : state.modelActivityLog.joined(separator: "\n"))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .id("model-log")
+                }
+                .frame(minHeight: 180, maxHeight: 300)
+                .padding(10)
+                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                .onChange(of: state.modelActivityLog.count) { _, _ in
+                    withAnimation { proxy.scrollTo("model-log", anchor: .bottom) }
+                }
+            }
+            HStack {
+                Spacer()
+                Button(state.modelActivityCanDismiss ? "Close" : "Working…") {
+                    state.showModelActivity = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!state.modelActivityCanDismiss)
+            }
+        }
+        .padding(24)
+        .frame(width: 620, height: 460)
+        .interactiveDismissDisabled(!state.modelActivityCanDismiss)
+    }
+}
+
 struct ContentView: View {
     @StateObject private var state = AppState()
     @State private var dropTargeted = false
@@ -765,6 +933,9 @@ struct ContentView: View {
         .onChange(of: state.timestamps) { _, _ in state.saveQueue() }
         .onAppear { updateFilter(queueFilter) }
         .onChange(of: queueFilter) { _, value in updateFilter(value) }
+        .sheet(isPresented: $state.showModelActivity) {
+            ModelActivitySheet(state: state)
+        }
     }
 
     private var header: some View {
@@ -1026,7 +1197,7 @@ struct ContentView: View {
             if state.diarize {
                 HStack {
                     Text("Diarization model").foregroundStyle(.secondary)
-                    Text(state.diarizationModel.path).lineLimit(1).foregroundStyle(.secondary)
+                    Text(state.diarizationModelArgument).lineLimit(1).foregroundStyle(.secondary)
                     Button("Choose…") { state.chooseDiarizationModel(state.diarizationModel) { state.diarizationModel = $0; state.saveQueue() } }
                         .disabled(state.isRunning)
                 }
