@@ -9,7 +9,7 @@ Offline English transcription for Apple Silicon Macs. Transcriberrr ships a nati
 - Word-level or sentence timestamps in JSON, SRT, and WebVTT; plain TXT is available without timestamps.
 - Optional Sortformer speaker diarization, including a per-job speaker limit.
 - Single files, recursive folders, JSON manifests, resumable JSONL progress, and output beside the source or in one destination folder.
-- Native SwiftUI queue with folder drop, regex filtering, visible Check all/None, per-track diarization, model status, and saved queue results.
+- Native SwiftUI queue with folder drop, regex filtering, visible Check all/None, per-track diarization, saved queue results, and a visible model setup/download activity window.
 
 ## Install a GitHub release
 
