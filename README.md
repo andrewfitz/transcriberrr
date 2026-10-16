@@ -13,9 +13,9 @@ Offline English transcription for Apple Silicon Macs. Transcriberrr ships a nati
 
 ## Install a GitHub release
 
-Download the arm64 `.app` archive from the repository Releases page, expand it, and move `Transcriberrr.app` to `/Applications`. The app bundle contains the UI, Rust CLI, and Apple-native helper; model weights are intentionally not bundled. The first run may download several gigabytes from Hugging Face or install Apple system models. macOS may require opening the app once in System Settings -> Privacy & Security for an unsigned development release.
+Download the arm64 `.dmg` from the repository Releases page, open it, and drag `Transcriberrr.app` to `/Applications`. The app bundle contains the UI, Rust CLI, and Apple-native helper; model weights are intentionally not bundled. The first run may download several gigabytes from Hugging Face or install Apple system models. macOS may require opening the app once in System Settings -> Privacy & Security for an unsigned development release.
 
-Release archives should be built on an Apple Silicon Mac and distributed with a SHA-256 checksum. Do not commit `target/`, `ui/.build/`, the unpacked `dist/Transcriberrr.app/`, recordings, or model caches; attach only the final `.app.zip` and checksum to a GitHub Release.
+Release archives should be built on an Apple Silicon Mac and distributed with a SHA-256 checksum. Do not commit `target/`, `ui/.build/`, the unpacked `dist/Transcriberrr.app/`, recordings, or model caches; attach only the final `.dmg` and `.dmg.sha256` files to a GitHub Release.
 
 ## Build from source
 
@@ -28,6 +28,9 @@ cargo build --release --features diarization
 # Native app bundle; also embeds the matching CLI and SpeechTranscriber helper
 ./scripts/build-macos-app.sh
 open dist/Transcriberrr.app
+
+# Build the GitHub release installer and checksum
+./scripts/build-release-dmg.sh
 ```
 
 The build script refuses non-`Darwin arm64` hosts. For a CLI-only build, use `cargo build --release`; add `--features parakeet` for the Parakeet Unified engine without diarization. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` are the required checks.
@@ -87,9 +90,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 swift build -c release --package-path ui --product transcriberrr-ui
 swift build -c release --package-path ui --product transcriberrr-native
 ./scripts/build-macos-app.sh
-ditto -c -k --keepParent dist/Transcriberrr.app dist/Transcriberrr.app.zip
+./scripts/build-release-dmg.sh
 file dist/Transcriberrr.app/Contents/MacOS/Transcriberrr
-shasum -a 256 dist/Transcriberrr.app.zip
+shasum -a 256 dist/Transcriberrr-*-macos-arm64.dmg
 ```
 
 Before publishing, test a short English recording through the CLI and the app, verify JSON word timing, and inspect the arm64 output with `file`. Keep credentials, recordings, downloaded weights, and generated release artifacts out of Git.

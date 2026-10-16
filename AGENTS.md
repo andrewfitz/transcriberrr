@@ -18,6 +18,7 @@ cargo fmt --check                     # Check Rust formatting
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test                            # Run Rust tests
 ./scripts/build-macos-app.sh          # Build the SwiftUI app bundle
+./scripts/build-release-dmg.sh        # Build arm64 DMG and SHA-256 checksum
 ```
 
 The UI launches the CLI by name, so put `target/release` on `PATH` before opening the app.
