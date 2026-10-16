@@ -36,7 +36,46 @@ private struct NativeTranscript: Codable {
     let duration_seconds: Double
     let text: String
     var segments: [NativeSegment]
+    let metadata: NativeMetadata
 }
+
+private struct NativeMetadata: Codable {
+    let transcribedWith: String
+    let version: String
+    let sourceCreatedAt: String?
+    let sourceModifiedAt: String?
+    let transcribedAt: String
+    let model: String
+    let diarization: NativeDiarizationMetadata?
+
+    private enum CodingKeys: String, CodingKey {
+        case transcribedWith = "transcribed-with"
+        case version
+        case sourceCreatedAt = "source_created_at"
+        case sourceModifiedAt = "source_modified_at"
+        case transcribedAt = "transcribed_at"
+        case model
+        case diarization
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(transcribedWith, forKey: .transcribedWith)
+        try container.encode(version, forKey: .version)
+        try container.encodeIfPresent(sourceCreatedAt, forKey: .sourceCreatedAt)
+        try container.encodeIfPresent(sourceModifiedAt, forKey: .sourceModifiedAt)
+        try container.encode(transcribedAt, forKey: .transcribedAt)
+        try container.encode(model, forKey: .model)
+        try container.encodeIfPresent(diarization, forKey: .diarization)
+    }
+}
+
+private struct NativeDiarizationMetadata: Codable {
+    let enabled: Bool
+    let speakers: Int?
+}
+
+private let transcriberrrVersion = "0.1.0"
 
 private enum OutputFormat: String {
     case txt, json, srt, vtt
@@ -203,6 +242,7 @@ struct TranscriberrrNative {
         let text = words.map(\.text).joined(separator: " ")
         let segments = buildSegments(words)
         let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
+        let resourceValues = try? input.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
         return NativeTranscript(
             source: input.path,
             model: "Apple SpeechTranscriber",
@@ -210,8 +250,23 @@ struct TranscriberrrNative {
             language: locale.identifier,
             duration_seconds: duration.isFinite ? duration : (words.last?.end ?? 0),
             text: text,
-            segments: segments
+            segments: segments,
+            metadata: NativeMetadata(
+                transcribedWith: "transcriberrr",
+                version: transcriberrrVersion,
+                sourceCreatedAt: resourceValues?.creationDate.map(iso8601),
+                sourceModifiedAt: resourceValues?.contentModificationDate.map(iso8601),
+                transcribedAt: iso8601(Date()),
+                model: "Apple SpeechTranscriber",
+                diarization: nil
+            )
         )
+    }
+
+    private static func iso8601(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
     private static func buildSegments(_ words: [NativeWord]) -> [NativeSegment] {

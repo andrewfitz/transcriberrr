@@ -2,6 +2,7 @@ mod model_cache;
 
 use anyhow::{Context, Result, bail};
 use candle_core::Device;
+use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Parser, ValueEnum};
 #[cfg(feature = "diarization")]
 use parakeet_rs::sortformer::{DiarizationConfig, Sortformer};
@@ -317,6 +318,27 @@ struct TranscriptDocument {
     duration_seconds: f32,
     text: String,
     segments: Vec<Segment>,
+    metadata: TranscriptMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct TranscriptMetadata {
+    #[serde(rename = "transcribed-with")]
+    transcribed_with: &'static str,
+    version: &'static str,
+    source_created_at: Option<String>,
+    source_modified_at: Option<String>,
+    transcribed_at: String,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diarization: Option<DiarizationMetadata>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiarizationMetadata {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speakers: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -750,9 +772,10 @@ fn process_one(
             segment.words.clear();
         }
     }
+    let model = model_display_name(&cli.model);
     let doc = TranscriptDocument {
         source: job.input.display().to_string(),
-        model: cli.model.clone(),
+        model: model.clone(),
         device: match cli.device {
             DeviceKind::Metal => "metal-gpu",
             DeviceKind::Cpu => "cpu",
@@ -763,6 +786,18 @@ fn process_one(
         duration_seconds: audio.duration_seconds,
         text,
         segments,
+        metadata: TranscriptMetadata {
+            transcribed_with: "transcriberrr",
+            version: env!("CARGO_PKG_VERSION"),
+            source_created_at: source_timestamp(&job.input, FileTimestamp::Created),
+            source_modified_at: source_timestamp(&job.input, FileTimestamp::Modified),
+            transcribed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            model,
+            diarization: job.diarize.then_some(DiarizationMetadata {
+                enabled: true,
+                speakers: job.speakers,
+            }),
+        },
     };
     let output_path = output_path(cli, job);
     report(0.95, "Writing output")?;
@@ -1148,6 +1183,30 @@ fn segment_from_words(words: Vec<Word>) -> Segment {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum FileTimestamp {
+    Created,
+    Modified,
+}
+
+fn source_timestamp(path: &Path, kind: FileTimestamp) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    let timestamp = match kind {
+        FileTimestamp::Created => metadata.created().ok()?,
+        FileTimestamp::Modified => metadata.modified().ok()?,
+    };
+    Some(DateTime::<Utc>::from(timestamp).to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn model_display_name(value: &str) -> String {
+    Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != ".")
+        .unwrap_or(value)
+        .to_owned()
+}
+
 fn write_output(doc: &TranscriptDocument, path: &Path, format: OutputFormat) -> Result<()> {
     let content = match format {
         OutputFormat::Txt => format!("{}\n", doc.text),
@@ -1290,5 +1349,40 @@ fn positive_f32(value: &str) -> std::result::Result<f32, String> {
         Err("must be greater than zero".to_owned())
     } else {
         Ok(parsed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_name_is_path_free() {
+        assert_eq!(model_display_name("Qwen/Qwen3-ASR-1.7B"), "Qwen3-ASR-1.7B");
+        assert_eq!(
+            model_display_name("/models/parakeet-unified"),
+            "parakeet-unified"
+        );
+    }
+
+    #[test]
+    fn metadata_serializes_transcription_fields() {
+        let metadata = TranscriptMetadata {
+            transcribed_with: "transcriberrr",
+            version: "0.1.0",
+            source_created_at: Some("2026-10-15T12:00:00Z".to_owned()),
+            source_modified_at: Some("2026-10-15T12:01:00Z".to_owned()),
+            transcribed_at: "2026-10-15T12:02:00Z".to_owned(),
+            model: "Qwen3-ASR-1.7B".to_owned(),
+            diarization: Some(DiarizationMetadata {
+                enabled: true,
+                speakers: Some(2),
+            }),
+        };
+        let value = serde_json::to_value(metadata).expect("metadata should serialize");
+        assert_eq!(value["transcribed-with"], "transcriberrr");
+        assert_eq!(value["version"], "0.1.0");
+        assert_eq!(value["model"], "Qwen3-ASR-1.7B");
+        assert_eq!(value["diarization"]["speakers"], 2);
     }
 }

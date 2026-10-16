@@ -52,7 +52,7 @@ The build script refuses non-`Darwin arm64` hosts. For a CLI-only build, use `ca
 
 Use `--help` for all options. `--model-status` reports the local cache without network access. `--download-model qwen3-asr-1.7b` (repeat the flag for multiple models) prefetches model files. For a complete Rust-engine setup, use `--download-model qwen3-asr-1.7b --download-model qwen3-forced-aligner-0.6b --download-model parakeet-v3 --download-model sortformer-4spk`. Set `--model-cache PATH` or `TRANSCRIBERRR_MODEL_CACHE` to change the cache location. The default is `~/Library/Application Support/Transcriberrr/models/hub`.
 
-Qwen word timestamps use `Qwen/Qwen3-ForcedAligner-0.6B`. JSON places words in `segments[].words[]` with `text`, `start`, and `end` seconds. Word-level SRT/WebVTT emit one cue per word. Apple SpeechTranscriber installs its model through macOS `AssetInventory`; it is unavailable before macOS 26 and does not diarize.
+Qwen word timestamps use `Qwen/Qwen3-ForcedAligner-0.6B`. JSON places words in `segments[].words[]` with `text`, `start`, and `end` seconds. JSON also includes `metadata` with the Transcriberrr version, source creation/modification times, transcription time, model name, and optional diarization settings. Word-level SRT/WebVTT emit one cue per word. Apple SpeechTranscriber installs its model through macOS `AssetInventory`; it is unavailable before macOS 26 and does not diarize.
 
 ## Diarization
 
