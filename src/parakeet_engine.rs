@@ -120,11 +120,14 @@ impl ParakeetEngine {
         let chunk_samples = (chunk_seconds * 16_000.0).round().max(1.0) as usize;
         let chunks: Vec<&[f32]> = samples.chunks(chunk_samples).collect();
         let total = chunks.len().max(1);
+        let chunk_duration = chunk_samples as f32 / 16_000.0;
         let mut text_parts = Vec::with_capacity(chunks.len());
         let mut words = Vec::new();
         for (index, chunk) in chunks.iter().enumerate() {
             let mut result = self.transcribe(chunk, timestamps)?;
-            let offset = index as f32 * chunk_seconds;
+            // Use the actual sample count after rounding the requested duration so timestamps do
+            // not drift across chunks when chunk_seconds is not sample aligned.
+            let offset = index as f32 * chunk_duration;
             for word in &mut result.words {
                 word.start += offset;
                 word.end += offset;

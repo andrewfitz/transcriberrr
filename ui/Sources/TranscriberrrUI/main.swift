@@ -27,6 +27,8 @@ final class AudioItem: ObservableObject, Identifiable {
     @Published var speakerCount: Int?
     @Published var outputURL: URL?
     @Published var resultSummary = ""
+    @Published var elapsedSeconds: TimeInterval = 0
+    @Published var estimatedRemainingSeconds: TimeInterval?
 
     init(url: URL, id: UUID = UUID(), duration: TimeInterval = 0, diarize: Bool = false, speakerCount: Int? = nil) {
         self.id = id
@@ -137,6 +139,12 @@ private struct ProgressEvent: Decodable {
     var error: String?
     var progress: Double?
     var phase: String?
+    var elapsedSeconds: TimeInterval?
+
+    enum CodingKeys: String, CodingKey {
+        case input, status, output, error, progress, phase
+        case elapsedSeconds = "elapsed_seconds"
+    }
 }
 
 /// Incrementally consumes the CLI's JSONL progress file. Reading the complete
@@ -145,7 +153,10 @@ private struct ProgressEvent: Decodable {
 @MainActor
 private final class ProgressReader {
     private var offset: UInt64 = 0
-    private var remainder = ""
+    // Keep undecoded bytes rather than a String. FileHandle reads can split a
+    // multibyte UTF-8 character, and decoding each chunk independently would
+    // silently discard that partial event.
+    private var remainder = Data()
     private(set) var events: [String: ProgressEvent] = [:]
 
     func read(from url: URL) -> [String: ProgressEvent] {
@@ -154,17 +165,18 @@ private final class ProgressReader {
         try? handle.seek(toOffset: offset)
         let data = handle.readDataToEndOfFile()
         offset = handle.offsetInFile
-        guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return events }
+        guard !data.isEmpty else { return events }
 
-        let combined = remainder + text
-        let lines = combined.split(separator: "\n", omittingEmptySubsequences: false)
-        remainder = combined.hasSuffix("\n") ? "" : String(lines.last ?? "")
-        let completeLines = combined.hasSuffix("\n") ? lines : lines.dropLast()
-        for line in completeLines {
-            guard let event = try? JSONDecoder().decode(ProgressEvent.self, from: Data(line.utf8)) else { continue }
+        let combined = remainder + data
+        var lineStart = combined.startIndex
+        for index in combined.indices where combined[index] == 0x0A {
+            let line = combined[lineStart..<index]
+            lineStart = combined.index(after: index)
+            guard let event = try? JSONDecoder().decode(ProgressEvent.self, from: line) else { continue }
             let key = URL(fileURLWithPath: event.input).standardizedFileURL.resolvingSymlinksInPath().path
             events[key] = event
         }
+        remainder = Data(combined[lineStart...])
         return events
     }
 }
@@ -195,9 +207,11 @@ final class AppState: ObservableObject {
     /// `qwen` uses the Rust Metal pipeline; `apple-native` uses the bundled
     /// SpeechTranscriber helper on macOS 26 and newer.
     @Published var engine = "qwen"
-    // Use the CLI alias so a fresh install downloads Sortformer into the shared model cache.
+    // Use an absolute sentinel for the CLI alias. URL(fileURLWithPath:) resolves
+    // relative paths against the current working directory, which would turn
+    // `sortformer` into a nonexistent local model path and skip auto-download.
     // Users may replace this with a local ONNX file from the picker.
-    @Published var diarizationModel = URL(fileURLWithPath: "sortformer")
+    @Published var diarizationModel = URL(fileURLWithPath: "/sortformer")
     @Published var device = "metal"
     @Published var format = "json"
     @Published var timestamps = "words"
@@ -216,6 +230,11 @@ final class AppState: ObservableObject {
     private var pendingSave: Task<Void, Never>?
     private var cachedModelStatusValue: String?
     private var activeProcess: Process?
+    private var queueStartedAt: Date?
+    private var storedQueueElapsedSeconds: TimeInterval = 0
+    @Published private var clock = Date()
+    private var clockTask: Task<Void, Never>?
+    private var itemStartedAt: [UUID: Date] = [:]
 
     private var queueFile: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -247,20 +266,32 @@ final class AppState: ObservableObject {
         } / Double(tracked.count)
     }
 
+    var queueElapsedSeconds: TimeInterval {
+        guard let queueStartedAt else { return storedQueueElapsedSeconds }
+        return max(0, clock.timeIntervalSince(queueStartedAt))
+    }
+
+    var queueEstimatedRemainingSeconds: TimeInterval? {
+        let progress = queueProgress
+        let elapsed = queueElapsedSeconds
+        guard isRunning, progress > 0.01, elapsed > 0 else { return nil }
+        return max(0, elapsed * (1 / progress - 1))
+    }
+
     var modelStatus: String {
         if let cachedModelStatusValue { return cachedModelStatusValue }
         let value: String
         switch engine {
         case "apple-native": value = "Apple SpeechTranscriber (system model; macOS 26+)"
         case "parakeet-v3":
-            if modelID.hasPrefix("/") && FileManager.default.fileExists(atPath: modelID) {
-                value = "Local model ready"
+            if isLocalModelPath(modelID) {
+                value = localModelURL(modelID).map { FileManager.default.fileExists(atPath: $0.path) ? "Local model ready" : "Local model not found" } ?? "Local model not found"
             } else {
                 value = cachedModel(modelID) ? "Downloaded" : "Downloads on first use"
             }
         default:
-            if modelID.hasPrefix("/") && FileManager.default.fileExists(atPath: modelID) {
-                value = "Local model ready"
+            if isLocalModelPath(modelID) {
+                value = localModelURL(modelID).map { FileManager.default.fileExists(atPath: $0.path) ? "Local model ready" : "Local model not found" } ?? "Local model not found"
             } else {
                 value = cachedModel(modelID) ? "Downloaded" : "Downloads on first use"
             }
@@ -294,7 +325,7 @@ final class AppState: ObservableObject {
     }
 
     private func cachedModel(_ id: String) -> Bool {
-        guard !id.isEmpty, !id.hasPrefix("/") else { return false }
+        guard !id.isEmpty, !isLocalModelPath(id) else { return false }
         let normalizedID: String
         switch id {
         case "parakeet-v3", "parakeet-unified", "parakeet-unified-en", "nvidia/parakeet-unified-en-0.6b":
@@ -302,10 +333,14 @@ final class AppState: ObservableObject {
         default:
             normalizedID = id
         }
-        let root = ProcessInfo.processInfo.environment["TRANSCRIBERRR_MODEL_CACHE"]
-            .map(URL.init(fileURLWithPath:))
-            ?? FileManager.default.homeDirectoryForCurrentUser
+        let root: URL
+        if let configured = ProcessInfo.processInfo.environment["TRANSCRIBERRR_MODEL_CACHE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !configured.isEmpty {
+            root = URL(fileURLWithPath: configured)
+        } else {
+            root = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/Transcriberrr/models/hub")
+        }
         let encoded = normalizedID.replacingOccurrences(of: "/", with: "--")
         let snapshots = root.appendingPathComponent("models--\(encoded)/snapshots", isDirectory: true)
         guard let revisions = try? FileManager.default.contentsOfDirectory(
@@ -438,7 +473,9 @@ final class AppState: ObservableObject {
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
         panel.allowsOtherFileTypes = true
-        panel.directoryURL = current.deletingLastPathComponent()
+        panel.directoryURL = current.path == "/sortformer"
+            ? FileManager.default.homeDirectoryForCurrentUser
+            : current.deletingLastPathComponent()
         if panel.runModal() == .OK, let url = panel.url { completion(url) }
     }
 
@@ -463,6 +500,7 @@ final class AppState: ObservableObject {
         guard !items.isEmpty, !isRunning else { return }
         isRunning = true
         isCancelling = false
+        startQueueClock()
         Task { @MainActor in
             if outputDestination == .folder {
                 try? FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
@@ -471,6 +509,8 @@ final class AppState: ObservableObject {
             for (index, item) in pending.enumerated() {
                 item.state = .queued
                 item.progress = 0
+                item.elapsedSeconds = 0
+                item.estimatedRemainingSeconds = nil
                 item.resultSummary = index == 0 ? "Waiting for model setup…" : "Waiting…"
             }
             objectWillChange.send()
@@ -493,6 +533,7 @@ final class AppState: ObservableObject {
                     modelActivityMessage = result.message.isEmpty ? "Model setup failed." : result.message
                     modelActivityCanDismiss = true
                     modelActivitySucceeded = false
+                    finishQueueClock()
                     isRunning = false
                     isCancelling = false
                     saveQueue()
@@ -521,11 +562,17 @@ final class AppState: ObservableObject {
                 for item in pending {
                     item.state = .processing
                     item.progress = 0.05
+                    item.elapsedSeconds = 0
+                    item.estimatedRemainingSeconds = nil
                     item.resultSummary = "Transcribing…"
+                    itemStartedAt[item.id] = Date()
                     objectWillChange.send()
                     saveQueue()
                     let output = uniqueOutput(expectedOutput(for: item), reserved: &reservedOutputs)
                     let result = await runCLI(for: item, outputOverride: output)
+                    if let startedAt = itemStartedAt.removeValue(forKey: item.id) {
+                        item.elapsedSeconds = max(0, Date().timeIntervalSince(startedAt))
+                    }
                     if isCancelling { break }
                     apply(result, to: item)
                     saveQueue()
@@ -540,6 +587,7 @@ final class AppState: ObservableObject {
                 saveQueue()
             }
             if isCancelling { markCanceled(pending) }
+            finishQueueClock()
             isRunning = false
             isCancelling = false
             activeProcess = nil
@@ -547,11 +595,39 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func startQueueClock() {
+        clockTask?.cancel()
+        let now = Date()
+        clock = now
+        queueStartedAt = now
+        storedQueueElapsedSeconds = 0
+        clockTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled, self.isRunning {
+                self.clock = Date()
+                for item in self.items where item.state == .processing {
+                    if let startedAt = self.itemStartedAt[item.id] {
+                        item.elapsedSeconds = max(0, self.clock.timeIntervalSince(startedAt))
+                    }
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    private func finishQueueClock() {
+        clock = Date()
+        storedQueueElapsedSeconds = queueElapsedSeconds
+        queueStartedAt = nil
+        clockTask?.cancel()
+        clockTask = nil
+        itemStartedAt.removeAll()
+    }
+
     private func requiredModelDownloads(for pending: [AudioItem]) -> [String] {
         guard engine != "apple-native" else { return [] }
         var values: [String] = []
         func append(_ value: String) {
-            guard !value.isEmpty, !value.hasPrefix("/"), !values.contains(value) else { return }
+            guard !value.isEmpty, !isLocalModelPath(value), !values.contains(value) else { return }
             guard modelNeedsDownload(value) else { return }
             values.append(value)
         }
@@ -566,6 +642,7 @@ final class AppState: ObservableObject {
     }
 
     private func modelNeedsDownload(_ value: String) -> Bool {
+        guard !isLocalModelPath(value) else { return false }
         if value == "sortformer" || value == "/sortformer" {
             return !cachedSortformer()
         }
@@ -573,10 +650,14 @@ final class AppState: ObservableObject {
     }
 
     private func cachedSortformer() -> Bool {
-        let root = ProcessInfo.processInfo.environment["TRANSCRIBERRR_MODEL_CACHE"]
-            .map(URL.init(fileURLWithPath:))
-            ?? FileManager.default.homeDirectoryForCurrentUser
+        let root: URL
+        if let configured = ProcessInfo.processInfo.environment["TRANSCRIBERRR_MODEL_CACHE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !configured.isEmpty {
+            root = URL(fileURLWithPath: configured)
+        } else {
+            root = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/Transcriberrr/models/hub")
+        }
         let repo = root.appendingPathComponent("models--altunenes--parakeet-rs/snapshots", isDirectory: true)
         guard let enumerator = FileManager.default.enumerator(at: repo, includingPropertiesForKeys: [.isRegularFileKey]) else {
             return false
@@ -659,10 +740,12 @@ final class AppState: ObservableObject {
     private func apply(_ result: (status: Int32, message: String, outputURL: URL?), to item: AudioItem) {
         if result.status == 0 {
             item.progress = 1
+            item.estimatedRemainingSeconds = nil
             item.state = .done
             item.outputURL = result.outputURL
             item.resultSummary = result.outputURL.map { "Saved to \($0.path)" } ?? "Transcription complete"
         } else {
+            item.estimatedRemainingSeconds = nil
             item.state = .failed(result.message.isEmpty ? "Transcription failed" : result.message)
             item.resultSummary = item.state.label
         }
@@ -677,17 +760,22 @@ final class AppState: ObservableObject {
             if let event, (event.status == "completed" || event.status == "skipped") {
                 let output = event.output.map(URL.init(fileURLWithPath:))
                 item.progress = 1
+                item.elapsedSeconds = event.elapsedSeconds ?? item.elapsedSeconds
+                item.estimatedRemainingSeconds = nil
                 item.state = .done
                 item.outputURL = output
                 item.resultSummary = output.map { "Saved to \($0.path)" } ?? "Transcription complete"
             } else if result.status == 0 {
                 let output = expectedOutput(for: item)
                 item.progress = 1
+                item.estimatedRemainingSeconds = nil
                 item.state = .done
                 item.outputURL = output
                 item.resultSummary = "Saved to \(output.path)"
             } else {
                 let message = event?.error ?? (fallback.isEmpty ? "Transcription failed" : fallback)
+                item.elapsedSeconds = event?.elapsedSeconds ?? item.elapsedSeconds
+                item.estimatedRemainingSeconds = nil
                 item.state = .failed(message)
                 item.resultSummary = message
             }
@@ -823,9 +911,17 @@ final class AppState: ObservableObject {
                             if event.status == "running" {
                                 item.state = .processing
                                 item.progress = event.progress ?? max(item.progress, 0.05)
+                                if let elapsed = event.elapsedSeconds {
+                                    item.elapsedSeconds = elapsed
+                                    item.estimatedRemainingSeconds = item.progress > 0.01
+                                        ? max(0, elapsed * (1 / item.progress - 1))
+                                        : nil
+                                }
                                 item.resultSummary = event.phase ?? "Transcribing…"
                             } else if event.status == "completed" {
                                 item.progress = 0.95
+                                item.elapsedSeconds = event.elapsedSeconds ?? item.elapsedSeconds
+                                item.estimatedRemainingSeconds = nil
                                 item.resultSummary = "Transcription complete; saving…"
                             }
                         }
@@ -853,12 +949,12 @@ final class AppState: ObservableObject {
             progressPoller.cancel()
             await progressPoller.value
             let events = progressReader.read(from: progressURL)
+            // The parent is shared by other app instances; remove only this
+            // job's directory so their active manifests remain intact.
             try? FileManager.default.removeItem(at: temporaryRoot)
-            try? FileManager.default.removeItem(at: temporaryRoot.deletingLastPathComponent())
             return (result.0, result.1, events)
         } catch {
             try? FileManager.default.removeItem(at: temporaryRoot)
-            try? FileManager.default.removeItem(at: temporaryRoot.deletingLastPathComponent())
             return (1, error.localizedDescription, [:])
         }
     }
@@ -873,11 +969,22 @@ final class AppState: ObservableObject {
         outputDestination = OutputDestination(rawValue: saved.outputDestination) ?? .folder
         modelID = saved.modelID
         engine = saved.engine ?? "qwen"
-        let savedDiarizationModel = URL(fileURLWithPath: saved.diarizationModel)
-        diarizationModel = (!FileManager.default.fileExists(atPath: savedDiarizationModel.path)
-                            && savedDiarizationModel.pathExtension.lowercased() == "onnx")
-            ? URL(fileURLWithPath: "sortformer")
-            : savedDiarizationModel
+        let savedDiarizationPath = saved.diarizationModel
+        let isLegacySortformerAlias = savedDiarizationPath == "sortformer"
+            || savedDiarizationPath == "/sortformer"
+            || (savedDiarizationPath.hasSuffix("/sortformer")
+                && !FileManager.default.fileExists(atPath: savedDiarizationPath))
+        if isLegacySortformerAlias {
+            // Preserve the alias when loading both new and older queue files;
+            // passing "sortformer" through URL(fileURLWithPath:) makes it cwd-relative.
+            diarizationModel = URL(fileURLWithPath: "/sortformer")
+        } else {
+            let savedDiarizationModel = URL(fileURLWithPath: saved.diarizationModel)
+            diarizationModel = (!FileManager.default.fileExists(atPath: savedDiarizationModel.path)
+                                && savedDiarizationModel.pathExtension.lowercased() == "onnx")
+                ? URL(fileURLWithPath: "/sortformer")
+                : savedDiarizationModel
+        }
         device = saved.device
         format = saved.format
         timestamps = saved.timestamps
@@ -972,6 +1079,20 @@ final class AppState: ObservableObject {
 
     private func isSupported(_ url: URL) -> Bool {
         supportedExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    private func isLocalModelPath(_ value: String) -> Bool {
+        value == "~" || value.hasPrefix("~/") || value.hasPrefix("/")
+    }
+
+    private func localModelURL(_ value: String) -> URL? {
+        guard isLocalModelPath(value) else { return nil }
+        if value == "~" { return FileManager.default.homeDirectoryForCurrentUser }
+        if value.hasPrefix("~/") {
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(String(value.dropFirst(2)))
+        }
+        return URL(fileURLWithPath: value)
     }
 
     private func isDirectory(_ url: URL) -> Bool {
@@ -1203,6 +1324,11 @@ struct ContentView: View {
                     Text(item.url.lastPathComponent).lineLimit(1)
                     Text("\(formatDuration(item.duration))  •  \(item.url.deletingLastPathComponent().path)")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    if item.state == .processing || item.elapsedSeconds > 0 {
+                        Text(itemTimingLabel(item))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                     if let outputURL = item.outputURL {
                         Button {
                             state.revealOutput(for: item)
@@ -1364,6 +1490,16 @@ struct ContentView: View {
                     Text("\(state.completedCount) of \(state.selectedCount) selected complete")
                     Text("\(formatDuration(state.totalDuration)) queued")
                         .font(.caption).foregroundStyle(.secondary)
+                    if state.isRunning || state.queueElapsedSeconds > 0 {
+                        HStack(spacing: 6) {
+                            Text("\(formatElapsed(state.queueElapsedSeconds)) elapsed")
+                            if let remaining = state.queueEstimatedRemainingSeconds {
+                                Text("• ~\(formatElapsed(remaining)) remaining")
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
                 if state.isRunning {
@@ -1445,4 +1581,21 @@ private func formatDuration(_ duration: TimeInterval) -> String {
     guard duration.isFinite, duration > 0 else { return "Unknown duration" }
     let total = Int(duration.rounded())
     return total >= 3600 ? String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60) : String(format: "%d:%02d", total / 60, total % 60)
+}
+
+private func formatElapsed(_ duration: TimeInterval) -> String {
+    guard duration.isFinite, duration >= 0 else { return "--:--" }
+    let total = Int(duration.rounded())
+    return total >= 3600
+        ? String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+        : String(format: "%d:%02d", total / 60, total % 60)
+}
+
+@MainActor
+private func itemTimingLabel(_ item: AudioItem) -> String {
+    var label = "\(formatElapsed(item.elapsedSeconds)) elapsed"
+    if let remaining = item.estimatedRemainingSeconds {
+        label += " • ~\(formatElapsed(remaining)) remaining"
+    }
+    return label
 }

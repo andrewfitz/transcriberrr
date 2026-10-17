@@ -86,7 +86,10 @@ impl ModelCache {
     /// Resolve a model ID or local directory.  A remote ID is downloaded into this cache and the
     /// local immutable snapshot path is returned to inference libraries.
     pub fn ensure(&self, id_or_path: &str) -> Result<PathBuf> {
-        let id_or_path = canonical_id(id_or_path);
+        // Accept shell-style home paths even when the value came from a repeated
+        // --download-model argument or a manifest rather than a top-level CLI path.
+        let expanded = expand_home(Path::new(id_or_path));
+        let id_or_path = canonical_id(&expanded.to_string_lossy());
         let path = Path::new(&id_or_path);
         if path.exists() {
             if path.is_dir() {
@@ -148,6 +151,7 @@ impl ModelCache {
             .or_else(|_| repo.get("model.onnx"))
             .or_else(|_| repo.get("encoder-model.onnx"))
             .or_else(|_| repo.get("diar_streaming_sortformer_4spk-v2.1.nemo"))
+            .map(snapshot_dir)
             .with_context(|| format!("model {id_or_path:?} has no recognised entry point"))
     }
 
@@ -183,6 +187,9 @@ impl ModelCache {
             for marker in [
                 "model.safetensors",
                 "model.safetensors.index.json",
+                "pytorch_model.bin",
+                "pytorch_model.bin.index.json",
+                "model.bin",
                 "model.onnx",
                 "encoder-model.onnx",
             ] {
@@ -214,10 +221,21 @@ impl ModelCache {
     }
 }
 
+fn snapshot_dir(entry_point: PathBuf) -> PathBuf {
+    // Inference backends consume the snapshot directory, not the marker file. Returning
+    // config.json here makes a subsequent ensure() reject the path as a file and prevents
+    // Qwen/aligner models from loading.
+    entry_point
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(entry_point)
+}
+
 fn is_model_asset(name: &str) -> bool {
     matches!(
         Path::new(name).extension().and_then(|ext| ext.to_str()),
         Some("json")
+            | Some("bin")
             | Some("safetensors")
             | Some("onnx")
             | Some("data")
@@ -228,10 +246,14 @@ fn is_model_asset(name: &str) -> bool {
 }
 
 pub fn default_cache_dir() -> PathBuf {
-    if let Ok(path) = env::var("TRANSCRIBERRR_MODEL_CACHE") {
+    if let Ok(path) = env::var("TRANSCRIBERRR_MODEL_CACHE")
+        && !path.trim().is_empty()
+    {
         return PathBuf::from(path);
     }
-    if let Ok(home) = env::var("HOME") {
+    if let Ok(home) = env::var("HOME")
+        && !home.trim().is_empty()
+    {
         return PathBuf::from(home).join("Library/Application Support/Transcriberrr/models/hub");
     }
     PathBuf::from(".transcriberrr/models/hub")
@@ -256,8 +278,13 @@ fn expand_home(path: &Path) -> PathBuf {
     let value = path.to_string_lossy();
     if (value == "~" || value.starts_with("~/"))
         && let Ok(home) = env::var("HOME")
+        && !home.trim().is_empty()
     {
-        return PathBuf::from(home).join(value.trim_start_matches("~/"));
+        return if value == "~" {
+            PathBuf::from(home)
+        } else {
+            PathBuf::from(home).join(value.trim_start_matches("~/"))
+        };
     }
     path.to_path_buf()
 }
@@ -274,5 +301,14 @@ mod tests {
             PARAKEET_UNIFIED_EN
         );
         assert_eq!(canonical_id("qwen3-asr-1.7b"), QWEN3_ASR_17B);
+    }
+
+    #[test]
+    fn ensure_entry_point_resolves_to_snapshot_directory() {
+        let entry = PathBuf::from("/tmp/hub/models--Qwen--Qwen3/snapshots/abc/config.json");
+        assert_eq!(
+            snapshot_dir(entry),
+            PathBuf::from("/tmp/hub/models--Qwen--Qwen3/snapshots/abc")
+        );
     }
 }

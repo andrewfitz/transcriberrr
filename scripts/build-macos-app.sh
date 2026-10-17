@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 UI_DIR="$ROOT_DIR/ui"
 APP_DIR="$ROOT_DIR/dist/Transcriberrr.app"
+VERSION="$(awk -F '"' '/^version = / { print $2; exit }' "$ROOT_DIR/Cargo.toml")"
+
+if [[ -z "$VERSION" ]]; then
+    echo "Unable to determine the package version from Cargo.toml" >&2
+    exit 1
+fi
 
 if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
     echo "Transcriberrr requires an Apple Silicon Mac (Darwin arm64)." >&2
@@ -42,4 +48,5 @@ cp "$CLI_BIN" "$APP_DIR/Contents/Resources/transcriberrr"
 cp "$NATIVE_BIN" "$APP_DIR/Contents/Resources/transcriberrr-native"
 chmod 755 "$APP_DIR/Contents/MacOS/Transcriberrr" "$APP_DIR/Contents/Resources/transcriberrr" "$APP_DIR/Contents/Resources/transcriberrr-native"
 cp "$UI_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP_DIR/Contents/Info.plist"
 echo "Built $APP_DIR"

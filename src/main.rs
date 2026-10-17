@@ -167,6 +167,14 @@ struct Job {
     output_location: OutputLocation,
 }
 
+struct InferenceModels<'a> {
+    asr: Option<&'a Qwen3Asr>,
+    aligner: Option<&'a Qwen3ForcedAligner>,
+    parakeet: Option<&'a mut ParakeetEngine>,
+    diarizer: &'a mut Option<Diarizer>,
+    model_label: &'a str,
+}
+
 #[derive(Debug, Deserialize)]
 struct JobManifest {
     items: Vec<ManifestItem>,
@@ -339,6 +347,10 @@ struct DiarizationMetadata {
     enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     speakers: Option<usize>,
+    /// Number of distinct speaker IDs returned by Sortformer. `speakers` retains the
+    /// user-requested maximum for backwards compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detected_speakers: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -384,6 +396,10 @@ fn main() -> Result<()> {
             cli.model = parakeet_engine::DEFAULT_MODEL_ID.to_owned();
         }
     }
+    // Keep the user-facing model identifier before replacing it with a local cache snapshot path.
+    // Inference needs the resolved directory, while transcript metadata should remain stable
+    // across cache revisions and machines.
+    let model_label = model_display_name(&cli.model);
     ensure_apple_silicon()?;
     let jobs = collect_jobs(&cli)?;
     if jobs.is_empty() {
@@ -412,12 +428,6 @@ fn main() -> Result<()> {
         bail!(
             "TXT cannot carry timestamps; use --format json, srt, or vtt, or disable them with --timestamps none"
         );
-    }
-    if matches!(cli.engine, EngineKind::Qwen3 | EngineKind::ParakeetV3) {
-        cli.model = model_cache
-            .ensure(&cli.model)?
-            .to_string_lossy()
-            .into_owned();
     }
     if matches!(cli.engine, EngineKind::Qwen3) && cli.timestamps != TimestampGranularity::None {
         cli.forced_aligner = model_cache
@@ -517,8 +527,13 @@ fn main() -> Result<()> {
     #[cfg(feature = "diarization")]
     let mut diarizer = if wants_diarization {
         let path = diarization_model_path.as_ref().expect("validated above");
-        let execution_config = parakeet_rs::ExecutionConfig::new()
-            .with_execution_provider(parakeet_rs::ExecutionProvider::BurnWgpu);
+        let provider = if matches!(cli.device, DeviceKind::Cpu) {
+            parakeet_rs::ExecutionProvider::BurnCpu
+        } else {
+            parakeet_rs::ExecutionProvider::BurnWgpu
+        };
+        let execution_config =
+            parakeet_rs::ExecutionConfig::new().with_execution_provider(provider);
         Some(
             Sortformer::with_config(path, Some(execution_config), DiarizationConfig::default())
                 .with_context(|| format!("loading diarization model {}", path.display()))?,
@@ -570,10 +585,13 @@ fn main() -> Result<()> {
         match process_one(
             &cli,
             &job,
-            asr.as_ref(),
-            aligner.as_ref(),
-            parakeet.as_mut(),
-            &mut diarizer,
+            InferenceModels {
+                asr: asr.as_ref(),
+                aligner: aligner.as_ref(),
+                parakeet: parakeet.as_mut(),
+                diarizer: &mut diarizer,
+                model_label: &model_label,
+            },
             &mut report,
         ) {
             Ok(output) => progress.record(ProgressEvent {
@@ -662,7 +680,10 @@ fn transcribe_qwen_chunks(
         if !result.text.trim().is_empty() {
             text_parts.push(result.text);
         }
-        let offset = index as f32 * cli.chunk_seconds;
+        // Offset by the actual number of samples in each chunk. Rounding the requested duration
+        // to a sample count otherwise accumulates timestamp drift for non-integral durations.
+        let chunk_duration = chunk_samples as f32 / TARGET_SAMPLE_RATE as f32;
+        let offset = index as f32 * chunk_duration;
         if let Some(value) = result.timestamps {
             let envelope = serde_json::from_value::<TimestampEnvelope>(value)
                 .context("Qwen3 returned timestamps in an unexpected format")?;
@@ -684,10 +705,7 @@ fn transcribe_qwen_chunks(
 fn process_one(
     cli: &Cli,
     job: &Job,
-    asr: Option<&Qwen3Asr>,
-    aligner: Option<&Qwen3ForcedAligner>,
-    parakeet: Option<&mut ParakeetEngine>,
-    diarizer: &mut Option<Diarizer>,
+    models: InferenceModels<'_>,
     report: &mut dyn FnMut(f32, &str) -> Result<()>,
 ) -> Result<PathBuf> {
     if matches!(cli.engine, EngineKind::AppleNative) {
@@ -708,7 +726,7 @@ fn process_one(
     }
     report(0.2, "Transcribing")?;
     let want_timestamps = cli.timestamps != TimestampGranularity::None;
-    let (text, language, aligned) = if let Some(parakeet) = parakeet {
+    let (text, language, aligned) = if let Some(parakeet) = models.parakeet {
         #[cfg(feature = "parakeet")]
         {
             let result = parakeet.transcribe_with_progress(
@@ -734,13 +752,20 @@ fn process_one(
             unreachable!("Parakeet engine requires the diarization feature")
         }
     } else {
-        let asr = asr.context("Qwen3 engine was not initialized")?;
-        transcribe_qwen_chunks(cli, asr, aligner, &audio.samples, want_timestamps, report)?
+        let asr = models.asr.context("Qwen3 engine was not initialized")?;
+        transcribe_qwen_chunks(
+            cli,
+            asr,
+            models.aligner,
+            &audio.samples,
+            want_timestamps,
+            report,
+        )?
     };
     report(0.75, "Building timestamps")?;
     let speaker_segments = if job.diarize {
         report(0.82, "Diarizing")?;
-        run_diarization(diarizer, &audio.samples, job.speakers.unwrap_or(8))?
+        run_diarization(models.diarizer, &audio.samples, job.speakers.unwrap_or(8))?
     } else {
         None
     };
@@ -755,13 +780,17 @@ fn process_one(
         .filter(|word| !word.text.trim().is_empty())
         .collect::<Vec<_>>();
     let mut segments = if words.is_empty() {
-        vec![Segment {
-            text: text.clone(),
-            start: 0.0,
-            end: audio.duration_seconds,
-            speaker: None,
-            words: Vec::new(),
-        }]
+        if text.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![Segment {
+                text: text.clone(),
+                start: 0.0,
+                end: audio.duration_seconds,
+                speaker: None,
+                words: Vec::new(),
+            }]
+        }
     } else {
         build_segments(words)
     };
@@ -772,7 +801,7 @@ fn process_one(
             segment.words.clear();
         }
     }
-    let model = model_display_name(&cli.model);
+    let model = models.model_label.to_owned();
     let doc = TranscriptDocument {
         source: job.input.display().to_string(),
         model: model.clone(),
@@ -796,12 +825,16 @@ fn process_one(
             diarization: job.diarize.then_some(DiarizationMetadata {
                 enabled: true,
                 speakers: job.speakers,
+                detected_speakers: detected_speaker_count(&speaker_segments),
             }),
         },
     };
     let output_path = output_path(cli, job);
     report(0.95, "Writing output")?;
-    if let Some(parent) = output_path.parent() {
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating output directory {}", parent.display()))?;
     }
@@ -828,7 +861,10 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
         "Apple SpeechTranscriber helper is not bundled; set TRANSCRIBERRR_NATIVE or build the macOS app",
     )?;
     let output_path = output_path(cli, job);
-    if let Some(parent) = output_path.parent() {
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating output directory {}", parent.display()))?;
     }
@@ -863,6 +899,12 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
         })?;
     if !status.success() {
         bail!("Apple SpeechTranscriber failed with status {status}");
+    }
+    if !output_path.is_file() {
+        bail!(
+            "Apple SpeechTranscriber exited successfully but did not create {}",
+            output_path.display()
+        );
     }
     Ok(output_path)
 }
@@ -1008,16 +1050,11 @@ fn decode_audio(path: &Path) -> Result<Audio> {
     if sample_rate == 0 {
         bail!("audio stream has an invalid zero sample rate");
     }
-    // Some AAC/M4A files omit the channel layout in container metadata even though the
-    // decoder provides it on the first decoded buffer. Keep that case recoverable.
-    let declared_channels = track
-        .codec_params
-        .channels
-        .map(|value| value.count())
-        .unwrap_or(0);
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
     let mut interleaved = Vec::new();
-    let mut decoded_channels = declared_channels;
+    // Use the decoder's actual channel count rather than trusting container metadata. Some
+    // AAC/M4A files declare a stale layout, while the first decoded buffer has the real count.
+    let mut decoded_channels = 0;
     loop {
         let packet = match format.next_packet() {
             Ok(packet) if packet.track_id() == track_id => packet,
@@ -1074,11 +1111,12 @@ fn downmix(samples: Vec<f32>, channels: usize) -> Vec<f32> {
 }
 
 fn resample_linear(input: Vec<f32>, source_rate: u32, target_rate: u32) -> Vec<f32> {
-    if source_rate == target_rate {
+    if input.is_empty() || source_rate == target_rate {
         return input;
     }
-    let output_len =
-        ((input.len() as f64 * target_rate as f64) / source_rate as f64).round() as usize;
+    let output_len = (((input.len() as f64 * target_rate as f64) / source_rate as f64)
+        .round()
+        .max(1.0)) as usize;
     (0..output_len)
         .map(|index| {
             let pos = index as f64 * source_rate as f64 / target_rate as f64;
@@ -1101,6 +1139,17 @@ fn speaker_at(segments: &Option<Vec<SpeakerSpan>>, start: f32, end: f32) -> Opti
                 && midpoint <= segment.end as f32 / TARGET_SAMPLE_RATE as f32
         })
         .map(|segment| segment.speaker_id)
+}
+
+fn detected_speaker_count(segments: &Option<Vec<SpeakerSpan>>) -> Option<usize> {
+    let segments = segments.as_ref()?;
+    let mut ids = segments
+        .iter()
+        .map(|segment| segment.speaker_id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    Some(ids.len())
 }
 
 #[cfg(feature = "diarization")]
@@ -1164,11 +1213,36 @@ fn segment_from_words(words: Vec<Word>) -> Segment {
     let speaker = words.first().and_then(|word| word.speaker);
     let mut text = String::new();
     for (index, word) in words.iter().enumerate() {
-        let punctuation = word.text.len() == 1
-            && word
-                .text
-                .chars()
-                .all(|character| matches!(character, '.' | ',' | '!' | '?' | ';' | ':' | ')'));
+        let punctuation = word.text.chars().count() == 1
+            && word.text.chars().all(|character| {
+                matches!(
+                    character,
+                    '.' | ','
+                        | '!'
+                        | '?'
+                        | ';'
+                        | ':'
+                        | ')'
+                        | ']'
+                        | '}'
+                        | '。'
+                        | '，'
+                        | '！'
+                        | '？'
+                        | '；'
+                        | '：'
+                        | '、'
+                        | '）'
+                        | '］'
+                        | '｝'
+                        | '」'
+                        | '』'
+                        | '》'
+                        | '〉'
+                        | '”'
+                        | '’'
+                )
+            });
         if index > 0 && !punctuation {
             text.push(' ');
         }
@@ -1334,10 +1408,15 @@ fn is_audio_path(path: &Path) -> bool {
 }
 fn expand_home(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
-    if let Some(rest) = raw.strip_prefix("~/")
+    if (raw == "~" || raw.starts_with("~/"))
         && let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
     {
-        return PathBuf::from(home).join(rest);
+        return if raw == "~" {
+            PathBuf::from(home)
+        } else {
+            PathBuf::from(home).join(raw.trim_start_matches("~/"))
+        };
     }
     path.to_path_buf()
 }
@@ -1345,8 +1424,8 @@ fn positive_f32(value: &str) -> std::result::Result<f32, String> {
     let parsed = value
         .parse::<f32>()
         .map_err(|_| "must be a number".to_owned())?;
-    if parsed <= 0.0 {
-        Err("must be greater than zero".to_owned())
+    if !parsed.is_finite() || parsed <= 0.0 {
+        Err("must be a finite number greater than zero".to_owned())
     } else {
         Ok(parsed)
     }
@@ -1377,6 +1456,7 @@ mod tests {
             diarization: Some(DiarizationMetadata {
                 enabled: true,
                 speakers: Some(2),
+                detected_speakers: Some(2),
             }),
         };
         let value = serde_json::to_value(metadata).expect("metadata should serialize");
@@ -1384,5 +1464,64 @@ mod tests {
         assert_eq!(value["version"], "0.1.0");
         assert_eq!(value["model"], "Qwen3-ASR-1.7B");
         assert_eq!(value["diarization"]["speakers"], 2);
+        assert_eq!(value["diarization"]["detected_speakers"], 2);
+    }
+
+    #[test]
+    fn detected_speaker_count_deduplicates_ids() {
+        let spans = Some(vec![
+            SpeakerSpan {
+                start: 0,
+                end: 1,
+                speaker_id: 2,
+            },
+            SpeakerSpan {
+                start: 1,
+                end: 2,
+                speaker_id: 1,
+            },
+            SpeakerSpan {
+                start: 2,
+                end: 3,
+                speaker_id: 2,
+            },
+        ]);
+        assert_eq!(detected_speaker_count(&spans), Some(2));
+        assert_eq!(detected_speaker_count(&None), None);
+    }
+
+    #[test]
+    fn resampling_keeps_nonempty_short_audio() {
+        assert_eq!(
+            resample_linear(vec![0.5], 192_000, TARGET_SAMPLE_RATE),
+            vec![0.5]
+        );
+        assert!(resample_linear(Vec::new(), 192_000, TARGET_SAMPLE_RATE).is_empty());
+    }
+
+    #[test]
+    fn chunk_seconds_rejects_non_finite_values() {
+        assert!(positive_f32("NaN").is_err());
+        assert!(positive_f32("inf").is_err());
+        assert_eq!(positive_f32("1.5"), Ok(1.5));
+    }
+
+    #[test]
+    fn segments_do_not_space_cjk_punctuation() {
+        let segments = build_segments(vec![
+            Word {
+                text: "你好".to_owned(),
+                start: 0.0,
+                end: 0.5,
+                speaker: None,
+            },
+            Word {
+                text: "。".to_owned(),
+                start: 0.5,
+                end: 0.6,
+                speaker: None,
+            },
+        ]);
+        assert_eq!(segments[0].text, "你好。");
     }
 }
