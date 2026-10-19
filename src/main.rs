@@ -1,9 +1,14 @@
 mod model_cache;
+mod transcript;
+use transcript::{
+    DiarizationMetadata, Segment, TranscriptDocument, TranscriptMetadata, Word, build_segments,
+    preserve_word_text, write_output,
+};
 
 use anyhow::{Context, Result, bail};
 use candle_core::Device;
 use chrono::{DateTime, SecondsFormat, Utc};
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "diarization")]
 use parakeet_rs::sortformer::{DiarizationConfig, Sortformer};
 use qwen3_asr::forced_aligner::{ForcedAlignProcessor, Qwen3ForcedAligner};
@@ -41,9 +46,13 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 #[command(
     name = "transcriberrr",
     version,
-    about = "Offline Qwen3-ASR transcription on Apple Silicon"
+    about = "Offline Qwen3-ASR transcription on Apple Silicon",
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
     #[arg(value_name = "AUDIO", required_unless_present_any = ["input_dir", "manifest", "model_status", "download_model"])]
     inputs: Vec<PathBuf>,
     #[arg(long, conflicts_with_all = ["inputs", "manifest"])]
@@ -106,6 +115,75 @@ struct Cli {
     fail_fast: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    /// Convert a transcript JSON without loading audio or models.
+    Convert(ConvertArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConvertArgs {
+    #[arg(value_name = "TRANSCRIPT.json")]
+    input: PathBuf,
+    /// Destination file (defaults to INPUT.converted.EXT).
+    #[arg(long, short = 'o')]
+    output: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Txt)]
+    format: OutputFormat,
+    /// Sentence/segment timestamps by default; none produces plain text.
+    #[arg(long, value_enum, default_value_t = TimestampGranularity::Sentences)]
+    timestamps: TimestampGranularity,
+    #[arg(long)]
+    overwrite: bool,
+}
+
+fn convert_transcript(args: ConvertArgs) -> Result<()> {
+    let input = expand_home(&args.input);
+    let file = File::open(&input).with_context(|| format!("opening {}", input.display()))?;
+    let mut doc: TranscriptDocument = serde_json::from_reader(BufReader::new(file))
+        .with_context(|| format!("reading transcript {}", input.display()))?;
+    doc.validate()?;
+    if args.timestamps == TimestampGranularity::Words
+        && doc.segments.iter().any(|segment| segment.words.is_empty())
+    {
+        bail!("word timestamps require a transcript with words in every segment");
+    }
+    if args.timestamps != TimestampGranularity::Words {
+        doc.collapse_words();
+    }
+    let extension = match args.format {
+        OutputFormat::Txt => "txt",
+        OutputFormat::Json => "json",
+        OutputFormat::Srt => "srt",
+        OutputFormat::Vtt => "vtt",
+    };
+    let output = args
+        .output
+        .as_deref()
+        .map(expand_home)
+        .unwrap_or_else(|| input.with_extension(format!("converted.{extension}")));
+    if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let content = transcript::render_output(&doc, args.format, args.timestamps)?;
+    // create_new prevents accidental clobbering, including races with another converter.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .create_new(!args.overwrite)
+        .truncate(args.overwrite)
+        .open(&output)
+        .with_context(|| {
+            format!(
+                "creating {} (use --overwrite to replace an existing file)",
+                output.display()
+            )
+        })?;
+    file.write_all(content.as_bytes())?;
+    eprintln!("{} -> {}", input.display(), output.display());
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum EngineKind {
     #[value(name = "qwen3")]
@@ -148,6 +226,7 @@ enum OutputLocation {
 enum TimestampGranularity {
     None,
     Words,
+    #[value(alias = "segments")]
     Sentences,
 }
 
@@ -298,63 +377,11 @@ struct AlignedWord {
     end_time: f32,
 }
 
-#[derive(Debug, Serialize)]
-struct Word {
-    text: String,
-    start: f32,
-    end: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    speaker: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-struct Segment {
-    text: String,
-    start: f32,
-    end: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    speaker: Option<usize>,
-    words: Vec<Word>,
-}
-
-#[derive(Debug, Serialize)]
-struct TranscriptDocument {
-    source: String,
-    model: String,
-    device: String,
-    language: String,
-    duration_seconds: f32,
-    text: String,
-    segments: Vec<Segment>,
-    metadata: TranscriptMetadata,
-}
-
-#[derive(Debug, Serialize)]
-struct TranscriptMetadata {
-    #[serde(rename = "transcribed-with")]
-    transcribed_with: &'static str,
-    version: &'static str,
-    source_created_at: Option<String>,
-    source_modified_at: Option<String>,
-    transcribed_at: String,
-    model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    diarization: Option<DiarizationMetadata>,
-}
-
-#[derive(Debug, Serialize)]
-struct DiarizationMetadata {
-    enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    speakers: Option<usize>,
-    /// Number of distinct speaker IDs returned by Sortformer. `speakers` retains the
-    /// user-requested maximum for backwards compatibility.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detected_speakers: Option<usize>,
-}
-
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    if let Some(CliCommand::Convert(args)) = cli.command.take() {
+        return convert_transcript(args);
+    }
     // Clap intentionally leaves path values untouched. Expand shell-style home paths here so
     // output/model paths behave the same way as input paths on macOS.
     cli.output_dir = expand_home(&cli.output_dir);
@@ -421,13 +448,6 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "parakeet"))]
     if matches!(cli.engine, EngineKind::ParakeetV3) {
         bail!("Parakeet support is not included in this build; rebuild with --features parakeet");
-    }
-    if matches!(cli.format, OutputFormat::Txt)
-        && !matches!(cli.timestamps, TimestampGranularity::None)
-    {
-        bail!(
-            "TXT cannot carry timestamps; use --format json, srt, or vtt, or disable them with --timestamps none"
-        );
     }
     if matches!(cli.engine, EngineKind::Qwen3) && cli.timestamps != TimestampGranularity::None {
         cli.forced_aligner = model_cache
@@ -769,7 +789,7 @@ fn process_one(
     } else {
         None
     };
-    let words = aligned
+    let mut words = aligned
         .into_iter()
         .map(|item| Word {
             text: item.text,
@@ -779,12 +799,16 @@ fn process_one(
         })
         .filter(|word| !word.text.trim().is_empty())
         .collect::<Vec<_>>();
+    if want_timestamps && !text.trim().is_empty() && words.is_empty() {
+        bail!("recognizer returned text without word timestamps");
+    }
+    preserve_word_text(&text, &mut words)?;
     let mut segments = if words.is_empty() {
         if text.trim().is_empty() {
             Vec::new()
         } else {
             vec![Segment {
-                text: text.clone(),
+                text: Some(text.clone()),
                 start: 0.0,
                 end: audio.duration_seconds,
                 speaker: None,
@@ -798,6 +822,7 @@ fn process_one(
         // Sentence timestamps retain segment boundaries but do not expose word items. This keeps
         // the JSON shape stable while honoring the requested granularity.
         for segment in &mut segments {
+            segment.text = Some(segment.content());
             segment.words.clear();
         }
     }
@@ -813,11 +838,10 @@ fn process_one(
         .to_owned(),
         language,
         duration_seconds: audio.duration_seconds,
-        text,
         segments,
         metadata: TranscriptMetadata {
-            transcribed_with: "transcriberrr",
-            version: env!("CARGO_PKG_VERSION"),
+            transcribed_with: "transcriberrr".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             source_created_at: source_timestamp(&job.input, FileTimestamp::Created),
             source_modified_at: source_timestamp(&job.input, FileTimestamp::Modified),
             transcribed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -841,7 +865,7 @@ fn process_one(
     if output_path.exists() && !cli.overwrite {
         bail!("output exists (use --overwrite): {}", output_path.display());
     }
-    write_output(&doc, &output_path, cli.format)?;
+    write_output(&doc, &output_path, cli.format, cli.timestamps)?;
     eprintln!(
         "{} -> {} ({:.2}s)",
         job.input.display(),
@@ -871,41 +895,30 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
     if output_path.exists() && !cli.overwrite {
         bail!("output exists (use --overwrite): {}", output_path.display());
     }
-    let format = match cli.format {
-        OutputFormat::Txt => "txt",
-        OutputFormat::Json => "json",
-        OutputFormat::Srt => "srt",
-        OutputFormat::Vtt => "vtt",
-    };
-    let timestamps = match cli.timestamps {
-        TimestampGranularity::None => "none",
-        TimestampGranularity::Words => "words",
-        TimestampGranularity::Sentences => "sentences",
-    };
-    let status = Command::new(&helper)
+    let result = Command::new(&helper)
         .arg(&job.input)
-        .arg("--output")
-        .arg(&output_path)
-        .arg("--format")
-        .arg(format)
-        .arg("--timestamps")
-        .arg(timestamps)
-        .status()
+        .args(["--format", "json", "--timestamps", "words"])
+        .stderr(std::process::Stdio::inherit())
+        .output()
         .with_context(|| {
             format!(
                 "launching Apple SpeechTranscriber helper {}",
                 helper.display()
             )
         })?;
-    if !status.success() {
-        bail!("Apple SpeechTranscriber failed with status {status}");
-    }
-    if !output_path.is_file() {
+    if !result.status.success() {
         bail!(
-            "Apple SpeechTranscriber exited successfully but did not create {}",
-            output_path.display()
+            "Apple SpeechTranscriber failed with status {}",
+            result.status
         );
     }
+    let mut doc: TranscriptDocument = serde_json::from_slice(&result.stdout)
+        .context("reading Apple SpeechTranscriber transcript")?;
+    doc.validate()?;
+    if cli.timestamps != TimestampGranularity::Words {
+        doc.collapse_words();
+    }
+    write_output(&doc, &output_path, cli.format, cli.timestamps)?;
     Ok(output_path)
 }
 
@@ -1187,76 +1200,6 @@ fn run_diarization(
     Ok(None)
 }
 
-fn build_segments(words: Vec<Word>) -> Vec<Segment> {
-    let mut result = Vec::new();
-    let mut current = Vec::new();
-    for word in words {
-        let split = current.last().is_some_and(|last: &Word| {
-            word.start - last.end > 1.0
-                || last.text.ends_with(['.', '?', '!'])
-                || word.speaker != last.speaker
-        });
-        if split && !current.is_empty() {
-            result.push(segment_from_words(std::mem::take(&mut current)));
-        }
-        current.push(word);
-    }
-    if !current.is_empty() {
-        result.push(segment_from_words(current));
-    }
-    result
-}
-
-fn segment_from_words(words: Vec<Word>) -> Segment {
-    let start = words.first().map(|word| word.start).unwrap_or_default();
-    let end = words.last().map(|word| word.end).unwrap_or(start);
-    let speaker = words.first().and_then(|word| word.speaker);
-    let mut text = String::new();
-    for (index, word) in words.iter().enumerate() {
-        let punctuation = word.text.chars().count() == 1
-            && word.text.chars().all(|character| {
-                matches!(
-                    character,
-                    '.' | ','
-                        | '!'
-                        | '?'
-                        | ';'
-                        | ':'
-                        | ')'
-                        | ']'
-                        | '}'
-                        | '。'
-                        | '，'
-                        | '！'
-                        | '？'
-                        | '；'
-                        | '：'
-                        | '、'
-                        | '）'
-                        | '］'
-                        | '｝'
-                        | '」'
-                        | '』'
-                        | '》'
-                        | '〉'
-                        | '”'
-                        | '’'
-                )
-            });
-        if index > 0 && !punctuation {
-            text.push(' ');
-        }
-        text.push_str(&word.text);
-    }
-    Segment {
-        text,
-        start,
-        end,
-        speaker,
-        words,
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum FileTimestamp {
     Created,
@@ -1279,74 +1222,6 @@ fn model_display_name(value: &str) -> String {
         .filter(|name| !name.is_empty() && *name != ".")
         .unwrap_or(value)
         .to_owned()
-}
-
-fn write_output(doc: &TranscriptDocument, path: &Path, format: OutputFormat) -> Result<()> {
-    let content = match format {
-        OutputFormat::Txt => format!("{}\n", doc.text),
-        OutputFormat::Json => serde_json::to_string_pretty(doc)? + "\n",
-        OutputFormat::Srt => subtitle_output(doc, false),
-        OutputFormat::Vtt => subtitle_output(doc, true),
-    };
-    fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-fn subtitle_output(doc: &TranscriptDocument, vtt: bool) -> String {
-    let mut output = String::new();
-    if vtt {
-        output.push_str("WEBVTT\n\n");
-    }
-    let mut cue_index = 0usize;
-    for segment in &doc.segments {
-        // SRT and WebVTT have no nested word object. When word timestamps are available,
-        // represent them as one standards-compliant cue per word; sentence-level output still
-        // uses the larger segment cue.
-        let cues = if segment.words.is_empty() {
-            vec![(
-                segment.start,
-                segment.end,
-                segment.text.as_str(),
-                segment.speaker,
-            )]
-        } else {
-            segment
-                .words
-                .iter()
-                .map(|word| (word.start, word.end, word.text.as_str(), word.speaker))
-                .collect()
-        };
-        for (start, end, text, speaker_id) in cues {
-            cue_index += 1;
-            if !vtt {
-                output.push_str(&format!("{}\n", cue_index));
-            }
-            let speaker = speaker_id
-                .map(|id| format!("[Speaker {id}] "))
-                .unwrap_or_default();
-            output.push_str(&format!(
-                "{} --> {}\n{}{}\n\n",
-                timestamp(start, vtt),
-                timestamp(end, vtt),
-                speaker,
-                text
-            ));
-        }
-    }
-    output
-}
-
-fn timestamp(seconds: f32, vtt: bool) -> String {
-    let total_ms = (seconds.max(0.0) * 1000.0).round() as u64;
-    let hours = total_ms / 3_600_000;
-    let minutes = (total_ms % 3_600_000) / 60_000;
-    let secs = (total_ms % 60_000) / 1000;
-    let millis = total_ms % 1000;
-    if vtt {
-        format!("{hours:02}:{minutes:02}:{secs:02}.{millis:03}")
-    } else {
-        format!("{hours:02}:{minutes:02}:{secs:02},{millis:03}")
-    }
 }
 
 fn output_path(cli: &Cli, job: &Job) -> PathBuf {
@@ -1447,8 +1322,8 @@ mod tests {
     #[test]
     fn metadata_serializes_transcription_fields() {
         let metadata = TranscriptMetadata {
-            transcribed_with: "transcriberrr",
-            version: "0.1.0",
+            transcribed_with: "transcriberrr".to_owned(),
+            version: "0.1.0".to_owned(),
             source_created_at: Some("2026-10-15T12:00:00Z".to_owned()),
             source_modified_at: Some("2026-10-15T12:01:00Z".to_owned()),
             transcribed_at: "2026-10-15T12:02:00Z".to_owned(),
@@ -1522,6 +1397,6 @@ mod tests {
                 speaker: None,
             },
         ]);
-        assert_eq!(segments[0].text, "你好。");
+        assert_eq!(segments[0].content(), "你好。");
     }
 }

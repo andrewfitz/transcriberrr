@@ -10,7 +10,7 @@ import Foundation
 import Speech
 
 private struct NativeWord: Codable {
-    let text: String
+    var text: String
     let start: Double
     let end: Double
     var speaker: Int?
@@ -18,7 +18,7 @@ private struct NativeWord: Codable {
     private enum CodingKeys: String, CodingKey { case text, start, end }
 }
 
-private struct NativeSegment: Codable {
+private struct NativeSegment: Encodable {
     let text: String
     let start: Double
     let end: Double
@@ -26,9 +26,20 @@ private struct NativeSegment: Codable {
     var words: [NativeWord]
 
     private enum CodingKeys: String, CodingKey { case text, start, end, words }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(start, forKey: .start)
+        try container.encode(end, forKey: .end)
+        if words.isEmpty {
+            try container.encode(text, forKey: .text)
+        } else {
+            try container.encode(words, forKey: .words)
+        }
+    }
 }
 
-private struct NativeTranscript: Codable {
+private struct NativeTranscript: Encodable {
     let source: String
     let model: String
     let device: String
@@ -37,6 +48,10 @@ private struct NativeTranscript: Codable {
     let text: String
     var segments: [NativeSegment]
     let metadata: NativeMetadata
+
+    private enum CodingKeys: String, CodingKey {
+        case source, model, device, language, duration_seconds, segments, metadata
+    }
 }
 
 private struct NativeMetadata: Codable {
@@ -90,6 +105,7 @@ private enum NativeError: LocalizedError {
     case unavailable
     case unsupportedLocale
     case unsupportedDiarization
+    case missingTimestamps
 
     var errorDescription: String? {
         switch self {
@@ -99,6 +115,8 @@ private enum NativeError: LocalizedError {
             return "Apple SpeechTranscriber is unavailable on this Mac or requires macOS 26 or later"
         case .unsupportedLocale:
             return "Apple SpeechTranscriber does not support English (en-US) on this Mac"
+        case .missingTimestamps:
+            return "Apple SpeechTranscriber returned text without word timestamps"
         case .unsupportedDiarization:
             return "Apple SpeechTranscriber does not provide speaker diarization; use the Qwen engine with --diarize"
         }
@@ -173,11 +191,12 @@ struct TranscriberrrNative {
         case .srt, .vtt:
             var output = format == .vtt ? "WEBVTT\n\n" : ""
             let cues: [(Double, Double, String)] = timestamps == .words
-                ? transcript.segments.flatMap { $0.words.map { ($0.start, $0.end, $0.text) } }
+                ? transcript.segments.flatMap { $0.words.map { ($0.start, $0.end, $0.text.trimmingCharacters(in: .whitespacesAndNewlines)) } }
                 : transcript.segments.map { ($0.start, $0.end, $0.text) }
             for (index, cue) in cues.enumerated() {
                 if format == .srt { output += "\(index + 1)\n" }
-                output += "\(timestamp(cue.0, format: format)) --> \(timestamp(cue.1, format: format))\n\(cue.2)\n\n"
+                let cueText = cue.2.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+                output += "\(timestamp(cue.0, format: format)) --> \(timestamp(cue.1, format: format))\n\(cueText)\n\n"
             }
             return Data(output.utf8)
         }
@@ -215,12 +234,34 @@ struct TranscriberrrNative {
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         let resultTask = Task { () throws -> [NativeWord] in
             var words: [NativeWord] = []
+            var pendingPrefix = ""
             for try await result in transcriber.results {
+                var firstRun = true
                 for run in result.text.runs {
-                    let text = String(result.text[run.range].characters).trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !text.isEmpty,
-                          let timeRange = run.audioTimeRange
-                    else { continue }
+                    var text = String(result.text[run.range].characters)
+                    guard !text.isEmpty else { continue }
+                    if firstRun, let previous = words.last,
+                       previous.text.last?.isWhitespace == false,
+                       text.first?.isWhitespace == false {
+                        text = " " + text
+                    }
+                    firstRun = false
+                    guard let timeRange = run.audioTimeRange,
+                          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    else {
+                        if text.contains(where: { $0.isLetter || $0.isNumber }) {
+                            throw NativeError.missingTimestamps
+                        }
+                        // Untimed punctuation and spaces still belong to the transcript.
+                        if !words.isEmpty {
+                            words[words.count - 1].text += text
+                        } else {
+                            pendingPrefix += text
+                        }
+                        continue
+                    }
+                    text = pendingPrefix + text
+                    pendingPrefix = ""
                     let start = CMTimeGetSeconds(timeRange.start)
                     let end = CMTimeGetSeconds(timeRange.end)
                     words.append(NativeWord(
@@ -231,6 +272,7 @@ struct TranscriberrrNative {
                     ))
                 }
             }
+            if !pendingPrefix.isEmpty { throw NativeError.missingTimestamps }
             return words
         }
         if let lastSample = try await analyzer.analyzeSequence(from: audioFile) {
@@ -239,7 +281,7 @@ struct TranscriberrrNative {
             await analyzer.cancelAndFinishNow()
         }
         let words = try await resultTask.value
-        let text = words.map(\.text).joined(separator: " ")
+        let text = words.map(\.text).joined()
         let segments = buildSegments(words)
         let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
         let resourceValues = try? input.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
@@ -273,7 +315,10 @@ struct TranscriberrrNative {
         var segments: [NativeSegment] = []
         var current: [NativeWord] = []
         for word in words {
-            let split = current.last.map { word.start - $0.end > 1.0 || $0.text.hasSuffix(".") || $0.text.hasSuffix("?") || $0.text.hasSuffix("!") } ?? false
+            let split = current.last.map { previous in
+                let ending = previous.text.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "”’\"')]}」』")))
+                return word.start - previous.end > 1.0 || ending.hasSuffix(".") || ending.hasSuffix("?") || ending.hasSuffix("!")
+            } ?? false
             if split, !current.isEmpty {
                 segments.append(segment(current))
                 current.removeAll(keepingCapacity: true)
@@ -286,9 +331,9 @@ struct TranscriberrrNative {
 
     private static func segment(_ words: [NativeWord]) -> NativeSegment {
         NativeSegment(
-            text: words.map(\.text).joined(separator: " "),
+            text: words.map(\.text).joined(),
             start: words.first?.start ?? 0,
-            end: words.last?.end ?? words.first?.start ?? 0,
+            end: words.map(\.end).max() ?? words.first?.start ?? 0,
             speaker: nil,
             words: words
         )

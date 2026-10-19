@@ -1,0 +1,375 @@
+//! Compact transcript schema and deterministic text/export operations.
+use crate::{OutputFormat, TimestampGranularity};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Word {
+    /// Exact transcript fragment, including preceding whitespace and punctuation.
+    pub(crate) text: String,
+    pub(crate) start: f32,
+    pub(crate) end: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) speaker: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Segment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) text: Option<String>,
+    pub(crate) start: f32,
+    pub(crate) end: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) speaker: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) words: Vec<Word>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TranscriptDocument {
+    pub(crate) source: String,
+    pub(crate) model: String,
+    pub(crate) device: String,
+    pub(crate) language: String,
+    pub(crate) duration_seconds: f32,
+    pub(crate) segments: Vec<Segment>,
+    pub(crate) metadata: TranscriptMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TranscriptMetadata {
+    #[serde(rename = "transcribed-with")]
+    pub(crate) transcribed_with: String,
+    pub(crate) version: String,
+    pub(crate) source_created_at: Option<String>,
+    pub(crate) source_modified_at: Option<String>,
+    pub(crate) transcribed_at: String,
+    pub(crate) model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diarization: Option<DiarizationMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DiarizationMetadata {
+    pub(crate) enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) speakers: Option<usize>,
+    /// Number of distinct speaker IDs returned by Sortformer. `speakers` retains the
+    /// user-requested maximum for backwards compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) detected_speakers: Option<usize>,
+}
+
+impl Segment {
+    pub(crate) fn content(&self) -> String {
+        self.text
+            .clone()
+            .unwrap_or_else(|| self.words.iter().map(|word| word.text.as_str()).collect())
+    }
+}
+
+impl TranscriptDocument {
+    pub(crate) fn content(&self) -> String {
+        self.segments.iter().map(Segment::content).collect()
+    }
+
+    pub(crate) fn collapse_words(&mut self) {
+        for segment in &mut self.segments {
+            segment.text = Some(segment.content());
+            segment.words.clear();
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        fn timing(start: f32, end: f32) -> Result<()> {
+            if !start.is_finite() || !end.is_finite() || start < 0.0 || end < start {
+                bail!("invalid transcript timing: {start} --> {end}");
+            }
+            Ok(())
+        }
+        timing(0.0, self.duration_seconds)?;
+        for segment in &self.segments {
+            timing(segment.start, segment.end)?;
+            if segment.text.is_some() == !segment.words.is_empty() {
+                bail!("each segment must contain either text or words, exclusively");
+            }
+            let mut last_start = segment.start;
+            for word in &segment.words {
+                timing(word.start, word.end)?;
+                if word.start < last_start || word.end > segment.end || word.text.is_empty() {
+                    bail!("invalid word order, segment bounds, or empty word text");
+                }
+                if word.speaker != segment.speaker {
+                    bail!("word speaker must match its segment speaker");
+                }
+                last_start = word.start;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn build_segments(words: Vec<Word>) -> Vec<Segment> {
+    let mut result = Vec::new();
+    let mut current = Vec::new();
+    for word in words {
+        let split = current.last().is_some_and(|last: &Word| {
+            word.start - last.end > 1.0
+                || last
+                    .text
+                    .trim_end_matches(['”', '’', '"', '\'', ')', ']', '」', '』'])
+                    .ends_with(['.', '?', '!', '。', '？', '！'])
+                || word.speaker != last.speaker
+        });
+        if split && !current.is_empty() {
+            result.push(segment_from_words(std::mem::take(&mut current)));
+        }
+        current.push(word);
+    }
+    if !current.is_empty() {
+        result.push(segment_from_words(current));
+    }
+    result
+}
+
+fn segment_from_words(words: Vec<Word>) -> Segment {
+    Segment {
+        text: None,
+        start: words.first().map(|word| word.start).unwrap_or_default(),
+        end: words.iter().map(|word| word.end).fold(0.0, f32::max),
+        speaker: words.first().and_then(|word| word.speaker),
+        words,
+    }
+}
+
+/// Restore exact source fragments to aligner tokens, which may omit punctuation.
+/// Match every letter/number in order; never silently discard or invent spoken text.
+pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
+    if words.is_empty() {
+        return Ok(());
+    }
+    let mut cursor = 0;
+    let mut spans = Vec::with_capacity(words.len());
+    for word in words.iter() {
+        let token = word.text.trim();
+        let letters: Vec<char> = token.chars().filter(|c| c.is_alphanumeric()).collect();
+        let mut start = None;
+        if letters.is_empty() {
+            if token.is_empty() {
+                bail!("empty aligned word");
+            }
+            let offset = text[cursor..]
+                .find(token)
+                .context("aligned punctuation does not match transcript")?;
+            if text[cursor..cursor + offset]
+                .chars()
+                .any(char::is_alphanumeric)
+            {
+                bail!("aligned punctuation skips transcript words");
+            }
+            start = Some(cursor + offset);
+            cursor += offset + token.len();
+        } else {
+            for expected in letters {
+                let (offset, actual) = text[cursor..]
+                    .char_indices()
+                    .find(|(_, c)| c.is_alphanumeric())
+                    .context("aligned words extend beyond transcript text")?;
+                if !actual.eq_ignore_ascii_case(&expected) {
+                    bail!(
+                        "aligned word {:?} does not match transcript near {:?}",
+                        token,
+                        text[cursor..].chars().take(40).collect::<String>()
+                    );
+                }
+                start.get_or_insert(cursor + offset);
+                cursor += offset + actual.len_utf8();
+            }
+        }
+        spans.push((start.unwrap_or(cursor), cursor));
+    }
+    if text[cursor..].chars().any(char::is_alphanumeric) {
+        bail!("transcript contains words without timestamps");
+    }
+    let mut previous_end = 0;
+    for index in 0..words.len() {
+        let end = if index + 1 == words.len() {
+            text.len()
+        } else {
+            // Attach closing punctuation to this word, leaving whitespace and opening
+            // quotes/brackets as the exact prefix of the next word.
+            let end = spans[index].1;
+            let gap = &text[end..spans[index + 1].0];
+            end + gap
+                .char_indices()
+                .find(|(_, c)| {
+                    c.is_whitespace() || matches!(c, '“' | '‘' | '(' | '[' | '{' | '「' | '『')
+                })
+                .map(|(offset, _)| offset)
+                .unwrap_or(gap.len())
+        };
+        words[index].text = text[previous_end..end].to_owned();
+        previous_end = end;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_output(
+    doc: &TranscriptDocument,
+    path: &Path,
+    format: OutputFormat,
+    timestamps: TimestampGranularity,
+) -> Result<()> {
+    std::fs::write(path, render_output(doc, format, timestamps)?)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+pub(crate) fn render_output(
+    doc: &TranscriptDocument,
+    format: OutputFormat,
+    timestamps: TimestampGranularity,
+) -> Result<String> {
+    doc.validate()?;
+    if matches!(format, OutputFormat::Json) {
+        return Ok(serde_json::to_string_pretty(doc)? + "\n");
+    }
+    if matches!(format, OutputFormat::Txt) && timestamps == TimestampGranularity::None {
+        let text = doc.content();
+        return Ok(if text.ends_with('\n') {
+            text
+        } else {
+            text + "\n"
+        });
+    }
+    let vtt = matches!(format, OutputFormat::Vtt);
+    let mut output = if vtt {
+        "WEBVTT\n\n".to_owned()
+    } else {
+        String::new()
+    };
+    let mut index = 0;
+    for segment in &doc.segments {
+        let cues = if timestamps == TimestampGranularity::Words && !segment.words.is_empty() {
+            segment
+                .words
+                .iter()
+                .map(|word| (word.start, word.end, word.text.clone(), word.speaker))
+                .collect::<Vec<_>>()
+        } else {
+            vec![(
+                segment.start,
+                segment.end,
+                segment.content(),
+                segment.speaker,
+            )]
+        };
+        for (start, end, text, speaker) in cues {
+            index += 1;
+            let speaker = speaker
+                .map(|id| format!("[Speaker {id}] "))
+                .unwrap_or_default();
+            match format {
+                OutputFormat::Txt => output.push_str(&format!(
+                    "[{} --> {}] {}{}\n",
+                    timestamp(start, true),
+                    timestamp(end, true),
+                    speaker,
+                    text.trim()
+                )),
+                OutputFormat::Srt | OutputFormat::Vtt => {
+                    if !vtt {
+                        output.push_str(&format!("{index}\n"));
+                    }
+                    output.push_str(&format!(
+                        "{} --> {}\n{}{}\n\n",
+                        timestamp(start, vtt),
+                        timestamp(end, vtt),
+                        speaker,
+                        // Blank lines delimit cues in SRT/WebVTT. Keep exact whitespace
+                        // in JSON/plain text, and use a single line for subtitle bodies.
+                        text.split_whitespace().collect::<Vec<_>>().join(" ")
+                    ));
+                }
+                OutputFormat::Json => unreachable!(),
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn timestamp(seconds: f32, vtt: bool) -> String {
+    let total_ms = (seconds.max(0.0) * 1000.0).round() as u64;
+    let hours = total_ms / 3_600_000;
+    let minutes = (total_ms % 3_600_000) / 60_000;
+    let secs = (total_ms % 60_000) / 1000;
+    let millis = total_ms % 1000;
+    let separator = if vtt { '.' } else { ',' };
+    format!("{hours:02}:{minutes:02}:{secs:02}{separator}{millis:03}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn words(tokens: &[&str]) -> Vec<Word> {
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(index, text)| Word {
+                text: (*text).to_owned(),
+                start: index as f32,
+                end: index as f32 + 0.5,
+                speaker: Some(index / 2),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn restores_punctuation_and_exact_spacing_from_recognized_text() {
+        let mut words = words(&["Hello", "world", "Dont", "panic"]);
+        preserve_word_text("  “Hello,  world!”\nDon't panic…  ", &mut words).unwrap();
+        assert_eq!(
+            words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<String>(),
+            "  “Hello,  world!”\nDon't panic…  "
+        );
+        let segments = build_segments(words);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].content(), "  “Hello,  world!”");
+        assert_eq!(segments[1].content(), "\nDon't panic…  ");
+        assert_eq!(segments[1].speaker, Some(1));
+    }
+
+    #[test]
+    fn restores_unspaced_unicode_and_separate_punctuation_tokens() {
+        let mut words = words(&["你好", "。", "再见"]);
+        preserve_word_text("你好。再见！", &mut words).unwrap();
+        assert_eq!(
+            words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<String>(),
+            "你好。再见！"
+        );
+        assert_eq!(words[1].text, "。");
+    }
+
+    #[test]
+    fn refuses_unmatched_text_instead_of_losing_words() {
+        for (text, tokens) in [
+            ("Hello missing world.", vec!["Hello", "world"]),
+            ("Hello world extra.", vec!["Hello", "world"]),
+            ("Hello.", vec!["Hello", "extra"]),
+        ] {
+            assert!(preserve_word_text(text, &mut words(&tokens)).is_err());
+        }
+    }
+
+    #[test]
+    fn timestamps_round_across_hour_boundary() {
+        assert_eq!(timestamp(3599.9998, false), "01:00:00,000");
+    }
+}

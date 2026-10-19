@@ -6,7 +6,8 @@ Offline English transcription for Apple Silicon Macs. Transcriberrr ships a nati
 
 - Qwen3-ASR 1.7B (default), the latest English Parakeet Unified 0.6B export, or Apple SpeechTranscriber (macOS 26+).
 - Metal GPU execution on Apple Silicon, with a CPU fallback for the Rust engines.
-- Word-level or sentence timestamps in JSON, SRT, and WebVTT; plain TXT is available without timestamps.
+- Compact word-level JSON, sentence/segment or word timestamps in TXT, SRT, and WebVTT, and plain TXT.
+- Convert saved transcript JSON between formats offline, without loading audio or models.
 - Optional Sortformer speaker diarization, including a per-job speaker limit.
 - Single files, recursive folders, JSON manifests, resumable JSONL progress, and output beside the source or in one destination folder.
 - Native SwiftUI queue with folder drop, regex filtering, visible Check all/None, per-track diarization, saved queue results, elapsed time and ETA per track and selected queue, and a visible model setup/download activity window.
@@ -54,6 +55,37 @@ The build script refuses non-`Darwin arm64` hosts. For a CLI-only build, use `ca
 ```
 
 Use `--help` for all options. `--model-status` reports the local cache without network access. `--download-model qwen3-asr-1.7b` (repeat the flag for multiple models) prefetches model files. For a complete Rust-engine setup, use `--download-model qwen3-asr-1.7b --download-model qwen3-forced-aligner-0.6b --download-model parakeet-v3 --download-model sortformer-4spk`. Set `--model-cache PATH` or `TRANSCRIBERRR_MODEL_CACHE` to change the cache location. The default is `~/Library/Application Support/Transcriberrr/models/hub`.
+
+## Convert a transcript
+
+```bash
+# Standard segment timestamps and speaker labels (the conversion defaults)
+./target/release/transcriberrr convert interview.json -o interview.txt
+
+# Sentence/segment subtitle cues
+./target/release/transcriberrr convert interview.json --format srt -o interview.srt
+./target/release/transcriberrr convert interview.json --format vtt -o interview.vtt
+
+# Plain text or individual word cues
+./target/release/transcriberrr convert interview.json --timestamps none -o plain.txt
+./target/release/transcriberrr convert interview.json --format srt --timestamps words -o words.srt
+
+# JSON with segment text instead of nested words
+./target/release/transcriberrr convert interview.json --format json -o segments.json
+```
+
+Conversion defaults to TXT and `--timestamps sentences` (`segments` is an alias). It preserves the existing segment boundaries and speaker IDs. Without `-o/--output`, it writes `INPUT.converted.EXT` beside the input. Existing files require `--overwrite`. Subtitle exports flatten whitespace inside each cue so transcript blank lines cannot split cues. Word export requires word timing data; segment-only JSON cannot recreate word timestamps. No audio, model downloads, GPU initialization, or inference is needed.
+
+Timestamped TXT looks like:
+
+```text
+[00:00:00.000 --> 00:00:02.400] [Speaker 1] Hello, world!
+[00:00:02.600 --> 00:00:03.200] [Speaker 2] Hi!
+```
+
+The compact JSON schema stores each piece of transcript text **once**. There is no top-level `text`. In word mode, `segments[].words[].text` contains exact text fragments, including punctuation and preceding whitespace; segments omit `text`. Concatenate word texts in segment order **without inserting separators or trimming** to reconstruct the transcript. Speaker IDs and timing remain on the words and segments. For sentence/no-word JSON, each segment contains `text` instead of `words`; concatenate those strings without separators. This is a breaking schema change; the converter reads the compact schema, not the old duplicated-text JSON.
+
+For example, the words for `Hello, world!` have texts `"Hello,"` and `" world!"`. Qwen aligner tokens are matched back to recognized text before writing, restoring punctuation and exact spacing. If the words cannot safely account for the recognized text, transcription reports an error instead of writing a lossy transcript.
 
 Qwen word timestamps use `Qwen/Qwen3-ForcedAligner-0.6B`. JSON places words in `segments[].words[]` with `text`, `start`, and `end` seconds. JSON also includes `metadata` with the Transcriberrr version, source creation/modification times, transcription time, model name, and optional diarization settings. For diarized jobs, `metadata.diarization.detected_speakers` reports the distinct speaker IDs returned by Sortformer, while `metadata.diarization.speakers` remains the requested maximum. Word-level SRT/WebVTT emit one cue per word. Apple SpeechTranscriber installs its model through macOS `AssetInventory`; it is unavailable before macOS 26 and does not diarize.
 
