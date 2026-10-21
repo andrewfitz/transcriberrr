@@ -110,6 +110,8 @@ private struct SavedQueue: Codable {
     var timestamps: String
     var diarizeByDefault: Bool
     var engine: String?
+    /// Optional so queue files from older versions still decode.
+    var speakerTurns: Bool?
 }
 
 /// The Rust CLI manifest is intentionally small and stable.  Keeping a typed
@@ -275,6 +277,8 @@ final class AppState: ObservableObject {
     @Published var format = "json"
     @Published var timestamps = "words"
     @Published var diarize = false
+    /// Text output only: label each speaker turn instead of writing the exact transcript.
+    @Published var speakerTurns = false
     @Published var isRunning = false
     @Published var showModelActivity = false
     @Published var modelActivityTitle = "Preparing models"
@@ -943,6 +947,9 @@ final class AppState: ObservableObject {
                              "--engine", cliEngine,
                              "--model", modelID, "--device", device, "--format", format,
                              "--timestamps", timestamps, "--progress-file", progressURL.path, "--overwrite"]
+            if format == "txt" && speakerTurns {
+                arguments.append("--speaker-turns")
+            }
             if items.contains(where: { $0.diarize || $0.speakerCount != nil }) {
                 arguments += ["--diarization-model", diarizationModelArgument]
             }
@@ -1016,6 +1023,7 @@ final class AppState: ObservableObject {
         outputDestination = OutputDestination(rawValue: saved.outputDestination) ?? .folder
         modelID = saved.modelID
         engine = saved.engine ?? "qwen"
+        speakerTurns = saved.speakerTurns ?? false
         let savedDiarizationPath = saved.diarizationModel
         let isLegacySortformerAlias = savedDiarizationPath == "sortformer"
             || savedDiarizationPath == "/sortformer"
@@ -1084,7 +1092,8 @@ final class AppState: ObservableObject {
             format: format,
             timestamps: timestamps,
             diarizeByDefault: diarize,
-            engine: engine
+            engine: engine,
+            speakerTurns: speakerTurns
         )
         guard let data = try? JSONEncoder().encode(saved) else { return }
         try? FileManager.default.createDirectory(at: queueFile.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1223,6 +1232,7 @@ struct ContentView: View {
         }
         .onChange(of: state.outputDestination) { _, _ in state.saveQueue() }
         .onChange(of: state.outputFolder) { _, _ in state.saveQueue() }
+        .onChange(of: state.speakerTurns) { _, _ in state.saveQueue() }
         .onChange(of: state.engine) { _, value in state.selectEngine(value); state.saveQueue() }
         .onChange(of: state.modelID) { _, _ in state.invalidateModelStatus(); state.saveQueue() }
         .onChange(of: state.diarizationModel) { _, _ in state.saveQueue() }
@@ -1496,6 +1506,13 @@ struct ContentView: View {
                         }
                     ))
                     .toggleStyle(.checkbox)
+                    // Text is always untimed; speaker turns only change diarized tracks.
+                    if state.format == "txt" {
+                        Toggle("Speaker turns", isOn: $state.speakerTurns)
+                            .toggleStyle(.checkbox)
+                            .help("Start a [Speaker N] paragraph at each speaker change in diarized tracks.")
+                            .disabled(state.engine == "apple-native")
+                    }
                     if state.timestamps != "none" {
                         setting("Timestamp level") {
                             Picker("", selection: $state.timestamps) {

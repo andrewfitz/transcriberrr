@@ -70,6 +70,24 @@ fn plain_text_reconstitutes_exact_spacing_and_punctuation() {
 }
 
 #[test]
+fn plain_text_can_label_speaker_turns() {
+    let f = Fixture::new();
+    success(f.run(&[
+        "--format",
+        "txt",
+        "--timestamps",
+        "none",
+        "--speaker-turns",
+        "-o",
+        "turns.txt",
+    ]));
+    assert_eq!(
+        f.read("turns.txt"),
+        "[Speaker 1] “Hello, world!”\n[Speaker 2] Yes—it's me.\n"
+    );
+}
+
+#[test]
 fn converts_to_sentence_and_word_subtitles() {
     let f = Fixture::new();
     success(f.run(&["--format", "srt", "-o", "out.srt"]));

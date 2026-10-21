@@ -246,14 +246,23 @@ pub(crate) fn normalize_word_timing(words: &mut [Word], duration: f32) {
 /// truncated transcript at the final path (which `--resume` would then refuse to replace).
 /// Without `overwrite`, the file is published with a hard link, which fails if the path exists,
 /// so two processes cannot both pass an earlier existence check and replace each other's output.
+/// How a transcript is rendered to a file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RenderOptions {
+    pub(crate) format: OutputFormat,
+    pub(crate) timestamps: TimestampGranularity,
+    /// Plain text only: one `[Speaker N]` paragraph per speaker turn instead of the exact
+    /// transcript text. Timestamped formats always carry speaker labels.
+    pub(crate) speaker_turns: bool,
+}
+
 pub(crate) fn write_output(
     doc: &TranscriptDocument,
     path: &Path,
-    format: OutputFormat,
-    timestamps: TimestampGranularity,
+    options: RenderOptions,
     overwrite: bool,
 ) -> Result<()> {
-    let content = render_output(doc, format, timestamps)?;
+    let content = render_output(doc, options)?;
     if path.file_name().is_none() {
         bail!("output path has no file name: {}", path.display());
     }
@@ -285,16 +294,22 @@ pub(crate) fn write_output(
     }
 }
 
-pub(crate) fn render_output(
-    doc: &TranscriptDocument,
-    format: OutputFormat,
-    timestamps: TimestampGranularity,
-) -> Result<String> {
+pub(crate) fn render_output(doc: &TranscriptDocument, options: RenderOptions) -> Result<String> {
+    let RenderOptions {
+        format,
+        timestamps,
+        speaker_turns,
+    } = options;
     doc.validate()?;
     if matches!(format, OutputFormat::Json) {
         return Ok(serde_json::to_string_pretty(doc)? + "\n");
     }
-    if matches!(format, OutputFormat::Txt) && timestamps == TimestampGranularity::None {
+    let plain_text =
+        matches!(format, OutputFormat::Txt) && timestamps == TimestampGranularity::None;
+    if plain_text && speaker_turns && doc.segments.iter().any(|segment| segment.speaker.is_some()) {
+        return Ok(speaker_turn_text(doc));
+    }
+    if plain_text {
         let text = doc.content();
         return Ok(if text.ends_with('\n') {
             text
@@ -356,6 +371,31 @@ pub(crate) fn render_output(
         }
     }
     Ok(output)
+}
+
+/// Plain text with one paragraph per speaker turn, labeled like the timestamped formats.
+/// Consecutive segments from the same speaker join into one paragraph.
+fn speaker_turn_text(doc: &TranscriptDocument) -> String {
+    let mut output = String::new();
+    let mut previous: Option<Option<usize>> = None;
+    for segment in &doc.segments {
+        let text = segment.content();
+        if previous == Some(segment.speaker) {
+            output.push_str(&text);
+            continue;
+        }
+        if previous.is_some() {
+            output.truncate(output.trim_end().len());
+            output.push('\n');
+        }
+        if let Some(id) = segment.speaker {
+            output.push_str(&format!("[Speaker {id}] "));
+        }
+        output.push_str(text.trim_start());
+        previous = Some(segment.speaker);
+    }
+    output.truncate(output.trim_end().len());
+    output + "\n"
 }
 
 fn timestamp(seconds: f32, vtt: bool) -> String {
@@ -480,23 +520,10 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("out.txt");
         std::fs::write(&path, "stale").unwrap();
-        write_output(
-            &doc,
-            &path,
-            OutputFormat::Txt,
-            TimestampGranularity::None,
-            true,
-        )
-        .unwrap();
+        write_output(&doc, &path, PLAIN, true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd\n");
-        let error = write_output(
-            &doc,
-            &path,
-            OutputFormat::Txt,
-            TimestampGranularity::None,
-            false,
-        )
-        .expect_err("must not replace an existing output without overwrite");
+        let error = write_output(&doc, &path, PLAIN, false)
+            .expect_err("must not replace an existing output without overwrite");
         assert!(error.to_string().contains("output exists"));
         assert_eq!(
             std::fs::read_dir(&directory).unwrap().count(),
@@ -504,6 +531,66 @@ mod tests {
             "no temp files left"
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    const PLAIN: RenderOptions = RenderOptions {
+        format: OutputFormat::Txt,
+        timestamps: TimestampGranularity::None,
+        speaker_turns: false,
+    };
+
+    #[test]
+    fn plain_text_speaker_turns_are_opt_in() {
+        let segment = |text: &str, start: f32, speaker: Option<usize>| Segment {
+            text: Some(text.to_owned()),
+            start,
+            end: start + 1.0,
+            speaker,
+            words: Vec::new(),
+        };
+        let mut doc = TranscriptDocument {
+            source: "a.wav".to_owned(),
+            model: "m".to_owned(),
+            device: "cpu".to_owned(),
+            language: "English".to_owned(),
+            duration_seconds: 4.0,
+            segments: vec![
+                segment("Hello there.", 0.0, Some(0)),
+                segment(" How are you?", 1.0, Some(0)),
+                segment("\n Fine, thanks.", 2.0, Some(1)),
+                segment(" Good.", 3.0, Some(0)),
+            ],
+            metadata: TranscriptMetadata {
+                transcribed_with: "transcriberrr".to_owned(),
+                version: "0".to_owned(),
+                source_created_at: None,
+                source_modified_at: None,
+                transcribed_at: "2026-01-01T00:00:00Z".to_owned(),
+                model: "m".to_owned(),
+                diarization: None,
+            },
+        };
+        let turns = RenderOptions {
+            speaker_turns: true,
+            ..PLAIN
+        };
+        assert_eq!(
+            render_output(&doc, turns).unwrap(),
+            "[Speaker 0] Hello there. How are you?\n[Speaker 1] Fine, thanks.\n[Speaker 0] Good.\n"
+        );
+        // Off by default: the exact transcript text.
+        assert_eq!(
+            render_output(&doc, PLAIN).unwrap(),
+            "Hello there. How are you?\n Fine, thanks. Good.\n"
+        );
+        // Without diarization the option changes nothing.
+        for segment in &mut doc.segments {
+            segment.speaker = None;
+        }
+        assert_eq!(
+            render_output(&doc, turns).unwrap(),
+            render_output(&doc, PLAIN).unwrap()
+        );
     }
 
     #[test]

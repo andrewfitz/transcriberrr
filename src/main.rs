@@ -2,8 +2,8 @@ mod audio_convert;
 mod model_cache;
 mod transcript;
 use transcript::{
-    DiarizationMetadata, Segment, TranscriptDocument, TranscriptMetadata, Word, build_segments,
-    normalize_word_timing, preserve_word_text, write_output,
+    DiarizationMetadata, RenderOptions, Segment, TranscriptDocument, TranscriptMetadata, Word,
+    build_segments, normalize_word_timing, preserve_word_text, write_output,
 };
 
 use anyhow::{Context, Result, bail};
@@ -110,6 +110,10 @@ struct Cli {
     chunk_seconds: f32,
     #[arg(long)]
     overwrite: bool,
+    /// With `--format txt --timestamps none`, write one `[Speaker N]` paragraph per speaker
+    /// turn instead of the exact transcript text. Requires diarization to have any effect.
+    #[arg(long)]
+    speaker_turns: bool,
     /// Append JSONL status events so long queues can be resumed safely.
     #[arg(long, value_name = "PATH")]
     progress_file: Option<PathBuf>,
@@ -141,6 +145,10 @@ struct ConvertArgs {
     timestamps: TimestampGranularity,
     #[arg(long)]
     overwrite: bool,
+    /// With `--format txt --timestamps none`, write one `[Speaker N]` paragraph per speaker
+    /// turn instead of the exact transcript text.
+    #[arg(long)]
+    speaker_turns: bool,
 }
 
 fn convert_transcript(args: ConvertArgs) -> Result<()> {
@@ -171,7 +179,14 @@ fn convert_transcript(args: ConvertArgs) -> Result<()> {
     if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    let content = transcript::render_output(&doc, args.format, args.timestamps)?;
+    let content = transcript::render_output(
+        &doc,
+        RenderOptions {
+            format: args.format,
+            timestamps: args.timestamps,
+            speaker_turns: args.speaker_turns,
+        },
+    )?;
     // create_new prevents accidental clobbering, including races with another converter.
     let mut file = OpenOptions::new()
         .write(true)
@@ -780,6 +795,14 @@ fn load_model<T>(
     }
 }
 
+fn render_options(cli: &Cli) -> RenderOptions {
+    RenderOptions {
+        format: cli.format,
+        timestamps: cli.timestamps,
+        speaker_turns: cli.speaker_turns,
+    }
+}
+
 fn ensure_apple_silicon() -> Result<()> {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         bail!("transcriberrr only supports Apple Silicon macOS (aarch64)");
@@ -1035,13 +1058,7 @@ fn process_one(
     if output_path.exists() && !cli.overwrite {
         bail!("output exists (use --overwrite): {}", output_path.display());
     }
-    write_output(
-        &doc,
-        &output_path,
-        cli.format,
-        cli.timestamps,
-        cli.overwrite,
-    )?;
+    write_output(&doc, &output_path, render_options(cli), cli.overwrite)?;
     eprintln!(
         "{} -> {} ({:.2}s)",
         job.input.display(),
@@ -1136,13 +1153,7 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
     if cli.timestamps != TimestampGranularity::Words {
         doc.collapse_words();
     }
-    write_output(
-        &doc,
-        &output_path,
-        cli.format,
-        cli.timestamps,
-        cli.overwrite,
-    )?;
+    write_output(&doc, &output_path, render_options(cli), cli.overwrite)?;
     Ok(output_path)
 }
 

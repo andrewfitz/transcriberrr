@@ -72,13 +72,14 @@ Use `--help` for all options. `--model-status` reports the local cache without n
 
 # Plain text or individual word cues
 ./target/release/transcriberrr convert interview.json --timestamps none -o plain.txt
+./target/release/transcriberrr convert interview.json --timestamps none --speaker-turns -o turns.txt
 ./target/release/transcriberrr convert interview.json --format srt --timestamps words -o words.srt
 
 # JSON with segment text instead of nested words
 ./target/release/transcriberrr convert interview.json --format json -o segments.json
 ```
 
-Conversion defaults to TXT and `--timestamps sentences` (`segments` is an alias). It preserves the existing segment boundaries and speaker IDs. Without `-o/--output`, it writes `INPUT.converted.EXT` beside the input. Existing files require `--overwrite`. Subtitle exports flatten whitespace inside each cue so transcript blank lines cannot split cues. Word export requires word timing data; segment-only JSON cannot recreate word timestamps. No audio, model downloads, GPU initialization, or inference is needed.
+Conversion defaults to TXT and `--timestamps sentences` (`segments` is an alias). It preserves the existing segment boundaries and speaker IDs. Without `-o/--output`, it writes `INPUT.converted.EXT` beside the input. Existing files require `--overwrite`. Plain text is the exact transcript; add `--speaker-turns` (also accepted when transcribing, and the app's "Speaker turns" option for Text) to start a `[Speaker N]` paragraph at each speaker change of a diarized transcript. Subtitle exports flatten whitespace inside each cue so transcript blank lines cannot split cues. Word export requires word timing data; segment-only JSON cannot recreate word timestamps. No audio, model downloads, GPU initialization, or inference is needed.
 
 Timestamped TXT looks like:
 
