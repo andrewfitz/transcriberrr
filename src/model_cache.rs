@@ -137,6 +137,16 @@ impl ModelCache {
         if info.siblings.is_empty() {
             bail!("Hugging Face repository {id_or_path:?} contains no files");
         }
+        // Files arrive in name order, so the cached_path markers (config.json plus e.g.
+        // model.safetensors) can exist long before tokenizer files or `.onnx.data` weights. Mark
+        // the repository incomplete until every file is present; an interrupted download then
+        // resumes on the next run instead of loading a partial snapshot forever.
+        let incomplete = self.incomplete_marker(&id_or_path);
+        if let Some(parent) = incomplete.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating model cache {}", parent.display()))?;
+        }
+        fs::write(&incomplete, b"").with_context(|| format!("writing {}", incomplete.display()))?;
         // Download every repository file.  Model indexes reference shard names, tokenizer files
         // are loaded separately, and optional config files vary between engines. Skip README,
         // image, and metadata assets so a fresh install downloads only inference inputs.
@@ -147,6 +157,8 @@ impl ModelCache {
             repo.get(&sibling.rfilename)
                 .with_context(|| format!("downloading {id_or_path}/{}", sibling.rfilename))?;
         }
+        fs::remove_file(&incomplete)
+            .with_context(|| format!("removing {}", incomplete.display()))?;
         repo.get("config.json")
             .or_else(|_| repo.get("model.onnx"))
             .or_else(|_| repo.get("encoder-model.onnx"))
@@ -177,7 +189,18 @@ impl ModelCache {
             .collect()
     }
 
+    /// Present while `ensure` is downloading a full repository. The Swift app checks the same
+    /// file name, so keep them in sync.
+    fn incomplete_marker(&self, id: &str) -> PathBuf {
+        self.root
+            .join(Repo::new(id.to_owned(), RepoType::Model).folder_name())
+            .join(".transcriberrr-incomplete")
+    }
+
     fn cached_path(&self, id: &str) -> Option<PathBuf> {
+        if self.incomplete_marker(id).exists() {
+            return None;
+        }
         let repo = Cache::new(self.root.clone()).repo(Repo::new(id.to_owned(), RepoType::Model));
         let config = repo.get("config.json");
         // Require a configuration plus at least one weight/entry point for normal models. This
@@ -301,6 +324,22 @@ mod tests {
             PARAKEET_UNIFIED_EN
         );
         assert_eq!(canonical_id("qwen3-asr-1.7b"), QWEN3_ASR_17B);
+    }
+
+    #[test]
+    fn interrupted_download_is_not_reported_as_cached() {
+        let root = env::temp_dir().join(format!("transcriberrr-cache-{}", std::process::id()));
+        let snapshot = root.join("models--Org--Model/snapshots/abc");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(root.join("models--Org--Model/refs")).unwrap();
+        fs::write(root.join("models--Org--Model/refs/main"), "abc").unwrap();
+        fs::write(snapshot.join("config.json"), "{}").unwrap();
+        fs::write(snapshot.join("model.safetensors"), "").unwrap();
+        let cache = ModelCache::new(Some(root.clone())).unwrap();
+        assert_eq!(cache.cached_path("Org/Model"), Some(snapshot.clone()));
+        fs::write(cache.incomplete_marker("Org/Model"), "").unwrap();
+        assert_eq!(cache.cached_path("Org/Model"), None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

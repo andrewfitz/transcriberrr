@@ -177,7 +177,8 @@ pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
                     .char_indices()
                     .find(|(_, c)| c.is_alphanumeric())
                     .context("aligned words extend beyond transcript text")?;
-                if !actual.eq_ignore_ascii_case(&expected) {
+                // Aligners may case-fold non-ASCII letters too ("École" vs "école").
+                if actual != expected && !actual.to_lowercase().eq(expected.to_lowercase()) {
                     bail!(
                         "aligned word {:?} does not match transcript near {:?}",
                         token,
@@ -216,14 +217,53 @@ pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
     Ok(())
 }
 
+/// Make aligner/recognizer timings satisfy `validate` instead of discarding a finished
+/// transcription at write time: times are clamped to the audio, starts never move backwards,
+/// and every word ends at or after its start. Padded final chunks can otherwise report words
+/// past the end of the audio.
+pub(crate) fn normalize_word_timing(words: &mut [Word], duration: f32) {
+    let duration = if duration.is_finite() {
+        duration.max(0.0)
+    } else {
+        0.0
+    };
+    let clamp = |value: f32, floor: f32| {
+        if value.is_finite() {
+            value.clamp(floor, duration.max(floor))
+        } else {
+            floor
+        }
+    };
+    let mut previous_start = 0.0f32;
+    for word in words {
+        word.start = clamp(word.start, previous_start);
+        word.end = clamp(word.end, word.start);
+        previous_start = word.start;
+    }
+}
+
+/// Write via a temporary sibling and rename so a crash or cancellation never leaves a
+/// truncated transcript at the final path (which `--resume` would then refuse to replace).
 pub(crate) fn write_output(
     doc: &TranscriptDocument,
     path: &Path,
     format: OutputFormat,
     timestamps: TimestampGranularity,
 ) -> Result<()> {
-    std::fs::write(path, render_output(doc, format, timestamps)?)
-        .with_context(|| format!("writing {}", path.display()))
+    let content = render_output(doc, format, timestamps)?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("output path has no file name: {}", path.display()))?;
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(temporary_name);
+    let result =
+        std::fs::write(&temporary, content).and_then(|()| std::fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("writing {}", path.display()))
 }
 
 pub(crate) fn render_output(
@@ -366,6 +406,69 @@ mod tests {
         ] {
             assert!(preserve_word_text(text, &mut words(&tokens)).is_err());
         }
+    }
+
+    #[test]
+    fn matches_non_ascii_letters_case_insensitively() {
+        let mut words = words(&["école", "ÉTÉ"]);
+        preserve_word_text("École été.", &mut words).unwrap();
+        assert_eq!(words[0].text, "École");
+        assert_eq!(words[1].text, " été.");
+    }
+
+    #[test]
+    fn normalizes_out_of_order_and_overlong_word_timing() {
+        let mut words = words(&["a", "b", "c", "d"]);
+        words[2].start = 0.5; // starts before word 1 (1.0)
+        words[2].end = 0.4; // ends before it starts
+        words[3].start = f32::NAN;
+        words[3].end = 99.0; // padded tail chunk beyond the audio
+        normalize_word_timing(&mut words, 3.2);
+        let mut last = 0.0;
+        for word in &words {
+            assert!(word.start >= last && word.end >= word.start && word.end <= 3.2);
+            last = word.start;
+        }
+        assert_eq!(words[3].end, 3.2);
+        let doc_words = words
+            .into_iter()
+            .map(|word| Word {
+                speaker: None,
+                ..word
+            })
+            .collect();
+        let segment = segment_from_words(doc_words);
+        let doc = TranscriptDocument {
+            source: "a.wav".to_owned(),
+            model: "m".to_owned(),
+            device: "cpu".to_owned(),
+            language: "English".to_owned(),
+            duration_seconds: 3.2,
+            segments: vec![segment],
+            metadata: TranscriptMetadata {
+                transcribed_with: "transcriberrr".to_owned(),
+                version: "0".to_owned(),
+                source_created_at: None,
+                source_modified_at: None,
+                transcribed_at: "2026-01-01T00:00:00Z".to_owned(),
+                model: "m".to_owned(),
+                diarization: None,
+            },
+        };
+        doc.validate().expect("normalized timing must validate");
+        let directory =
+            std::env::temp_dir().join(format!("transcriberrr-write-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("out.txt");
+        std::fs::write(&path, "stale").unwrap();
+        write_output(&doc, &path, OutputFormat::Txt, TimestampGranularity::None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd\n");
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            1,
+            "no temp files left"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -118,16 +118,14 @@ impl ParakeetEngine {
         report: &mut dyn FnMut(f32, &str) -> Result<()>,
     ) -> Result<ParakeetTranscript> {
         let chunk_samples = (chunk_seconds * 16_000.0).round().max(1.0) as usize;
-        let chunks: Vec<&[f32]> = samples.chunks(chunk_samples).collect();
+        // Cut in pauses (as for Qwen) so words are not split across independent decodes.
+        let chunks = crate::chunk_ranges(samples, chunk_samples);
         let total = chunks.len().max(1);
-        let chunk_duration = chunk_samples as f32 / 16_000.0;
         let mut text_parts = Vec::with_capacity(chunks.len());
         let mut words = Vec::new();
-        for (index, chunk) in chunks.iter().enumerate() {
-            let mut result = self.transcribe(chunk, timestamps)?;
-            // Use the actual sample count after rounding the requested duration so timestamps do
-            // not drift across chunks when chunk_seconds is not sample aligned.
-            let offset = index as f32 * chunk_duration;
+        for (index, range) in chunks.iter().enumerate() {
+            let mut result = self.transcribe(&samples[range.clone()], timestamps)?;
+            let offset = range.start as f32 / 16_000.0;
             for word in &mut result.words {
                 word.start += offset;
                 word.end += offset;

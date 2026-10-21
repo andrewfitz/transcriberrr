@@ -2,7 +2,7 @@ mod model_cache;
 mod transcript;
 use transcript::{
     DiarizationMetadata, Segment, TranscriptDocument, TranscriptMetadata, Word, build_segments,
-    preserve_word_text, write_output,
+    normalize_word_timing, preserve_word_text, write_output,
 };
 
 use anyhow::{Context, Result, bail};
@@ -16,7 +16,7 @@ use qwen3_asr::{AudioInput, Batch, LoadOptions, Qwen3Asr, TranscribeOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -303,14 +303,23 @@ impl ProgressLog {
             if path.exists() {
                 let file = File::open(path)
                     .with_context(|| format!("opening progress file {}", path.display()))?;
-                for line in BufReader::new(file).lines() {
+                for (index, line) in BufReader::new(file).lines().enumerate() {
                     let line = line?;
                     if line.trim().is_empty() {
                         continue;
                     }
-                    let event: ProgressEvent = serde_json::from_str(&line)
-                        .with_context(|| format!("invalid progress event in {}", path.display()))?;
-                    latest.insert(event.input.clone(), event);
+                    // A crash or kill can leave a torn final line. Losing one status event only
+                    // means that input is processed again, so never let it block a resume.
+                    match serde_json::from_str::<ProgressEvent>(&line) {
+                        Ok(event) => {
+                            latest.insert(event.input.clone(), event);
+                        }
+                        Err(error) => eprintln!(
+                            "warning: ignoring invalid progress event at {}:{}: {error}",
+                            path.display(),
+                            index + 1
+                        ),
+                    }
                 }
             }
         }
@@ -324,12 +333,23 @@ impl ProgressLog {
                         format!("creating progress directory {}", parent.display())
                     })?;
                 }
-                OpenOptions::new()
+                let mut file = OpenOptions::new()
                     .create(true)
+                    .read(true)
                     .append(true)
                     .open(path)
-                    .with_context(|| format!("opening progress file {}", path.display()))
-                    .map(BufWriter::new)
+                    .with_context(|| format!("opening progress file {}", path.display()))?;
+                // Terminate a torn final line so the next event starts on its own line instead
+                // of being concatenated into the invalid fragment.
+                if file.metadata()?.len() > 0 {
+                    let mut last = [0u8; 1];
+                    file.seek(SeekFrom::End(-1))?;
+                    file.read_exact(&mut last)?;
+                    if last[0] != b'\n' {
+                        file.write_all(b"\n")?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(BufWriter::new(file))
             })
             .transpose()?;
         Ok(Self { writer, latest })
@@ -432,6 +452,7 @@ fn main() -> Result<()> {
     if jobs.is_empty() {
         bail!("no supported audio files were found");
     }
+    ensure_unique_outputs(&cli, &jobs)?;
     if jobs.iter().any(|job| job.diarize) && cli.diarization_model.is_none() {
         bail!("--diarize requires --diarization-model PATH");
     }
@@ -669,14 +690,14 @@ fn transcribe_qwen_chunks(
     let chunk_samples = (cli.chunk_seconds * TARGET_SAMPLE_RATE as f32)
         .round()
         .max(1.0) as usize;
-    let chunks: Vec<&[f32]> = samples.chunks(chunk_samples).collect();
+    let chunks = chunk_ranges(samples, chunk_samples);
     let total = chunks.len().max(1);
     let mut text_parts = Vec::with_capacity(chunks.len());
     let mut language = "English".to_owned();
     let mut aligned = Vec::new();
-    for (index, chunk) in chunks.iter().enumerate() {
+    for (index, range) in chunks.iter().enumerate() {
         let audio_input = AudioInput::Waveform {
-            samples: chunk,
+            samples: &samples[range.clone()],
             sample_rate: TARGET_SAMPLE_RATE,
         };
         let opts = TranscribeOptions {
@@ -700,10 +721,8 @@ fn transcribe_qwen_chunks(
         if !result.text.trim().is_empty() {
             text_parts.push(result.text);
         }
-        // Offset by the actual number of samples in each chunk. Rounding the requested duration
-        // to a sample count otherwise accumulates timestamp drift for non-integral durations.
-        let chunk_duration = chunk_samples as f32 / TARGET_SAMPLE_RATE as f32;
-        let offset = index as f32 * chunk_duration;
+        // Offset by the chunk's exact starting sample; chunk lengths vary with the cut points.
+        let offset = range.start as f32 / TARGET_SAMPLE_RATE as f32;
         if let Some(value) = result.timestamps {
             let envelope = serde_json::from_value::<TimestampEnvelope>(value)
                 .context("Qwen3 returned timestamps in an unexpected format")?;
@@ -720,6 +739,43 @@ fn transcribe_qwen_chunks(
         )?;
     }
     Ok((text_parts.join(" "), language, aligned))
+}
+
+/// Split audio into chunks of at most `chunk_samples`, cutting each chunk at the quietest
+/// 100 ms window in the preceding few seconds. Fixed-length cuts land mid-word, producing a
+/// garbled or duplicated word on both sides of every boundary.
+fn chunk_ranges(samples: &[f32], chunk_samples: usize) -> Vec<std::ops::Range<usize>> {
+    let chunk_samples = chunk_samples.max(1);
+    let window = (TARGET_SAMPLE_RATE as usize / 10).min(chunk_samples);
+    let search = (5 * TARGET_SAMPLE_RATE as usize).min(chunk_samples / 2);
+    // Never leave a sliver as the final chunk: Parakeet produces zero encoder frames for
+    // under 10 ms of audio and fails the whole file.
+    let min_tail = (TARGET_SAMPLE_RATE as usize).min(chunk_samples / 2);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while samples.len() - start > chunk_samples {
+        let limit = (start + chunk_samples)
+            .min(samples.len() - min_tail)
+            .max(start + 1);
+        let mut cut = limit;
+        let first = limit.saturating_sub(search).max(start + 1);
+        if search >= window && limit - first >= window {
+            // Sliding sum of magnitudes over [position, position + window).
+            let mut energy: f32 = samples[first..first + window].iter().map(|s| s.abs()).sum();
+            let mut quietest = (energy, first);
+            for position in first + 1..=limit - window {
+                energy += samples[position + window - 1].abs() - samples[position - 1].abs();
+                if energy < quietest.0 {
+                    quietest = (energy, position);
+                }
+            }
+            cut = quietest.1 + window / 2;
+        }
+        ranges.push(start..cut);
+        start = cut;
+    }
+    ranges.push(start..samples.len());
+    ranges
 }
 
 fn process_one(
@@ -802,6 +858,7 @@ fn process_one(
     if want_timestamps && !text.trim().is_empty() && words.is_empty() {
         bail!("recognizer returned text without word timestamps");
     }
+    normalize_word_timing(&mut words, audio.duration_seconds);
     preserve_word_text(&text, &mut words)?;
     let mut segments = if words.is_empty() {
         if text.trim().is_empty() {
@@ -1064,10 +1121,9 @@ fn decode_audio(path: &Path) -> Result<Audio> {
         bail!("audio stream has an invalid zero sample rate");
     }
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
-    let mut interleaved = Vec::new();
-    // Use the decoder's actual channel count rather than trusting container metadata. Some
-    // AAC/M4A files declare a stale layout, while the first decoded buffer has the real count.
-    let mut decoded_channels = 0;
+    let mut mono = Vec::new();
+    let mut decoded_packets = 0usize;
+    let mut skipped_packets = 0usize;
     loop {
         let packet = match format.next_packet() {
             Ok(packet) if packet.track_id() == track_id => packet,
@@ -1084,74 +1140,171 @@ fn decode_audio(path: &Path) -> Result<Audio> {
             Err(SymphoniaError::IoError(error)) => return Err(error.into()),
             Err(error) => return Err(error.into()),
         };
-        append_decoded(
-            decoder.decode(&packet)?,
-            &mut interleaved,
-            &mut decoded_channels,
+        match decoder.decode(&packet) {
+            Ok(buffer) => {
+                append_decoded(buffer, &mut mono);
+                decoded_packets += 1;
+            }
+            // A damaged frame (common in recovered MP3/AAC recordings) only loses that frame;
+            // Symphonia documents decode errors as recoverable.
+            Err(SymphoniaError::DecodeError(_)) => skipped_packets += 1,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if decoded_packets == 0 {
+        bail!("audio stream has no decodable packets");
+    }
+    if skipped_packets > 0 {
+        eprintln!(
+            "warning: skipped {skipped_packets} undecodable packet(s) in {}",
+            path.display()
         );
     }
-    // Consume each intermediate buffer where possible.  Long recordings can contain
-    // millions of samples; avoiding clones here keeps peak RSS substantially lower
-    // before the model receives the waveform.
-    if decoded_channels == 0 {
-        bail!("audio stream has no decodable channel count");
-    }
-    let mono = downmix(interleaved, decoded_channels);
-    let samples = resample_linear(mono, sample_rate, TARGET_SAMPLE_RATE);
+    let samples = resample(mono, sample_rate, TARGET_SAMPLE_RATE);
     Ok(Audio {
         duration_seconds: samples.len() as f32 / TARGET_SAMPLE_RATE as f32,
         samples,
     })
 }
 
-fn append_decoded(buffer: AudioBufferRef<'_>, output: &mut Vec<f32>, channels: &mut usize) {
-    if *channels == 0 {
-        *channels = buffer.spec().channels.count();
-    }
+/// Downmix each decoded buffer using its own channel count. Container metadata can be stale
+/// (some AAC/M4A files), and the layout may change mid-stream, so a count taken from one buffer
+/// must not be applied to another. Mixing per buffer also avoids holding the full interleaved
+/// stream, which keeps peak RSS lower for long multichannel recordings.
+fn append_decoded(buffer: AudioBufferRef<'_>, output: &mut Vec<f32>) {
+    let channels = buffer.spec().channels.count().max(1);
     let mut sample_buffer = SampleBuffer::<f32>::new(buffer.frames() as u64, *buffer.spec());
     sample_buffer.copy_interleaved_ref(buffer);
-    output.extend_from_slice(sample_buffer.samples());
+    downmix_into(sample_buffer.samples(), channels, output);
 }
 
-fn downmix(samples: Vec<f32>, channels: usize) -> Vec<f32> {
+fn downmix_into(interleaved: &[f32], channels: usize, output: &mut Vec<f32>) {
     if channels <= 1 {
-        return samples;
+        output.extend_from_slice(interleaved);
+        return;
     }
-    samples
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect()
+    output.extend(
+        interleaved
+            .chunks(channels)
+            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32),
+    );
 }
 
-fn resample_linear(input: Vec<f32>, source_rate: u32, target_rate: u32) -> Vec<f32> {
+/// Zero crossings on each side of the resampling kernel's centre.
+const RESAMPLE_ZERO_CROSSINGS: f64 = 8.0;
+
+/// Polyphase windowed-sinc resampler. Plain interpolation from 44.1/48 kHz folds 8–24 kHz
+/// energy (sibilants, hiss) back into the 0–8 kHz speech band; the low-pass at the lower
+/// Nyquist frequency prevents that. Sample rates share a large divisor in practice
+/// (48 kHz → 16 kHz needs one phase, 44.1 kHz needs 160), so every kernel is precomputed.
+fn resample(input: Vec<f32>, source_rate: u32, target_rate: u32) -> Vec<f32> {
     if input.is_empty() || source_rate == target_rate {
         return input;
     }
-    let output_len = (((input.len() as f64 * target_rate as f64) / source_rate as f64)
-        .round()
-        .max(1.0)) as usize;
+    let divisor = gcd(source_rate, target_rate);
+    let up = (target_rate / divisor) as usize;
+    let down = (source_rate / divisor) as usize;
+    let cutoff = (target_rate as f64 / source_rate as f64).min(1.0) * 0.95;
+    let half = (RESAMPLE_ZERO_CROSSINGS / cutoff).ceil() as usize;
+    let kernels: Vec<Vec<f32>> = (0..up)
+        .map(|phase| {
+            let frac = phase as f64 / up as f64;
+            let weights: Vec<f64> = (0..2 * half)
+                .map(|tap| {
+                    let distance = tap as f64 + 1.0 - half as f64 - frac;
+                    let x = distance * cutoff;
+                    let sinc = if x.abs() < 1e-9 {
+                        1.0
+                    } else {
+                        (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+                    };
+                    let window = if distance.abs() >= half as f64 {
+                        0.0
+                    } else {
+                        0.5 + 0.5 * (std::f64::consts::PI * distance / half as f64).cos()
+                    };
+                    sinc * window
+                })
+                .collect();
+            let total: f64 = weights.iter().sum();
+            weights
+                .iter()
+                .map(|weight| (weight / total) as f32)
+                .collect()
+        })
+        .collect();
+    let output_len = ((input.len() as f64 * up as f64 / down as f64).round() as usize).max(1);
     (0..output_len)
         .map(|index| {
-            let pos = index as f64 * source_rate as f64 / target_rate as f64;
-            let left = pos.floor() as usize;
-            let right = (left + 1).min(input.len().saturating_sub(1));
-            let frac = (pos - left as f64) as f32;
-            input.get(left).copied().unwrap_or(0.0) * (1.0 - frac)
-                + input.get(right).copied().unwrap_or(0.0) * frac
+            let position = index * down;
+            let base = position / up;
+            let kernel = &kernels[position % up];
+            // Taps cover input[base + 1 - half ..= base + half]. Renormalize over the taps that
+            // fall inside the clip so the first and last few milliseconds are not attenuated.
+            let first = (base + 1).saturating_sub(half);
+            let skip = first + half - (base + 1);
+            let (sum, weight) = input
+                .get(first..)
+                .unwrap_or_default()
+                .iter()
+                .zip(&kernel[skip..])
+                .fold((0.0f32, 0.0f32), |(sum, total), (sample, weight)| {
+                    (sum + sample * weight, total + weight)
+                });
+            if weight.abs() > 1e-6 {
+                sum / weight
+            } else {
+                sum
+            }
         })
         .collect()
 }
 
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Assign the speaker whose span contains the word's midpoint, or else the nearest span.
+/// Aligner and diarizer boundaries rarely agree exactly, and a word that falls in a short gap
+/// between spans was still spoken by someone; leaving it unlabeled splits the segment.
 fn speaker_at(segments: &Option<Vec<SpeakerSpan>>, start: f32, end: f32) -> Option<usize> {
     let midpoint = (start + end) * 0.5;
     segments
         .as_ref()?
         .iter()
-        .find(|segment| {
-            midpoint >= segment.start as f32 / TARGET_SAMPLE_RATE as f32
-                && midpoint <= segment.end as f32 / TARGET_SAMPLE_RATE as f32
+        .map(|segment| {
+            let span_start = segment.start as f32 / TARGET_SAMPLE_RATE as f32;
+            let span_end = segment.end as f32 / TARGET_SAMPLE_RATE as f32;
+            let distance = (span_start - midpoint).max(midpoint - span_end).max(0.0);
+            (distance, segment.speaker_id)
         })
-        .map(|segment| segment.speaker_id)
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, speaker)| speaker)
+}
+
+/// Keep the `max_speakers` speakers with the most speaking time. Filtering by ID instead would
+/// keep whichever speakers Sortformer happened to number first and drop a main speaker.
+#[cfg_attr(not(feature = "diarization"), allow(dead_code))]
+fn limit_speakers(mut spans: Vec<SpeakerSpan>, max_speakers: usize) -> Vec<SpeakerSpan> {
+    let mut talk_time: HashMap<usize, u64> = HashMap::new();
+    for span in &spans {
+        *talk_time.entry(span.speaker_id).or_default() += span.end.saturating_sub(span.start);
+    }
+    if talk_time.len() <= max_speakers {
+        return spans;
+    }
+    let mut ranked = talk_time.into_iter().collect::<Vec<_>>();
+    ranked.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    let kept = ranked
+        .into_iter()
+        .take(max_speakers)
+        .map(|(speaker, _)| speaker)
+        .collect::<Vec<_>>();
+    spans.retain(|span| kept.contains(&span.speaker_id));
+    spans
 }
 
 fn detected_speaker_count(segments: &Option<Vec<SpeakerSpan>>) -> Option<usize> {
@@ -1177,15 +1330,15 @@ fn run_diarization(
             model
                 .diarize(samples.to_vec(), TARGET_SAMPLE_RATE, 1)
                 .map(|segments| {
-                    segments
+                    let spans = segments
                         .into_iter()
-                        .filter(|segment| segment.speaker_id < max_speakers)
                         .map(|segment| SpeakerSpan {
                             start: segment.start,
                             end: segment.end,
                             speaker_id: segment.speaker_id,
                         })
-                        .collect()
+                        .collect();
+                    limit_speakers(spans, max_speakers)
                 })
         })
         .transpose()?)
@@ -1248,10 +1401,33 @@ fn output_path(cli: &Cli, job: &Job) -> PathBuf {
     {
         parent.join(relative).with_extension(extension)
     } else {
-        parent
-            .join(job.input.file_stem().unwrap_or_default())
-            .with_extension(extension)
+        // Append rather than `with_extension`: a dotted stem such as `meeting.2024` would
+        // otherwise lose its last component and collide with `meeting.2025`.
+        let mut name = job.input.file_stem().unwrap_or_default().to_os_string();
+        name.push(".");
+        name.push(extension);
+        parent.join(name)
     }
+}
+
+/// Reject queues where two inputs (for example `talk.m4a` and `talk.wav`) would write the same
+/// transcript. Without this, the second job either fails late or, with `--overwrite`, silently
+/// replaces the first job's output.
+fn ensure_unique_outputs(cli: &Cli, jobs: &[Job]) -> Result<()> {
+    let mut seen: HashMap<String, &Path> = HashMap::new();
+    for job in jobs {
+        // APFS is case-insensitive by default, so compare case-folded paths.
+        let key = output_path(cli, job).to_string_lossy().to_lowercase();
+        if let Some(previous) = seen.insert(key, &job.input) {
+            bail!(
+                "{} and {} would both write {}; use a manifest with explicit outputs",
+                previous.display(),
+                job.input.display(),
+                output_path(cli, job).display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn input_key(path: &Path) -> String {
@@ -1367,11 +1543,151 @@ mod tests {
 
     #[test]
     fn resampling_keeps_nonempty_short_audio() {
+        assert_eq!(resample(vec![0.5], 192_000, TARGET_SAMPLE_RATE), vec![0.5]);
+        assert!(resample(Vec::new(), 192_000, TARGET_SAMPLE_RATE).is_empty());
+    }
+
+    fn tone(frequency: f32, rate: u32, seconds: f32) -> Vec<f32> {
+        (0..(rate as f32 * seconds) as usize)
+            .map(|index| (std::f32::consts::TAU * frequency * index as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn resampling_rejects_aliases_and_keeps_speech_band() {
+        for rate in [44_100, 48_000] {
+            // 12 kHz is above the 8 kHz output Nyquist; linear interpolation folds it to 4 kHz
+            // at nearly full amplitude.
+            let alias = resample(tone(12_000.0, rate, 1.0), rate, TARGET_SAMPLE_RATE);
+            assert_eq!(alias.len(), TARGET_SAMPLE_RATE as usize);
+            assert!(rms(&alias[800..15_200]) < 0.02, "{rate} Hz aliasing");
+            let speech = resample(tone(1_000.0, rate, 1.0), rate, TARGET_SAMPLE_RATE);
+            let level = rms(&speech[800..15_200]);
+            assert!(
+                (level - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.02,
+                "{level}"
+            );
+        }
+        let upsampled = resample(vec![0.25; 800], 8_000, TARGET_SAMPLE_RATE);
+        assert_eq!(upsampled.len(), 1_600);
+        assert!(upsampled.iter().all(|sample| (sample - 0.25).abs() < 1e-3));
+    }
+
+    #[test]
+    fn chunks_cut_in_silence_and_cover_all_samples() {
+        let rate = TARGET_SAMPLE_RATE as usize;
+        // 25 s of tone with a 200 ms pause starting at 8.5 s; 10 s chunks.
+        let mut samples = tone(440.0, TARGET_SAMPLE_RATE, 25.0);
+        samples[rate * 85 / 10..rate * 87 / 10].fill(0.0);
+        let ranges = chunk_ranges(&samples, rate * 10);
+        assert_eq!(ranges.first().map(|range| range.start), Some(0));
+        assert_eq!(ranges.last().map(|range| range.end), Some(samples.len()));
+        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert!(ranges.iter().all(|range| range.len() <= rate * 10));
+        assert!((rate * 85 / 10..rate * 87 / 10).contains(&ranges[0].end));
+        assert_eq!(chunk_ranges(&samples[..rate], rate * 10), vec![0..rate]);
+        // 10.005 s with 10 s chunks must not end in an 80-sample chunk.
+        let ranges = chunk_ranges(&samples[..rate * 10 + 80], rate * 10);
+        assert!(ranges.last().is_some_and(|range| range.len() >= rate));
+    }
+
+    fn span(start_seconds: f32, end_seconds: f32, speaker_id: usize) -> SpeakerSpan {
+        SpeakerSpan {
+            start: (start_seconds * TARGET_SAMPLE_RATE as f32) as u64,
+            end: (end_seconds * TARGET_SAMPLE_RATE as f32) as u64,
+            speaker_id,
+        }
+    }
+
+    #[test]
+    fn words_between_diarization_spans_get_the_nearest_speaker() {
+        let spans = Some(vec![span(0.0, 2.0, 0), span(3.0, 5.0, 1)]);
+        assert_eq!(speaker_at(&spans, 1.0, 1.2), Some(0));
+        assert_eq!(speaker_at(&spans, 2.1, 2.3), Some(0));
+        assert_eq!(speaker_at(&spans, 2.7, 2.9), Some(1));
+        assert_eq!(speaker_at(&spans, 9.0, 9.5), Some(1));
+        assert_eq!(speaker_at(&None, 1.0, 1.2), None);
+    }
+
+    #[test]
+    fn speaker_limit_keeps_the_most_talkative_speakers() {
+        let spans = vec![
+            span(0.0, 1.0, 0),
+            span(1.0, 20.0, 2),
+            span(20.0, 30.0, 1),
+            span(30.0, 31.0, 0),
+        ];
+        let kept = limit_speakers(spans.clone(), 2);
+        let mut ids = kept.iter().map(|span| span.speaker_id).collect::<Vec<_>>();
+        ids.dedup();
+        assert_eq!(ids, vec![2, 1]);
+        assert_eq!(limit_speakers(spans, 3).len(), 4);
+    }
+
+    #[test]
+    fn dotted_stems_keep_every_component() {
+        let cli = Cli::parse_from(["transcriberrr", "--format", "txt", "-o", "out", "x.wav"]);
+        let job = |input: &str| Job {
+            input: PathBuf::from(input),
+            diarize: false,
+            speakers: None,
+            output: None,
+            output_dir: PathBuf::from("out"),
+            output_location: OutputLocation::Folder,
+        };
         assert_eq!(
-            resample_linear(vec![0.5], 192_000, TARGET_SAMPLE_RATE),
-            vec![0.5]
+            output_path(&cli, &job("rec/meeting.2024.m4a")),
+            PathBuf::from("out/meeting.2024.txt")
         );
-        assert!(resample_linear(Vec::new(), 192_000, TARGET_SAMPLE_RATE).is_empty());
+        assert_eq!(
+            output_path(&cli, &job("rec/plain.m4a")),
+            PathBuf::from("out/plain.txt")
+        );
+        assert!(ensure_unique_outputs(&cli, &[job("a/call.1.m4a"), job("a/call.2.m4a")]).is_ok());
+        let error = ensure_unique_outputs(&cli, &[job("a/Talk.m4a"), job("b/talk.wav")])
+            .expect_err("colliding outputs must be rejected");
+        assert!(error.to_string().contains("would both write"));
+    }
+
+    #[test]
+    fn resume_tolerates_a_torn_progress_line() {
+        let directory = std::env::temp_dir().join(format!(
+            "transcriberrr-progress-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("progress.jsonl");
+        fs::write(
+            &path,
+            "{\"input\":\"/a.wav\",\"status\":\"completed\"}\n{\"input\":\"/b.wav\",\"sta",
+        )
+        .unwrap();
+        let mut log = ProgressLog::open(Some(&path), true).expect("torn line must not abort");
+        assert!(
+            log.latest
+                .get("/a.wav")
+                .is_some_and(|event| event.status == "completed")
+        );
+        log.record(ProgressEvent {
+            input: "/c.wav".to_owned(),
+            status: "completed".to_owned(),
+            output: None,
+            error: None,
+            elapsed_seconds: None,
+            progress: None,
+            phase: None,
+        })
+        .unwrap();
+        drop(log);
+        let reopened = ProgressLog::open(Some(&path), true).unwrap();
+        assert!(reopened.latest.contains_key("/a.wav"));
+        assert!(reopened.latest.contains_key("/c.wav"));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
