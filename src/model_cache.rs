@@ -103,7 +103,36 @@ impl ModelCache {
         if let Some(snapshot) = self.cached_path(&id_or_path) {
             return Ok(snapshot);
         }
+        self.fetch(&id_or_path)
+    }
 
+    /// Re-check a Hub model against the repository listing and download any missing files.
+    /// Used when a cached snapshot fails to load: caches interrupted before the incomplete
+    /// marker existed still look complete offline. Returns `None` for local model paths.
+    pub fn repair(&self, id_or_path: &str) -> Result<Option<PathBuf>> {
+        let expanded = expand_home(Path::new(id_or_path));
+        let id = canonical_id(&expanded.to_string_lossy());
+        if Path::new(&id).exists() {
+            return Ok(None);
+        }
+        self.fetch(&id).map(Some)
+    }
+
+    /// Offline lookup used by `--cached-model` so the app asks the CLI instead of
+    /// re-implementing aliases, markers, and snapshot resolution.
+    pub fn lookup(&self, id_or_path: &str) -> Option<PathBuf> {
+        let expanded = expand_home(Path::new(id_or_path));
+        let id = canonical_id(&expanded.to_string_lossy());
+        let path = Path::new(&id);
+        if path.exists() {
+            return Some(path.to_path_buf());
+        }
+        self.cached_path(&id)
+    }
+
+    /// Download `id` into the cache; files already present are not fetched again.
+    fn fetch(&self, id_or_path: &str) -> Result<PathBuf> {
+        let id_or_path = id_or_path.to_owned();
         let api = ApiBuilder::from_cache(Cache::new(self.root.clone()))
             .with_progress(true)
             .build()
@@ -206,6 +235,24 @@ impl ModelCache {
         // Require a configuration plus at least one weight/entry point for normal models. This
         // prevents a network interruption after config.json from being mistaken for a complete
         // snapshot on the next run.
+        // Sharded weights: the index names every shard, so a partial download is detectable
+        // offline even without the incomplete marker.
+        if let Some(index) = repo.get("model.safetensors.index.json") {
+            let shards = fs::read_to_string(&index)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|value| {
+                    value["weight_map"].as_object().map(|map| {
+                        map.values()
+                            .filter_map(|shard| shard.as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                });
+            match shards {
+                Some(shards) if shards.iter().all(|shard| repo.get(shard).is_some()) => {}
+                _ => return None,
+            }
+        }
         if config.is_some() {
             for marker in [
                 "model.safetensors",
@@ -339,6 +386,23 @@ mod tests {
         assert_eq!(cache.cached_path("Org/Model"), Some(snapshot.clone()));
         fs::write(cache.incomplete_marker("Org/Model"), "").unwrap();
         assert_eq!(cache.cached_path("Org/Model"), None);
+        fs::remove_file(cache.incomplete_marker("Org/Model")).unwrap();
+
+        // Pre-marker partial download: the index names a shard that never arrived.
+        fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001.safetensors","b":"model-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        fs::write(snapshot.join("model-00001.safetensors"), "").unwrap();
+        assert_eq!(cache.cached_path("Org/Model"), None);
+        fs::write(snapshot.join("model-00002.safetensors"), "").unwrap();
+        assert_eq!(cache.cached_path("Org/Model"), Some(snapshot.clone()));
+        assert_eq!(cache.lookup("Org/Model"), Some(snapshot));
+        assert_eq!(
+            cache.lookup(&root.display().to_string()),
+            Some(root.clone())
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

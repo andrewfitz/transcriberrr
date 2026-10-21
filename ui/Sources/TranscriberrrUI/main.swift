@@ -282,13 +282,13 @@ final class AppState: ObservableObject {
 
     private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "mp3", "ogg", "wav", "webm"]
     private var pendingSave: Task<Void, Never>?
-    private var cachedModelStatusValue: String?
+    @Published private(set) var modelStatus = "Checking the local model cache…"
+    private var modelStatusTask: Task<Void, Never>?
     private var activeProcess: Process?
     private var queueStartedAt: Date?
     private var storedQueueElapsedSeconds: TimeInterval = 0
     @Published private var clock = Date()
     private var clockTask: Task<Void, Never>?
-    private var itemStartedAt: [UUID: Date] = [:]
 
     private var queueFile: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -298,6 +298,7 @@ final class AppState: ObservableObject {
 
     init() {
         loadQueue()
+        invalidateModelStatus()
         // saveQueue() is debounced, so flush on quit. Child processes also outlive the
         // app; stop the CLI rather than leave it holding the GPU with nobody watching.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
@@ -342,28 +343,6 @@ final class AppState: ObservableObject {
         return max(0, elapsed * (1 / progress - 1))
     }
 
-    var modelStatus: String {
-        if let cachedModelStatusValue { return cachedModelStatusValue }
-        let value: String
-        switch engine {
-        case "apple-native": value = "Apple SpeechTranscriber (system model; macOS 26+)"
-        case "parakeet-v3":
-            if isLocalModelPath(modelID) {
-                value = localModelURL(modelID).map { FileManager.default.fileExists(atPath: $0.path) ? "Local model ready" : "Local model not found" } ?? "Local model not found"
-            } else {
-                value = cachedModel(modelID) ? "Downloaded" : "Downloads on first use"
-            }
-        default:
-            if isLocalModelPath(modelID) {
-                value = localModelURL(modelID).map { FileManager.default.fileExists(atPath: $0.path) ? "Local model ready" : "Local model not found" } ?? "Local model not found"
-            } else {
-                value = cachedModel(modelID) ? "Downloaded" : "Downloads on first use"
-            }
-        }
-        cachedModelStatusValue = value
-        return value
-    }
-
     func selectEngine(_ value: String) {
         if value == "parakeet-v3" && modelID == "Qwen/Qwen3-ASR-1.7B" {
             modelID = "eschmidbauer/parakeet-unified-en-0.6b-onnx"
@@ -381,77 +360,29 @@ final class AppState: ObservableObject {
             }
         }
         engine = value
-        cachedModelStatusValue = nil
+        invalidateModelStatus()
     }
 
+    /// Re-query the CLI for the selected model's cache state. Called on launch
+    /// and whenever the engine or model changes.
     func invalidateModelStatus() {
-        cachedModelStatusValue = nil
-    }
-
-    /// Mirrors `model_cache::default_cache_dir` and its `~` expansion in the CLI.
-    private var modelCacheRoot: URL {
-        if let configured = ProcessInfo.processInfo.environment["TRANSCRIBERRR_MODEL_CACHE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !configured.isEmpty {
-            return URL(fileURLWithPath: (configured as NSString).expandingTildeInPath)
+        modelStatusTask?.cancel()
+        guard engine != "apple-native" else {
+            modelStatus = "Apple SpeechTranscriber (system model; macOS 26+)"
+            return
         }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Transcriberrr/models/hub")
-    }
-
-    /// Mirrors `model_cache::canonical_id`; an alias missing here made the app
-    /// re-run the download step on every queue.
-    private func canonicalModelID(_ id: String) -> String {
-        switch id {
-        case "qwen3-asr-1.7b", "qwen-1.7b": "Qwen/Qwen3-ASR-1.7B"
-        case "qwen3-asr-0.6b", "qwen-0.6b": "Qwen/Qwen3-ASR-0.6B"
-        case "qwen3-forced-aligner-0.6b", "forced-aligner": "Qwen/Qwen3-ForcedAligner-0.6B"
-        case "parakeet-v3", "parakeet-unified", "parakeet-unified-en", "nvidia/parakeet-unified-en-0.6b":
-            "eschmidbauer/parakeet-unified-en-0.6b-onnx"
-        case "parakeet-tdt-v3": "istupakov/parakeet-tdt-0.6b-v3-onnx"
-        case "sortformer-4spk", "sortformer": "altunenes/parakeet-rs"
-        default: id
-        }
-    }
-
-    private func modelRepository(_ id: String) -> URL {
-        modelCacheRoot.appendingPathComponent("models--" + id.replacingOccurrences(of: "/", with: "--"), isDirectory: true)
-    }
-
-    private func cachedModel(_ id: String) -> Bool {
-        guard !id.isEmpty, !isLocalModelPath(id) else { return false }
-        let normalizedID = canonicalModelID(id)
-        let repository = modelRepository(normalizedID)
-        // Written by the CLI while a download is in flight; see model_cache.rs.
-        if FileManager.default.fileExists(atPath: repository.appendingPathComponent(".transcriberrr-incomplete").path) {
-            return false
-        }
-        let snapshots = repository.appendingPathComponent("snapshots", isDirectory: true)
-        guard let revisions = try? FileManager.default.contentsOfDirectory(
-            at: snapshots,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return false }
-        // Match the CLI's completeness check: a created snapshots directory alone can be left
-        // behind by an interrupted download and must not be shown as ready.
-        return revisions.contains { revision in
-            guard (try? revision.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return false }
-            if normalizedID == "eschmidbauer/parakeet-unified-en-0.6b-onnx" {
-                let unified = revision.appendingPathComponent("onnx_fp32", isDirectory: true)
-                return ["encoder.onnx", "encoder.onnx.data", "decoder_joint.onnx", "decoder_joint.onnx.data", "tokenizer.model"]
-                    .allSatisfy { FileManager.default.fileExists(atPath: unified.appendingPathComponent($0).path) }
+        let model = effectiveModelID
+        modelStatus = "Checking the local model cache…"
+        modelStatusTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let cached = await self.cachedModels([model])?[model]
+            guard !Task.isCancelled else { return }
+            let local = self.isLocalModelPath(model)
+            self.modelStatus = switch cached {
+            case true?: local ? "Local model ready" : "Downloaded"
+            case false?: local ? "Local model not found" : "Downloads on first use"
+            case nil: "Model status unavailable"
             }
-            let config = revision.appendingPathComponent("config.json")
-            guard FileManager.default.fileExists(atPath: config.path) else { return false }
-            let markers = [
-                "model.safetensors",
-                "model.safetensors.index.json",
-                "pytorch_model.bin",
-                "pytorch_model.bin.index.json",
-                "model.bin",
-                "model.onnx",
-                "encoder-model.onnx"
-            ]
-            return markers.contains { FileManager.default.fileExists(atPath: revision.appendingPathComponent($0).path) }
         }
     }
 
@@ -602,8 +533,8 @@ final class AppState: ObservableObject {
             objectWillChange.send()
             saveQueue()
 
-            let modelDownloads = requiredModelDownloads(for: pending)
-            if !modelDownloads.isEmpty {
+            let modelDownloads = await requiredModelDownloads(for: pending)
+            if !modelDownloads.isEmpty, !isCancelling {
                 beginModelActivity(title: "Preparing models", message: "Checking and downloading model files…")
                 modelActivityLog = modelDownloads.map { "Model: \($0)" }
                 let result = await downloadModels(modelDownloads)
@@ -632,7 +563,7 @@ final class AppState: ObservableObject {
                 modelActivityProgress = 1
             }
 
-            if engine != "apple-native", let first = pending.first {
+            if let first = pending.first {
                 first.state = .processing
                 first.progress = 0.05
                 first.resultSummary = "Starting transcription…"
@@ -642,29 +573,10 @@ final class AppState: ObservableObject {
 
             // Qwen and Parakeet keep their weights in process memory. Run the
             // whole queue through one manifest so a 5,000-track queue does not
-            // repeatedly pay model startup and Metal pipeline compilation.
-            if engine == "apple-native" {
-                var reservedOutputs = Set<String>()
-                for item in pending {
-                    if isCancelling { break }
-                    item.state = .processing
-                    item.progress = 0.05
-                    item.elapsedSeconds = 0
-                    item.estimatedRemainingSeconds = nil
-                    item.resultSummary = "Transcribing…"
-                    itemStartedAt[item.id] = Date()
-                    objectWillChange.send()
-                    saveQueue()
-                    let output = uniqueOutput(expectedOutput(for: item), reserved: &reservedOutputs)
-                    let result = await runCLI(for: item, outputOverride: output)
-                    if let startedAt = itemStartedAt.removeValue(forKey: item.id) {
-                        item.elapsedSeconds = max(0, Date().timeIntervalSince(startedAt))
-                    }
-                    if isCancelling { break }
-                    apply(result, to: item)
-                    saveQueue()
-                }
-            } else if !pending.isEmpty, !isCancelling {
+            // repeatedly pay model startup and Metal pipeline compilation. The
+            // Apple engine goes through the CLI too, which converts formats
+            // AVFoundation cannot open (WebM) and validates the transcript.
+            if !pending.isEmpty, !isCancelling {
                 let result = await runBulkCLI(for: pending)
                 if isCancelling {
                     markCanceled(pending)
@@ -691,11 +603,6 @@ final class AppState: ObservableObject {
         clockTask = Task { @MainActor [weak self] in
             while let self, !Task.isCancelled, self.isRunning {
                 self.clock = Date()
-                for item in self.items where item.state == .processing {
-                    if let startedAt = self.itemStartedAt[item.id] {
-                        item.elapsedSeconds = max(0, self.clock.timeIntervalSince(startedAt))
-                    }
-                }
                 try? await Task.sleep(for: .seconds(1))
             }
         }
@@ -707,46 +614,63 @@ final class AppState: ObservableObject {
         queueStartedAt = nil
         clockTask?.cancel()
         clockTask = nil
-        itemStartedAt.removeAll()
     }
 
-    private func requiredModelDownloads(for pending: [AudioItem]) -> [String] {
+    /// The model the CLI will load: it swaps the Qwen default for the Parakeet
+    /// default with --engine parakeet-v3 (main.rs).
+    private var effectiveModelID: String {
+        engine == "parakeet-v3" && modelID == "Qwen/Qwen3-ASR-1.7B"
+            ? "eschmidbauer/parakeet-unified-en-0.6b-onnx" : modelID
+    }
+
+    private func requiredModelDownloads(for pending: [AudioItem]) async -> [String] {
         guard engine != "apple-native" else { return [] }
-        var values: [String] = []
+        var candidates: [String] = []
         func append(_ value: String) {
-            guard !value.isEmpty, !isLocalModelPath(value), !values.contains(value) else { return }
-            guard modelNeedsDownload(value) else { return }
-            values.append(value)
+            // Local paths cannot be downloaded; the CLI reports a missing one itself.
+            guard !value.isEmpty, !isLocalModelPath(value), !candidates.contains(value) else { return }
+            candidates.append(value)
         }
-        // The CLI swaps the Qwen default for the Parakeet default with --engine parakeet-v3
-        // (main.rs); check the model it will actually load, not the one in the field.
-        append(engine == "parakeet-v3" && modelID == "Qwen/Qwen3-ASR-1.7B"
-               ? "eschmidbauer/parakeet-unified-en-0.6b-onnx" : modelID)
+        append(effectiveModelID)
         if engine == "qwen" && timestamps != "none" {
             append("Qwen/Qwen3-ForcedAligner-0.6B")
         }
         if pending.contains(where: { $0.diarize || $0.speakerCount != nil }) {
             append(diarizationModelArgument)
         }
-        return values
+        guard !candidates.isEmpty else { return [] }
+        // If the query fails, let the download step decide; it is a no-op for
+        // files already in the cache.
+        guard let cached = await cachedModels(candidates) else { return candidates }
+        return candidates.filter { cached[$0] != true }
     }
 
-    private func modelNeedsDownload(_ value: String) -> Bool {
-        guard !isLocalModelPath(value) else { return false }
-        if value == "/sortformer" || canonicalModelID(value) == "altunenes/parakeet-rs" {
-            return !cachedSortformer()
+    /// Asks the CLI (`--cached-model`) which models are usable offline, so the
+    /// app never re-implements aliases, completeness markers, or snapshot rules.
+    private func cachedModels(_ ids: [String]) async -> [String: Bool]? {
+        guard let executableURL = cliURL else { return nil }
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = ids.flatMap { ["--cached-model", $0] }
+        let output = PipeCollector()
+        process.standardOutput = output.pipe
+        process.standardError = FileHandle.nullDevice
+        let result: (Int32, String)? = await withCheckedContinuation { continuation in
+            process.terminationHandler = { process in
+                continuation.resume(returning: (process.terminationStatus, output.finish()))
+            }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                _ = output.finish()
+                continuation.resume(returning: nil)
+            }
         }
-        return !cachedModel(value)
-    }
-
-    private func cachedSortformer() -> Bool {
-        let repo = modelRepository("altunenes/parakeet-rs").appendingPathComponent("snapshots", isDirectory: true)
-        guard let enumerator = FileManager.default.enumerator(at: repo, includingPropertiesForKeys: [.isRegularFileKey]) else {
-            return false
-        }
-        return enumerator.compactMap { $0 as? URL }.contains { url in
-            url.lastPathComponent == "nemotron3_diar_v3.onnx"
-        }
+        struct Entry: Decodable { var id: String; var cached: Bool }
+        guard let result, result.0 == 0,
+              let entries = try? JSONDecoder().decode([Entry].self, from: Data(result.1.utf8)) else { return nil }
+        return Dictionary(entries.map { ($0.id, $0.cached) }, uniquingKeysWith: { first, _ in first })
     }
 
     var diarizationModelArgument: String {
@@ -828,20 +752,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func apply(_ result: (status: Int32, message: String, outputURL: URL?), to item: AudioItem) {
-        if result.status == 0 {
-            item.progress = 1
-            item.estimatedRemainingSeconds = nil
-            item.state = .done
-            item.outputURL = result.outputURL
-            item.resultSummary = result.outputURL.map { "Saved to \($0.path)" } ?? "Transcription complete"
-        } else {
-            item.estimatedRemainingSeconds = nil
-            item.state = .failed(result.message.isEmpty ? "Transcription failed" : result.message)
-            item.resultSummary = item.state.label
-        }
-    }
-
     private func applyBulk(_ result: BulkResult, to items: [AudioItem]) {
         // stderr holds a line per finished track; the last line is the run's error.
         let fallback = result.message.split(whereSeparator: \.isNewline).last
@@ -901,57 +811,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func runCLI(for item: AudioItem, outputOverride: URL? = nil) async -> (status: Int32, message: String, outputURL: URL?) {
-        let process = Process()
-        let isNative = engine == "apple-native"
-        if isNative && item.diarize {
-            return (1, "Apple SpeechTranscriber does not provide diarization; choose Qwen3 or Parakeet Unified for speaker labels.", nil)
-        }
-        let executableURL = isNative ? nativeURL : cliURL
-        guard let executableURL else {
-            let name = isNative ? "transcriberrr-native" : "transcriberrr"
-            return (1, "The \(name) executable is not bundled. Rebuild the app with scripts/build-macos-app.sh.", nil)
-        }
-        process.executableURL = executableURL
-        let destination = outputDestination == .folder ? outputFolder : item.url.deletingLastPathComponent()
-        let outputExtension = format
-        let output = outputOverride
-            ?? destination.appendingPathComponent(item.url.deletingPathExtension().lastPathComponent).appendingPathExtension(outputExtension)
-        var arguments: [String]
-        if isNative {
-            arguments = [item.url.path, "--output", output.path, "--format", format, "--timestamps", timestamps]
-            if item.diarize {
-                arguments.append("--diarize")
-                if let speakerCount = item.speakerCount { arguments += ["--speakers", String(speakerCount)] }
-            }
-        } else {
-            let backend = engine == "parakeet-v3" ? "parakeet-v3" : "qwen3"
-            arguments = [item.url.path, "--output-dir", destination.path, "--engine", backend, "--model", modelID, "--device", device, "--format", format, "--timestamps", timestamps, "--overwrite"]
-            if item.diarize {
-                arguments += ["--diarize", "--diarization-model", diarizationModelArgument]
-                if let speakerCount = item.speakerCount {
-                    arguments += ["--speakers", String(speakerCount)]
-                }
-            }
-        }
-        process.arguments = arguments
-        let errors = PipeCollector()
-        process.standardError = errors.pipe
-        return await withCheckedContinuation { continuation in
-            process.terminationHandler = { process in
-                let message = errors.finish()
-                Task { @MainActor in
-                    if self.activeProcess === process { self.activeProcess = nil }
-                }
-                continuation.resume(returning: (process.terminationStatus, message, output))
-            }
-            launch(process) { error in
-                _ = errors.finish()
-                continuation.resume(returning: (1, error.localizedDescription, nil))
-            }
-        }
-    }
-
     private struct BulkResult {
         var status: Int32
         var message: String
@@ -987,7 +846,7 @@ final class AppState: ObservableObject {
             let data = try JSONEncoder().encode(manifest)
             try data.write(to: manifestURL, options: .atomic)
             var arguments = ["--manifest", manifestURL.path, "--output-dir", destination.path,
-                             "--engine", engine == "parakeet-v3" ? "parakeet-v3" : "qwen3",
+                             "--engine", cliEngine,
                              "--model", modelID, "--device", device, "--format", format,
                              "--timestamps", timestamps, "--progress-file", progressURL.path, "--overwrite"]
             if items.contains(where: { $0.diarize || $0.speakerCount != nil }) {
@@ -996,6 +855,11 @@ final class AppState: ObservableObject {
             let process = Process()
             process.executableURL = executableURL
             process.arguments = arguments
+            if let nativeURL {
+                // Lets a development CLI (target/release) find the Speech helper.
+                process.environment = ProcessInfo.processInfo.environment
+                    .merging(["TRANSCRIBERRR_NATIVE": nativeURL.path]) { _, new in new }
+            }
             let errors = PipeCollector()
             process.standardError = errors.pipe
             let progressReader = ProgressReader()
@@ -1053,6 +917,14 @@ final class AppState: ObservableObject {
         } catch {
             try? FileManager.default.removeItem(at: temporaryRoot)
             return BulkResult(status: 1, message: error.localizedDescription, progress: [:])
+        }
+    }
+
+    private var cliEngine: String {
+        switch engine {
+        case "parakeet-v3": "parakeet-v3"
+        case "apple-native": "apple-native"
+        default: "qwen3"
         }
     }
 
@@ -1183,16 +1055,6 @@ final class AppState: ObservableObject {
 
     private func isLocalModelPath(_ value: String) -> Bool {
         value == "~" || value.hasPrefix("~/") || value.hasPrefix("/")
-    }
-
-    private func localModelURL(_ value: String) -> URL? {
-        guard isLocalModelPath(value) else { return nil }
-        if value == "~" { return FileManager.default.homeDirectoryForCurrentUser }
-        if value.hasPrefix("~/") {
-            return FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(String(value.dropFirst(2)))
-        }
-        return URL(fileURLWithPath: value)
     }
 
     private func isDirectory(_ url: URL) -> Bool {

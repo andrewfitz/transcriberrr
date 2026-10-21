@@ -251,13 +251,12 @@ pub(crate) fn write_output(
     timestamps: TimestampGranularity,
 ) -> Result<()> {
     let content = render_output(doc, format, timestamps)?;
-    let file_name = path
-        .file_name()
-        .with_context(|| format!("output path has no file name: {}", path.display()))?;
-    let mut temporary_name = std::ffi::OsString::from(".");
-    temporary_name.push(file_name);
-    temporary_name.push(format!(".{}.tmp", std::process::id()));
-    let temporary = path.with_file_name(temporary_name);
+    if path.file_name().is_none() {
+        bail!("output path has no file name: {}", path.display());
+    }
+    // Fixed-length name: deriving it from a near-255-byte file name would exceed NAME_MAX.
+    // One process writes one output at a time, so the PID keeps it unique.
+    let temporary = path.with_file_name(format!(".transcriberrr-{}.tmp", std::process::id()));
     let result =
         std::fs::write(&temporary, content).and_then(|()| std::fs::rename(&temporary, path));
     if result.is_err() {

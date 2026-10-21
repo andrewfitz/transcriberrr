@@ -1,3 +1,4 @@
+mod audio_convert;
 mod model_cache;
 mod transcript;
 use transcript::{
@@ -53,7 +54,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
-    #[arg(value_name = "AUDIO", required_unless_present_any = ["input_dir", "manifest", "model_status", "download_model"])]
+    #[arg(value_name = "AUDIO", required_unless_present_any = ["input_dir", "manifest", "model_status", "download_model", "cached_model"])]
     inputs: Vec<PathBuf>,
     #[arg(long, conflicts_with_all = ["inputs", "manifest"])]
     input_dir: Option<PathBuf>,
@@ -78,6 +79,10 @@ struct Cli {
     /// Print cached model status as JSON and exit when no input is supplied.
     #[arg(long)]
     model_status: bool,
+    /// Report whether model IDs, aliases, or local paths are usable offline, as JSON, then exit.
+    /// The app uses this so it never second-guesses the CLI's cache rules.
+    #[arg(long = "cached-model", value_name = "ID", conflicts_with_all = ["inputs", "input_dir", "manifest"])]
+    cached_model: Vec<String>,
     /// Qwen3 forced aligner ID or local directory for word timestamps.
     #[arg(long, default_value = "Qwen/Qwen3-ForcedAligner-0.6B")]
     forced_aligner: String,
@@ -419,6 +424,22 @@ fn main() -> Result<()> {
             .into_owned();
     }
     let model_cache = model_cache::ModelCache::new(cli.model_cache.clone())?;
+    if !cli.cached_model.is_empty() {
+        let report = cli
+            .cached_model
+            .iter()
+            .map(|id| {
+                let path = model_cache.lookup(id);
+                serde_json::json!({
+                    "id": id,
+                    "cached": path.is_some(),
+                    "path": path.map(|path| path.display().to_string()),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if cli.model_status {
         println!("{}", serde_json::to_string_pretty(&model_cache.status())?);
         if cli.download_model.is_empty()
@@ -469,12 +490,6 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "parakeet"))]
     if matches!(cli.engine, EngineKind::ParakeetV3) {
         bail!("Parakeet support is not included in this build; rebuild with --features parakeet");
-    }
-    if matches!(cli.engine, EngineKind::Qwen3) && cli.timestamps != TimestampGranularity::None {
-        cli.forced_aligner = model_cache
-            .ensure(&cli.forced_aligner)?
-            .to_string_lossy()
-            .into_owned();
     }
     let wants_diarization = jobs.iter().any(|job| job.diarize);
     #[cfg(feature = "diarization")]
@@ -529,37 +544,33 @@ fn main() -> Result<()> {
     let mut aligner: Option<Qwen3ForcedAligner> = None;
     let load_options = LoadOptions::default();
     if matches!(cli.engine, EngineKind::Qwen3) {
-        let model_path = model_cache.ensure(&cli.model)?;
-        let model_path = model_path
-            .to_str()
-            .context("Qwen model cache path is not valid UTF-8")?;
-        asr = Some(
-            Qwen3Asr::from_pretrained(model_path, &device, &load_options)
-                .with_context(|| format!("loading Qwen3-ASR model {}", cli.model))?,
-        );
-        if cli.timestamps != TimestampGranularity::None {
-            let aligner_path = model_cache.ensure(&cli.forced_aligner)?;
-            let aligner_path = aligner_path
+        asr = Some(load_model(&model_cache, &cli.model, |path| {
+            let path = path
                 .to_str()
-                .context("forced aligner cache path is not valid UTF-8")?;
-            aligner = Some(
+                .context("Qwen model cache path is not valid UTF-8")?;
+            Qwen3Asr::from_pretrained(path, &device, &load_options)
+                .with_context(|| format!("loading Qwen3-ASR model {}", cli.model))
+        })?);
+        if cli.timestamps != TimestampGranularity::None {
+            aligner = Some(load_model(&model_cache, &cli.forced_aligner, |path| {
+                let path = path
+                    .to_str()
+                    .context("forced aligner cache path is not valid UTF-8")?;
                 Qwen3ForcedAligner::from_pretrained_with_processor(
-                    aligner_path,
+                    path,
                     &device,
                     &load_options,
                     ForcedAlignProcessor::new(),
                 )
-                .with_context(|| format!("loading forced aligner {}", cli.forced_aligner))?,
-            );
+                .with_context(|| format!("loading forced aligner {}", cli.forced_aligner))
+            })?);
         }
     }
     #[cfg(feature = "parakeet")]
     let mut parakeet = if matches!(cli.engine, EngineKind::ParakeetV3) {
-        let model_path = model_cache.ensure(&cli.model)?;
-        Some(ParakeetEngine::from_pretrained(
-            &model_path,
-            matches!(cli.device, DeviceKind::Metal),
-        )?)
+        Some(load_model(&model_cache, &cli.model, |path| {
+            ParakeetEngine::from_pretrained(path, matches!(cli.device, DeviceKind::Metal))
+        })?)
     } else {
         None
     };
@@ -666,6 +677,28 @@ fn main() -> Result<()> {
         bail!("{failures} input file(s) failed");
     }
     Ok(())
+}
+
+/// Resolve and load a model. If a cached Hub snapshot fails to load, re-check it against the
+/// repository once (fetching any missing files) and retry, so a partial download from an older
+/// build repairs itself instead of failing every run.
+fn load_model<T>(
+    cache: &model_cache::ModelCache,
+    id: &str,
+    load: impl Fn(&Path) -> Result<T>,
+) -> Result<T> {
+    let path = cache.ensure(id)?;
+    match load(&path) {
+        Ok(model) => Ok(model),
+        Err(error) => {
+            eprintln!("warning: {error:#}; checking the {id} download for missing files");
+            match cache.repair(id) {
+                Ok(Some(path)) => load(&path),
+                Ok(None) => Err(error),
+                Err(repair_error) => Err(error.context(format!("repair failed: {repair_error:#}"))),
+            }
+        }
+    }
 }
 
 fn ensure_apple_silicon() -> Result<()> {
@@ -952,8 +985,25 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
     if output_path.exists() && !cli.overwrite {
         bail!("output exists (use --overwrite): {}", output_path.display());
     }
+    // AVFoundation cannot open Matroska/WebM; decode it here and hand the helper a WAV.
+    let converted = if job
+        .input
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("webm"))
+    {
+        let audio = decode_audio(&job.input)
+            .with_context(|| format!("decoding {}", job.input.display()))?;
+        let wav = audio_convert::TempPath::new("wav");
+        audio_convert::write_float_wav(wav.path(), &audio.samples, TARGET_SAMPLE_RATE)?;
+        Some(wav)
+    } else {
+        None
+    };
+    let helper_input = converted
+        .as_ref()
+        .map_or(job.input.as_path(), audio_convert::TempPath::path);
     let result = Command::new(&helper)
-        .arg(&job.input)
+        .arg(helper_input)
         .args(["--format", "json", "--timestamps", "words"])
         .stderr(std::process::Stdio::inherit())
         .output()
@@ -971,6 +1021,12 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
     }
     let mut doc: TranscriptDocument = serde_json::from_slice(&result.stdout)
         .context("reading Apple SpeechTranscriber transcript")?;
+    // Describe the user's file and this build, not a temporary WAV or the helper's own
+    // version constant.
+    doc.source = job.input.display().to_string();
+    doc.metadata.version = env!("CARGO_PKG_VERSION").to_owned();
+    doc.metadata.source_created_at = source_timestamp(&job.input, FileTimestamp::Created);
+    doc.metadata.source_modified_at = source_timestamp(&job.input, FileTimestamp::Modified);
     doc.validate()?;
     if cli.timestamps != TimestampGranularity::Words {
         doc.collapse_words();
@@ -1096,6 +1152,23 @@ fn validate_input(path: &Path) -> Result<()> {
 }
 
 fn decode_audio(path: &Path) -> Result<Audio> {
+    match decode_with_symphonia(path) {
+        // Symphonia has no Opus decoder; Core Audio does (see audio_convert).
+        Err(error)
+            if matches!(
+                error.downcast_ref::<SymphoniaError>(),
+                Some(SymphoniaError::Unsupported(_))
+            ) =>
+        {
+            let wav = audio_convert::convert_with_core_audio(path)
+                .with_context(|| format!("{error:#}; the Core Audio fallback also failed"))?;
+            decode_with_symphonia(wav.path())
+        }
+        result => result,
+    }
+}
+
+fn decode_with_symphonia(path: &Path) -> Result<Audio> {
     let file = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -1172,6 +1245,10 @@ fn decode_audio(path: &Path) -> Result<Audio> {
 /// must not be applied to another. Mixing per buffer also avoids holding the full interleaved
 /// stream, which keeps peak RSS lower for long multichannel recordings.
 fn append_decoded(buffer: AudioBufferRef<'_>, output: &mut Vec<f32>) {
+    // Vorbis emits an empty first buffer; SampleBuffer panics copying zero frames of stereo.
+    if buffer.frames() == 0 {
+        return;
+    }
     let channels = buffer.spec().channels.count().max(1);
     let mut sample_buffer = SampleBuffer::<f32>::new(buffer.frames() as u64, *buffer.spec());
     sample_buffer.copy_interleaved_ref(buffer);
@@ -1688,6 +1765,52 @@ mod tests {
         assert!(reopened.latest.contains_key("/a.wav"));
         assert!(reopened.latest.contains_key("/c.wav"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Stereo Ogg Vorbis used to panic inside Symphonia, and Opus (Ogg or WebM) was rejected
+    /// as an unsupported codec. Fixtures are generated with ffmpeg; skipped when it is absent.
+    #[test]
+    fn decodes_vorbis_and_opus_containers() {
+        let Ok(ffmpeg) = which_ffmpeg() else {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        };
+        let source = audio_convert::TempPath::new("wav");
+        audio_convert::write_float_wav(source.path(), &tone(440.0, 48_000, 1.0), 48_000).unwrap();
+        for (extension, codec) in [("ogg", "vorbis"), ("ogg", "libopus"), ("webm", "libopus")] {
+            let encoded = audio_convert::TempPath::new(extension);
+            let status = Command::new(&ffmpeg)
+                .args(["-loglevel", "error", "-y", "-i"])
+                .arg(source.path())
+                .args(["-ac", "2", "-strict", "-2", "-c:a", codec])
+                .arg(encoded.path())
+                .status()
+                .unwrap();
+            if !status.success() {
+                eprintln!("skipping {codec}/{extension}: encoder unavailable");
+                continue;
+            }
+            let audio = decode_audio(encoded.path()).unwrap_or_else(|error| {
+                panic!("{codec} in {extension}: {error:#}");
+            });
+            assert!(
+                (audio.duration_seconds - 1.0).abs() < 0.1,
+                "{codec}/{extension}: {}",
+                audio.duration_seconds
+            );
+            assert!(
+                rms(&audio.samples) > 0.3,
+                "{codec}/{extension} decoded silence"
+            );
+        }
+    }
+
+    fn which_ffmpeg() -> std::result::Result<PathBuf, ()> {
+        ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+            .ok_or(())
     }
 
     #[test]
