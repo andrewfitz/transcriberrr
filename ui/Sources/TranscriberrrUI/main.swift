@@ -289,7 +289,8 @@ final class AppState: ObservableObject {
     @Published var modelActivitySucceeded = false
     @Published var isCancelling = false
 
-    private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "mp3", "ogg", "wav", "webm"]
+    // Keep in sync with AUDIO_EXTENSIONS in src/main.rs.
+    private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "mp3", "mp4", "ogg", "opus", "wav", "webm"]
     private var pendingSave: Task<Void, Never>?
     @Published private(set) var modelStatus = "Checking the local model cache…"
     private var modelStatusTask: Task<Void, Never>?
@@ -358,10 +359,18 @@ final class AppState: ObservableObject {
         return max(0, elapsed * (1 / progress - 1))
     }
 
+    /// Model families, so switching engines swaps any model of the other family (sizes,
+    /// aliases), not just the two defaults.
+    /// Mirrors the CLI (main.rs): Qwen3-ASR Hub IDs and their aliases, not local paths.
+    private func isQwenModel(_ id: String) -> Bool {
+        id.hasPrefix("Qwen/Qwen3-ASR") || ["qwen3-asr-1.7b", "qwen-1.7b", "qwen3-asr-0.6b", "qwen-0.6b"].contains(id)
+    }
+    private func isParakeetModel(_ id: String) -> Bool { id.lowercased().contains("parakeet") }
+
     func selectEngine(_ value: String) {
-        if value == "parakeet-v3" && modelID == "Qwen/Qwen3-ASR-1.7B" {
+        if value == "parakeet-v3" && isQwenModel(modelID) {
             modelID = "eschmidbauer/parakeet-unified-en-0.6b-onnx"
-        } else if value == "qwen" && (modelID == "eschmidbauer/parakeet-unified-en-0.6b-onnx" || modelID == "istupakov/parakeet-tdt-0.6b-v3-onnx") {
+        } else if value == "qwen" && isParakeetModel(modelID) {
             modelID = "Qwen/Qwen3-ASR-1.7B"
         }
         if value == "apple-native" {
@@ -481,6 +490,8 @@ final class AppState: ObservableObject {
                         item.duration = duration
                     }
                 }
+                // Rows observe AppState, not each AudioItem; publish so durations appear.
+                self.objectWillChange.send()
                 self.saveQueue()
             }
         }
@@ -551,16 +562,15 @@ final class AppState: ObservableObject {
             }
             // A file deleted or on an unmounted drive since it was queued would make the CLI
             // reject the whole manifest; fail just that row instead.
+            // Checked on every run, so a row works again once its file is back.
+            var missing = Set<UUID>()
             for item in items where item.selected && item.state != .done
                 && !FileManager.default.fileExists(atPath: item.url.path) {
+                missing.insert(item.id)
                 item.state = .failed("File not found")
                 item.resultSummary = "File not found: \(item.url.path)"
             }
-            let pending = items.filter {
-                guard $0.selected, $0.state != .done else { return false }
-                if case .failed("File not found") = $0.state { return false }
-                return true
-            }
+            let pending = items.filter { $0.selected && $0.state != .done && !missing.contains($0.id) }
             runItemIDs = Set(pending.map(\.id))
             guard !pending.isEmpty else {
                 finishQueueClock()
@@ -592,7 +602,9 @@ final class AppState: ObservableObject {
                             $0.resultSummary = "Model setup failed; see the model activity window."
                         }
                     }
-                    modelActivityMessage = result.message.isEmpty ? "Model setup failed." : result.message
+                    modelActivityMessage = isCancelling
+                        ? "Model download canceled."
+                        : result.message.isEmpty ? "Model setup failed." : result.message
                     modelActivityCanDismiss = true
                     modelActivitySucceeded = false
                     finishQueueClock()
@@ -662,10 +674,10 @@ final class AppState: ObservableObject {
         clockTask = nil
     }
 
-    /// The model the CLI will load: it swaps the Qwen default for the Parakeet
-    /// default with --engine parakeet-v3 (main.rs).
+    /// The model the CLI will load: with --engine parakeet-v3 it replaces any Qwen
+    /// model with the Parakeet default (main.rs).
     private var effectiveModelID: String {
-        engine == "parakeet-v3" && modelID == "Qwen/Qwen3-ASR-1.7B"
+        engine == "parakeet-v3" && isQwenModel(modelID)
             ? "eschmidbauer/parakeet-unified-en-0.6b-onnx" : modelID
     }
 
@@ -1048,7 +1060,9 @@ final class AppState: ObservableObject {
         diarize = saved.diarizeByDefault
         items = saved.items.compactMap { value in
             let url = URL(fileURLWithPath: value.path)
-            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            // Keep rows whose file is missing right now (an unplugged drive, say): dropping
+            // them here would erase them from queue.json on the next save. transcribe()
+            // checks each file when a run starts.
             let item = AudioItem(url: url, id: value.id, duration: value.duration, diarize: value.diarize,
                                  speakerCount: value.diarize ? value.speakerCount : nil)
             item.state = value.state == "done" ? .done : value.state == "processing" ? .queued : value.state == "canceled" ? .canceled : value.state == "failed" ? .failed(value.error ?? "Transcription failed") : .queued
