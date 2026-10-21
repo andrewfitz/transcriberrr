@@ -2,26 +2,28 @@
 
 ## Project Structure & Module Organization
 
-- `src/main.rs` contains the Rust CLI, audio decoding/resampling, Qwen3 inference, alignment, diarization, and output writers.
-- `ui/Sources/TranscriberrrUI/main.swift` contains the SwiftUI drag-and-drop macOS front end; `ui/Package.swift` defines its Swift package.
-- `scripts/build-macos-app.sh` assembles `dist/Transcriberrr.app` after the Swift build.
-- `tests/` is reserved for Rust integration tests; add tests there as behavior grows. Do not commit `target/`, `ui/.build/`, model weights, recordings, or `dist/` artifacts.
+- `src/main.rs` contains the Rust CLI: job collection, audio decoding/resampling, chunking, Qwen3 inference, alignment, diarization, and progress reporting.
+- `src/transcript.rs` holds the transcript schema, validation, and TXT/JSON/SRT/VTT writers; `src/model_cache.rs` resolves, downloads, and repairs Hugging Face models; `src/audio_convert.rs` holds the Core Audio and WebM→Ogg Opus fallbacks; `src/parakeet_engine.rs` wraps Parakeet (feature `parakeet`).
+- `ui/Sources/TranscriberrrUI/main.swift` contains the SwiftUI drag-and-drop macOS front end; `ui/Sources/TranscriberrrNative/main.swift` is the Apple SpeechTranscriber helper the CLI runs for `--engine apple-native`; `ui/Package.swift` defines both.
+- `scripts/build-macos-app.sh` assembles and signs `dist/Transcriberrr.app` (CLI and helper in `Contents/Helpers`); `scripts/build-release-dmg.sh` builds the DMG and optionally notarizes it.
+- `tests/` holds Rust integration tests; add tests there as behavior grows. Do not commit `target/`, `ui/.build/`, model weights, recordings, or `dist/` artifacts.
 
 ## Build, Test, and Development Commands
 
 Use Rust 1.99+ on Apple Silicon macOS. From the repository root:
 
 ```bash
-cargo build --release                 # Build target/release/transcriberrr
-cargo run --release -- audio.m4a      # Run the CLI locally
+cargo build --release --features diarization   # target/release/transcriberrr with Parakeet + Sortformer
+cargo run --release --features diarization -- audio.m4a
 cargo fmt --check                     # Check Rust formatting
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                            # Run Rust tests
-./scripts/build-macos-app.sh          # Build the SwiftUI app bundle
+cargo test --all-features             # Run Rust tests
+swift build -c release --package-path ui        # UI and Apple helper
+./scripts/build-macos-app.sh          # Build and sign the app bundle
 ./scripts/build-release-dmg.sh        # Build arm64 DMG and SHA-256 checksum
 ```
 
-The UI launches the CLI by name, so put `target/release` on `PATH` before opening the app.
+A plain `cargo build --release` omits Parakeet and diarization, and those engines then fail with "not included in this build". The app does not use `PATH`: it runs `TRANSCRIBERRR_CLI` / `TRANSCRIBERRR_NATIVE` when set, then the binaries in `Contents/Helpers`, then (for `swift run`) `target/release/transcriberrr` and the helper under `ui/.build`. A cargo-built CLI finds the helper under `ui/.build` too, so build the Swift package before using `--engine apple-native`.
 
 ## Coding Style & Naming Conventions
 

@@ -40,7 +40,7 @@ else
     exit 1
 fi
 
-# Build both executables before assembling the app. The CLI lives in Resources so
+# Build both executables before assembling the app. The CLI lives in Contents/Helpers so
 # a Finder-launched app never depends on the user's interactive shell PATH.
 "${CARGO_CMD[@]}" build --release --features diarization --manifest-path "$ROOT_DIR/Cargo.toml"
 swift build -c release --package-path "$UI_DIR" --product transcriberrr-ui
@@ -53,11 +53,11 @@ CLI_BIN="$ROOT_DIR/target/release/transcriberrr"
 [[ -x "$CLI_BIN" ]] || { echo "Rust CLI binary not found: $CLI_BIN" >&2; exit 1; }
 
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Helpers" "$APP_DIR/Contents/Resources"
 cp "$UI_BIN" "$APP_DIR/Contents/MacOS/Transcriberrr"
-cp "$CLI_BIN" "$APP_DIR/Contents/Resources/transcriberrr"
-cp "$NATIVE_BIN" "$APP_DIR/Contents/Resources/transcriberrr-native"
-chmod 755 "$APP_DIR/Contents/MacOS/Transcriberrr" "$APP_DIR/Contents/Resources/transcriberrr" "$APP_DIR/Contents/Resources/transcriberrr-native"
+cp "$CLI_BIN" "$APP_DIR/Contents/Helpers/transcriberrr"
+cp "$NATIVE_BIN" "$APP_DIR/Contents/Helpers/transcriberrr-native"
+chmod 755 "$APP_DIR/Contents/MacOS/Transcriberrr" "$APP_DIR/Contents/Helpers/transcriberrr" "$APP_DIR/Contents/Helpers/transcriberrr-native"
 cp "$UI_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP_DIR/Contents/Info.plist"
 
@@ -68,8 +68,8 @@ if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
     # Notarization requires the hardened runtime and a secure timestamp.
     SIGN_ARGS+=(--options runtime --timestamp)
 fi
-codesign "${SIGN_ARGS[@]}" "$APP_DIR/Contents/Resources/transcriberrr"
-codesign "${SIGN_ARGS[@]}" "$APP_DIR/Contents/Resources/transcriberrr-native"
+codesign "${SIGN_ARGS[@]}" "$APP_DIR/Contents/Helpers/transcriberrr"
+codesign "${SIGN_ARGS[@]}" "$APP_DIR/Contents/Helpers/transcriberrr-native"
 codesign "${SIGN_ARGS[@]}" "$APP_DIR"
 codesign --verify --strict --deep "$APP_DIR"
 echo "Built $APP_DIR (signed: $CODESIGN_IDENTITY)"

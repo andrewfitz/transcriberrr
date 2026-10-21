@@ -14,7 +14,7 @@ Offline English transcription for Apple Silicon Macs. Transcriberrr ships a nati
 
 ## Install a GitHub release
 
-Download the arm64 `.dmg` from the repository Releases page, open it, and drag `Transcriberrr.app` to `/Applications`. The app bundle contains the UI, Rust CLI, and Apple-native helper; model weights are intentionally not bundled. The first run may download several gigabytes from Hugging Face or install Apple system models. macOS may require opening the app once in System Settings -> Privacy & Security for an unsigned development release.
+Download the arm64 `.dmg` from the repository Releases page, open it, and drag `Transcriberrr.app` to `/Applications`. The app bundle contains the UI, Rust CLI, and Apple-native helper; model weights are intentionally not bundled. The first run may download several gigabytes from Hugging Face or install Apple system models. A development release is only ad-hoc signed, so macOS may require opening it once from System Settings -> Privacy & Security; notarized releases open normally.
 
 The build scripts ad-hoc sign the bundle by default. For a release that opens without a Gatekeeper warning, sign with a Developer ID and notarize: `CODESIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" NOTARY_PROFILE=PROFILE ./scripts/build-release-dmg.sh`, where `PROFILE` was created with `xcrun notarytool store-credentials`.
 
@@ -55,6 +55,8 @@ The build script refuses non-`Darwin arm64` hosts. For a CLI-only build, use `ca
 ./target/release/transcriberrr interview.wav --engine parakeet-v3
 ./target/release/transcriberrr interview.wav --engine apple-native
 ```
+
+`--engine apple-native` runs the `transcriberrr-native` helper. The app bundle includes it; for a cargo build, run `swift build -c release --package-path ui` first (the CLI finds the helper under `ui/.build`) or set `TRANSCRIBERRR_NATIVE` to its path.
 
 Use `--help` for all options. `--model-status` reports the local cache without network access. `--download-model qwen3-asr-1.7b` (repeat the flag for multiple models) prefetches model files. For a complete Rust-engine setup, use `--download-model qwen3-asr-1.7b --download-model qwen3-forced-aligner-0.6b --download-model parakeet-v3 --download-model sortformer-4spk`. Set `--model-cache PATH` or `TRANSCRIBERRR_MODEL_CACHE` to change the cache location. The default is `~/Library/Application Support/Transcriberrr/models/hub`.
 
