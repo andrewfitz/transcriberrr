@@ -173,8 +173,7 @@ private final class ProgressReader {
             let line = combined[lineStart..<index]
             lineStart = combined.index(after: index)
             guard let event = try? JSONDecoder().decode(ProgressEvent.self, from: line) else { continue }
-            let key = URL(fileURLWithPath: event.input).standardizedFileURL.resolvingSymlinksInPath().path
-            events[key] = event
+            events[canonicalPath(event.input)] = event
         }
         remainder = Data(combined[lineStart...])
         return events
@@ -196,6 +195,61 @@ private final class URLCollector: @unchecked Sendable {
         defer { lock.unlock() }
         return urls
     }
+}
+
+/// Drains a child process pipe while it runs. A pipe holds only ~64 KB; the CLI
+/// writes a line per finished track, so reading only after exit deadlocks a large
+/// queue (the CLI blocks on write and never exits). Keeps a bounded tail for errors.
+private final class PipeCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    private let limit = 256 * 1024
+    private let onData: (@Sendable (Data) -> Void)?
+    let pipe = Pipe()
+
+    init(onData: (@Sendable (Data) -> Void)? = nil) {
+        self.onData = onData
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            // Empty data means EOF; without clearing, the handler is re-invoked in a busy loop.
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            self?.append(chunk)
+            onData?(chunk)
+        }
+    }
+
+    private func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        if data.count > limit { data.removeFirst(data.count - limit) }
+        lock.unlock()
+    }
+
+    /// Call from the termination handler: stops the reader and collects anything left.
+    func finish() -> String {
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let rest = pipe.fileHandleForReading.readDataToEndOfFile()
+        if !rest.isEmpty {
+            append(rest)
+            onData?(rest)
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+/// Matches Rust's `fs::canonicalize` (realpath). `resolvingSymlinksInPath` drops
+/// `/private`, so files under /tmp or /var never matched their progress events.
+private func canonicalPath(_ path: String) -> String {
+    guard let resolved = realpath(path, nil) else {
+        return URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+    defer { free(resolved) }
+    return String(cString: resolved)
 }
 
 @MainActor
@@ -244,6 +298,16 @@ final class AppState: ObservableObject {
 
     init() {
         loadQueue()
+        // saveQueue() is debounced, so flush on quit. Child processes also outlive the
+        // app; stop the CLI rather than leave it holding the GPU with nobody watching.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.pendingSave?.cancel()
+                self.activeProcess?.terminate()
+                self.writeQueue()
+            }
+        }
     }
 
     var selectedItems: [AudioItem] { items.filter(\.selected) }
@@ -324,25 +388,44 @@ final class AppState: ObservableObject {
         cachedModelStatusValue = nil
     }
 
-    private func cachedModel(_ id: String) -> Bool {
-        guard !id.isEmpty, !isLocalModelPath(id) else { return false }
-        let normalizedID: String
-        switch id {
-        case "parakeet-v3", "parakeet-unified", "parakeet-unified-en", "nvidia/parakeet-unified-en-0.6b":
-            normalizedID = "eschmidbauer/parakeet-unified-en-0.6b-onnx"
-        default:
-            normalizedID = id
-        }
-        let root: URL
+    /// Mirrors `model_cache::default_cache_dir` and its `~` expansion in the CLI.
+    private var modelCacheRoot: URL {
         if let configured = ProcessInfo.processInfo.environment["TRANSCRIBERRR_MODEL_CACHE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines), !configured.isEmpty {
-            root = URL(fileURLWithPath: configured)
-        } else {
-            root = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/Transcriberrr/models/hub")
+            return URL(fileURLWithPath: (configured as NSString).expandingTildeInPath)
         }
-        let encoded = normalizedID.replacingOccurrences(of: "/", with: "--")
-        let snapshots = root.appendingPathComponent("models--\(encoded)/snapshots", isDirectory: true)
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Transcriberrr/models/hub")
+    }
+
+    /// Mirrors `model_cache::canonical_id`; an alias missing here made the app
+    /// re-run the download step on every queue.
+    private func canonicalModelID(_ id: String) -> String {
+        switch id {
+        case "qwen3-asr-1.7b", "qwen-1.7b": "Qwen/Qwen3-ASR-1.7B"
+        case "qwen3-asr-0.6b", "qwen-0.6b": "Qwen/Qwen3-ASR-0.6B"
+        case "qwen3-forced-aligner-0.6b", "forced-aligner": "Qwen/Qwen3-ForcedAligner-0.6B"
+        case "parakeet-v3", "parakeet-unified", "parakeet-unified-en", "nvidia/parakeet-unified-en-0.6b":
+            "eschmidbauer/parakeet-unified-en-0.6b-onnx"
+        case "parakeet-tdt-v3": "istupakov/parakeet-tdt-0.6b-v3-onnx"
+        case "sortformer-4spk", "sortformer": "altunenes/parakeet-rs"
+        default: id
+        }
+    }
+
+    private func modelRepository(_ id: String) -> URL {
+        modelCacheRoot.appendingPathComponent("models--" + id.replacingOccurrences(of: "/", with: "--"), isDirectory: true)
+    }
+
+    private func cachedModel(_ id: String) -> Bool {
+        guard !id.isEmpty, !isLocalModelPath(id) else { return false }
+        let normalizedID = canonicalModelID(id)
+        let repository = modelRepository(normalizedID)
+        // Written by the CLI while a download is in flight; see model_cache.rs.
+        if FileManager.default.fileExists(atPath: repository.appendingPathComponent(".transcriberrr-incomplete").path) {
+            return false
+        }
+        let snapshots = repository.appendingPathComponent("snapshots", isDirectory: true)
         guard let revisions = try? FileManager.default.contentsOfDirectory(
             at: snapshots,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -362,9 +445,11 @@ final class AppState: ObservableObject {
             let markers = [
                 "model.safetensors",
                 "model.safetensors.index.json",
+                "pytorch_model.bin",
+                "pytorch_model.bin.index.json",
+                "model.bin",
                 "model.onnx",
-                "encoder-model.onnx",
-                "diar_streaming_sortformer_4spk-v2.1.nemo"
+                "encoder-model.onnx"
             ]
             return markers.contains { FileManager.default.fileExists(atPath: revision.appendingPathComponent($0).path) }
         }
@@ -441,7 +526,8 @@ final class AppState: ObservableObject {
             }
             await MainActor.run {
                 guard let self else { return }
-                let values = Dictionary(uniqueKeysWithValues: durations)
+                // Distinct URLs can share a path; uniqueKeysWithValues would trap.
+                let values = Dictionary(durations, uniquingKeysWith: { first, _ in first })
                 for item in self.items {
                     if let duration = values[item.url.standardizedFileURL.path] {
                         item.duration = duration
@@ -560,6 +646,7 @@ final class AppState: ObservableObject {
             if engine == "apple-native" {
                 var reservedOutputs = Set<String>()
                 for item in pending {
+                    if isCancelling { break }
                     item.state = .processing
                     item.progress = 0.05
                     item.elapsedSeconds = 0
@@ -577,7 +664,7 @@ final class AppState: ObservableObject {
                     apply(result, to: item)
                     saveQueue()
                 }
-            } else if !pending.isEmpty {
+            } else if !pending.isEmpty, !isCancelling {
                 let result = await runBulkCLI(for: pending)
                 if isCancelling {
                     markCanceled(pending)
@@ -631,7 +718,10 @@ final class AppState: ObservableObject {
             guard modelNeedsDownload(value) else { return }
             values.append(value)
         }
-        append(modelID)
+        // The CLI swaps the Qwen default for the Parakeet default with --engine parakeet-v3
+        // (main.rs); check the model it will actually load, not the one in the field.
+        append(engine == "parakeet-v3" && modelID == "Qwen/Qwen3-ASR-1.7B"
+               ? "eschmidbauer/parakeet-unified-en-0.6b-onnx" : modelID)
         if engine == "qwen" && timestamps != "none" {
             append("Qwen/Qwen3-ForcedAligner-0.6B")
         }
@@ -643,22 +733,14 @@ final class AppState: ObservableObject {
 
     private func modelNeedsDownload(_ value: String) -> Bool {
         guard !isLocalModelPath(value) else { return false }
-        if value == "sortformer" || value == "/sortformer" {
+        if value == "/sortformer" || canonicalModelID(value) == "altunenes/parakeet-rs" {
             return !cachedSortformer()
         }
         return !cachedModel(value)
     }
 
     private func cachedSortformer() -> Bool {
-        let root: URL
-        if let configured = ProcessInfo.processInfo.environment["TRANSCRIBERRR_MODEL_CACHE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !configured.isEmpty {
-            root = URL(fileURLWithPath: configured)
-        } else {
-            root = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/Transcriberrr/models/hub")
-        }
-        let repo = root.appendingPathComponent("models--altunenes--parakeet-rs/snapshots", isDirectory: true)
+        let repo = modelRepository("altunenes/parakeet-rs").appendingPathComponent("snapshots", isDirectory: true)
         guard let enumerator = FileManager.default.enumerator(at: repo, includingPropertiesForKeys: [.isRegularFileKey]) else {
             return false
         }
@@ -694,7 +776,8 @@ final class AppState: ObservableObject {
         if let last = lines.last, !last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             modelActivityMessage = last.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        if let match = normalized.range(of: #"\b(\d{1,3})%\b"#, options: .regularExpression),
+        // No trailing \b: after "%" it requires a word character, so "45% " never matched.
+        if let match = normalized.range(of: #"\b\d{1,3}(\.\d+)?%"#, options: .regularExpression),
            let percent = Double(normalized[match].dropLast()) {
             modelActivityProgress = min(max(percent / 100, 0), 1)
         }
@@ -707,33 +790,41 @@ final class AppState: ObservableObject {
         let process = Process()
         process.executableURL = executableURL
         process.arguments = ids.flatMap { ["--download-model", $0] }
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        let output = PipeCollector { [weak self] data in
+            let text = String(decoding: data, as: UTF8.self)
+            Task { @MainActor in self?.appendModelActivity(text) }
+        }
+        process.standardOutput = output.pipe
+        process.standardError = output.pipe
         return await withCheckedContinuation { continuation in
-            pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                Task { @MainActor in self?.appendModelActivity(text) }
-            }
             process.terminationHandler = { process in
-                pipe.fileHandleForReading.readabilityHandler = nil
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let message = String(data: data, encoding: .utf8) ?? ""
+                let transcript = output.finish()
                 Task { @MainActor in
                     if self.activeProcess === process { self.activeProcess = nil }
-                    if !message.isEmpty { self.appendModelActivity(message) }
+                    // The streamed log already holds the output; report the last line
+                    // (usually the error) instead of only whatever arrived after exit.
+                    let message = transcript.split(whereSeparator: \.isNewline).last.map(String.init) ?? ""
                     continuation.resume(returning: (process.terminationStatus, message))
                 }
             }
-            do {
-                activeProcess = process
-                try process.run()
-            } catch {
-                pipe.fileHandleForReading.readabilityHandler = nil
-                activeProcess = nil
+            launch(process) { error in
+                _ = output.finish()
                 continuation.resume(returning: (1, error.localizedDescription))
             }
+        }
+    }
+
+    /// Starts `process` as the active (cancellable) process. A cancel that arrived
+    /// while no process was running would otherwise be lost and let a whole queue run.
+    private func launch(_ process: Process, onFailure: (Error) -> Void) {
+        do {
+            activeProcess = process
+            try process.run()
+            if isCancelling { process.terminate() }
+        } catch {
+            process.terminationHandler = nil
+            activeProcess = nil
+            onFailure(error)
         }
     }
 
@@ -751,8 +842,10 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func applyBulk(_ result: (status: Int32, message: String, progress: [String: ProgressEvent]), to items: [AudioItem]) {
-        let fallback = result.message.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func applyBulk(_ result: BulkResult, to items: [AudioItem]) {
+        // stderr holds a line per finished track; the last line is the run's error.
+        let fallback = result.message.split(whereSeparator: \.isNewline).last
+            .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
         for item in items {
             let key = progressKey(item.url.path)
             let event = result.progress[key]
@@ -766,7 +859,9 @@ final class AppState: ObservableObject {
                 item.outputURL = output
                 item.resultSummary = output.map { "Saved to \($0.path)" } ?? "Transcription complete"
             } else if result.status == 0 {
-                let output = expectedOutput(for: item)
+                // Use the path the manifest actually requested; `expectedOutput` ignores
+                // the `-2` suffix added for duplicate basenames.
+                let output = result.outputs[item.id] ?? expectedOutput(for: item)
                 item.progress = 1
                 item.estimatedRemainingSeconds = nil
                 item.state = .done
@@ -840,31 +935,33 @@ final class AppState: ObservableObject {
             }
         }
         process.arguments = arguments
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
+        let errors = PipeCollector()
+        process.standardError = errors.pipe
         return await withCheckedContinuation { continuation in
             process.terminationHandler = { process in
-                let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                let message = String(data: data, encoding: .utf8) ?? ""
+                let message = errors.finish()
                 Task { @MainActor in
                     if self.activeProcess === process { self.activeProcess = nil }
                 }
                 continuation.resume(returning: (process.terminationStatus, message, output))
             }
-            do {
-                activeProcess = process
-                try process.run()
-            } catch {
-                process.terminationHandler = nil
-                activeProcess = nil
+            launch(process) { error in
+                _ = errors.finish()
                 continuation.resume(returning: (1, error.localizedDescription, nil))
             }
         }
     }
 
-    private func runBulkCLI(for items: [AudioItem]) async -> (status: Int32, message: String, progress: [String: ProgressEvent]) {
+    private struct BulkResult {
+        var status: Int32
+        var message: String
+        var progress: [String: ProgressEvent]
+        var outputs: [UUID: URL] = [:]
+    }
+
+    private func runBulkCLI(for items: [AudioItem]) async -> BulkResult {
         guard let executableURL = cliURL else {
-            return (1, "The transcriberrr executable is not bundled. Rebuild the app with scripts/build-macos-app.sh.", [:])
+            return BulkResult(status: 1, message: "The transcriberrr executable is not bundled. Rebuild the app with scripts/build-macos-app.sh.", progress: [:])
         }
         let temporaryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("Transcriberrr", isDirectory: true)
@@ -878,8 +975,10 @@ final class AppState: ObservableObject {
             // Explicit output paths keep duplicate basenames from different source folders from
             // overwriting each other when a large queue is written to one destination folder.
             var reserved = Set<String>()
+            var outputs: [UUID: URL] = [:]
             let manifestItems = items.map { item -> ManifestItem in
                 let output = uniqueOutput(expectedOutput(for: item), reserved: &reserved)
+                outputs[item.id] = output
                 return ManifestItem(input: item.url.standardizedFileURL.path, diarize: item.diarize,
                                     speakers: item.speakerCount, output: output.path,
                                     outputDir: destination.path, outputLocation: location)
@@ -897,16 +996,18 @@ final class AppState: ObservableObject {
             let process = Process()
             process.executableURL = executableURL
             process.arguments = arguments
-            let errorPipe = Pipe()
-            process.standardError = errorPipe
+            let errors = PipeCollector()
+            process.standardError = errors.pipe
             let progressReader = ProgressReader()
+            // Resolve once: realpath for every row every poll is thousands of syscalls
+            // per second on the main actor for a large queue.
+            let keys = items.map { progressKey($0.url.path) }
             let progressPoller = Task { @MainActor [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .milliseconds(500))
                     guard !Task.isCancelled else { break }
                     let events = progressReader.read(from: progressURL)
-                    for item in items {
-                        let key = self?.progressKey(item.url.path) ?? item.url.path
+                    for (item, key) in zip(items, keys) {
                         if let event = events[key] {
                             if event.status == "running" {
                                 item.state = .processing
@@ -931,18 +1032,14 @@ final class AppState: ObservableObject {
             }
             let result = await withCheckedContinuation { continuation in
                 process.terminationHandler = { process in
-                    let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    let message = errors.finish()
                     Task { @MainActor in
                         if self.activeProcess === process { self.activeProcess = nil }
                     }
-                    continuation.resume(returning: (process.terminationStatus, String(data: data, encoding: .utf8) ?? ""))
+                    continuation.resume(returning: (process.terminationStatus, message))
                 }
-                do {
-                    activeProcess = process
-                    try process.run()
-                } catch {
-                    process.terminationHandler = nil
-                    activeProcess = nil
+                launch(process) { error in
+                    _ = errors.finish()
                     continuation.resume(returning: (1, error.localizedDescription))
                 }
             }
@@ -952,15 +1049,15 @@ final class AppState: ObservableObject {
             // The parent is shared by other app instances; remove only this
             // job's directory so their active manifests remain intact.
             try? FileManager.default.removeItem(at: temporaryRoot)
-            return (result.0, result.1, events)
+            return BulkResult(status: result.0, message: result.1, progress: events, outputs: outputs)
         } catch {
             try? FileManager.default.removeItem(at: temporaryRoot)
-            return (1, error.localizedDescription, [:])
+            return BulkResult(status: 1, message: error.localizedDescription, progress: [:])
         }
     }
 
     private func progressKey(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+        canonicalPath(path)
     }
 
     private func loadQueue() {
@@ -987,7 +1084,9 @@ final class AppState: ObservableObject {
         }
         device = saved.device
         format = saved.format
-        timestamps = saved.timestamps
+        // The format picker keeps Text untimed; enforce that for older queue files too,
+        // otherwise engines disagree (the Apple helper ignores TXT timestamps).
+        timestamps = saved.format == "txt" ? "none" : saved.timestamps
         diarize = saved.diarizeByDefault
         items = saved.items.compactMap { value in
             let url = URL(fileURLWithPath: value.path)
@@ -1071,9 +1170,10 @@ final class AppState: ObservableObject {
         }
         if let bundled = Bundle.main.url(forResource: "transcriberrr-native", withExtension: nil),
            FileManager.default.isExecutableFile(atPath: bundled.path) { return bundled }
+        // Three components up from this file is already `ui/`.
         let repositoryHelper = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("ui/.build/out/Products/Release/transcriberrr-native")
+            .appendingPathComponent(".build/out/Products/Release/transcriberrr-native")
         return FileManager.default.isExecutableFile(atPath: repositoryHelper.path) ? repositoryHelper : nil
     }
 
@@ -1182,6 +1282,8 @@ struct ContentView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
+            // Refuse (so Finder animates the files back) rather than silently drop them.
+            guard !state.isRunning else { return false }
             loadDroppedItems(providers)
             return true
         }
@@ -1254,10 +1356,13 @@ struct ContentView: View {
                 TextField("Regex filter", text: $queueFilter)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 180)
+                // Selection drives queue progress and ETA; changing it mid-run skews both.
                 Button("Check all") { state.selectAll(visibleItems, selected: true) }
                     .buttonStyle(.borderless)
+                    .disabled(state.isRunning)
                 Button("Check none") { state.selectAll(visibleItems, selected: false) }
                     .buttonStyle(.borderless)
+                    .disabled(state.isRunning)
                 Button("Clear completed") { state.clearCompleted() }
                     .buttonStyle(.borderless)
                 .disabled(state.completedItemCount == 0 || state.isRunning)
@@ -1375,13 +1480,15 @@ struct ContentView: View {
                     .foregroundStyle(item.diarize ? .primary : .secondary)
                     .accessibilityLabel("Diarize this track")
                     .accessibilityValue(item.diarize ? "On" : "Off")
-                    .disabled(state.isRunning)
+                    // SpeechTranscriber has no speaker labels; enabling this only fails the item.
+                    .disabled(state.isRunning || state.engine == "apple-native")
                 if item.diarize && state.engine != "apple-native" {
                     Picker("Speakers", selection: Binding<Int>(get: { item.speakerCount ?? 0 }, set: { state.setSpeakerCount(for: item, $0 == 0 ? nil : $0) })) {
                         Text("Auto").tag(0)
                         ForEach(1...8, id: \.self) { count in Text("\(count)").tag(count) }
                     }
                     .pickerStyle(.menu).font(.caption).frame(width: 140)
+                    .disabled(state.isRunning)
                 }
                 Spacer()
             }
@@ -1472,6 +1579,7 @@ struct ContentView: View {
                     }
                         .buttonStyle(.borderless)
                         .accessibilityValue(state.diarize ? "On" : "Off")
+                        .disabled(state.engine == "apple-native")
                     Spacer()
                 }
             }

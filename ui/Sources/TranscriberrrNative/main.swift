@@ -262,12 +262,16 @@ struct TranscriberrrNative {
                     }
                     text = pendingPrefix + text
                     pendingPrefix = ""
-                    let start = CMTimeGetSeconds(timeRange.start)
-                    let end = CMTimeGetSeconds(timeRange.end)
+                    // Keep timings finite and ordered: the Rust side rejects a document with a
+                    // NaN, a backwards start, or end < start, losing the whole transcript.
+                    let rawStart = CMTimeGetSeconds(timeRange.start)
+                    let rawEnd = CMTimeGetSeconds(timeRange.end)
+                    let start = max(rawStart.isFinite ? rawStart : 0, words.last?.start ?? 0)
+                    let end = max(rawEnd.isFinite ? rawEnd : start, start)
                     words.append(NativeWord(
                         text: text,
-                        start: start.isFinite ? start : 0,
-                        end: end.isFinite ? end : start,
+                        start: start,
+                        end: end,
                         speaker: nil
                     ))
                 }
