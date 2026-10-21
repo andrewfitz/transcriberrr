@@ -16,6 +16,17 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
     exit 1
 fi
 
+# The Speech helper reports its own version when run standalone; keep it in step with Cargo.
+NATIVE_VERSION="$(awk -F '"' '/^private let transcriberrrVersion = / { print $2; exit }' "$UI_DIR/Sources/TranscriberrrNative/main.swift")"
+if [[ "$NATIVE_VERSION" != "$VERSION" ]]; then
+    echo "Version mismatch: Cargo.toml is $VERSION but TranscriberrrNative reports $NATIVE_VERSION" >&2
+    exit 1
+fi
+
+# Ad-hoc signing ("-") by default. Set CODESIGN_IDENTITY to a "Developer ID Application"
+# identity for releases that Gatekeeper should open without a warning.
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+
 command -v swift >/dev/null 2>&1 || { echo "swift is required to build the app" >&2; exit 1; }
 if command -v cargo >/dev/null 2>&1; then
     CARGO_CMD=(cargo)
@@ -49,4 +60,16 @@ cp "$NATIVE_BIN" "$APP_DIR/Contents/Resources/transcriberrr-native"
 chmod 755 "$APP_DIR/Contents/MacOS/Transcriberrr" "$APP_DIR/Contents/Resources/transcriberrr" "$APP_DIR/Contents/Resources/transcriberrr-native"
 cp "$UI_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP_DIR/Contents/Info.plist"
-echo "Built $APP_DIR"
+
+# Sign nested executables before the bundle. Editing Info.plist after the linker's ad-hoc
+# signature leaves an invalid bundle seal, which Gatekeeper reports as "damaged".
+SIGN_ARGS=(--force --sign "$CODESIGN_IDENTITY")
+if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
+    # Notarization requires the hardened runtime and a secure timestamp.
+    SIGN_ARGS+=(--options runtime --timestamp)
+fi
+codesign "${SIGN_ARGS[@]}" "$APP_DIR/Contents/Resources/transcriberrr"
+codesign "${SIGN_ARGS[@]}" "$APP_DIR/Contents/Resources/transcriberrr-native"
+codesign "${SIGN_ARGS[@]}" "$APP_DIR"
+codesign --verify --strict --deep "$APP_DIR"
+echo "Built $APP_DIR (signed: $CODESIGN_IDENTITY)"

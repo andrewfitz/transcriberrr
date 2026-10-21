@@ -37,6 +37,20 @@ hdiutil create \
     -format UDZO \
     -imagekey zlib-level=9 \
     "$DMG_PATH"
+
+# With a Developer ID identity, sign the disk image too. With NOTARY_PROFILE (a keychain profile
+# created by `xcrun notarytool store-credentials`), notarize and staple it so Gatekeeper opens
+# the app offline without a warning.
+if [[ "${CODESIGN_IDENTITY:--}" != "-" ]]; then
+    codesign --force --sign "$CODESIGN_IDENTITY" --timestamp "$DMG_PATH"
+    if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+        xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
+        xcrun stapler staple "$DMG_PATH"
+    fi
+elif [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    echo "NOTARY_PROFILE requires CODESIGN_IDENTITY to be a Developer ID identity" >&2
+    exit 1
+fi
 (
     cd "$DIST_DIR"
     shasum -a 256 "$(basename "$DMG_PATH")" > "$(basename "$SHA_PATH")"

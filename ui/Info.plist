@@ -20,5 +20,7 @@
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Transcriberrr transcribes the audio files you add on this Mac with Apple's on-device speech recognition.</string>
 </dict>
 </plist>
