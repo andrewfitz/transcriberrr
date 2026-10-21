@@ -9061,6 +9061,7 @@ dependencies = [
  "chrono",
  "clap",
  "hf-hub",
+ "libc",
  "parakeet-rs",
  "qwen3_asr",
  "serde",

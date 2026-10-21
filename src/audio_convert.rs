@@ -44,7 +44,32 @@ impl Drop for TempPath {
     }
 }
 
-/// Decode `input` with Core Audio into a float WAV that Symphonia can read.
+/// Remove temporary files left by CLI processes that were force-killed (SIGKILL skips `Drop`).
+/// Names carry the owning PID; files whose process no longer exists are stale.
+pub(crate) fn remove_stale_temp_files() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("transcriberrr-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        // kill(pid, 0) checks for existence without sending a signal.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        if !alive {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Decode `input` with Core Audio into a 16 kHz float CAF that Symphonia can read.
 pub(crate) fn convert_with_core_audio(input: &Path) -> Result<TempPath> {
     // Core Audio reads Ogg Opus but no Matroska/WebM, so rewrap Opus packets first.
     let remuxed = if is_ogg(input)? {
@@ -53,11 +78,13 @@ pub(crate) fn convert_with_core_audio(input: &Path) -> Result<TempPath> {
         remux_opus_to_ogg(input)?
     };
     let source = remuxed.as_ref().map_or(input, TempPath::path);
-    let wav = TempPath::new("wav");
+    // CAF has 64-bit sizes; WAV caps at 4 GB, which 48 kHz stereo float passes after ~3 h.
+    // Converting to the model's 16 kHz here also cuts the temporary file to a third.
+    let converted = TempPath::new("caf");
     let output = Command::new(AFCONVERT)
-        .args(["-f", "WAVE", "-d", "LEF32"])
+        .args(["-f", "caff", "-d", "LEF32@16000"])
         .arg(source)
-        .arg(wav.path())
+        .arg(converted.path())
         .output()
         .with_context(|| format!("launching {AFCONVERT}"))?;
     if !output.status.success() {
@@ -67,7 +94,7 @@ pub(crate) fn convert_with_core_audio(input: &Path) -> Result<TempPath> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(wav)
+    Ok(converted)
 }
 
 fn is_ogg(path: &Path) -> Result<bool> {
@@ -94,12 +121,14 @@ fn remux_opus_to_ogg(input: &Path) -> Result<Option<TempPath>> {
         return Ok(None);
     };
     let mut format = probed.format;
-    let Some(track) = format.default_track() else {
+    // The Opus track, not `default_track()`: screen recordings list video first.
+    let Some(track) = format
+        .tracks()
+        .iter()
+        .find(|track| track.codec_params.codec == CODEC_TYPE_OPUS)
+    else {
         return Ok(None);
     };
-    if track.codec_params.codec != CODEC_TYPE_OPUS {
-        return Ok(None);
-    }
     let track_id = track.id;
     let channels = track
         .codec_params
@@ -249,7 +278,11 @@ fn ogg_crc(data: &[u8]) -> u32 {
 
 /// Write 32-bit float mono WAV, used to hand already-decoded audio to the Apple helper.
 pub(crate) fn write_float_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
-    let data_len = u32::try_from(samples.len() * 4).context("audio too long for WAV")?;
+    // RIFF sizes are u32 and include the 36 header bytes after the size field.
+    let data_len = u32::try_from(samples.len() * 4)
+        .ok()
+        .filter(|length| length.checked_add(36).is_some())
+        .context("audio too long for WAV")?;
     let mut out =
         BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
     out.write_all(b"RIFF")?;

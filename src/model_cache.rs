@@ -186,8 +186,12 @@ impl ModelCache {
             repo.get(&sibling.rfilename)
                 .with_context(|| format!("downloading {id_or_path}/{}", sibling.rfilename))?;
         }
-        fs::remove_file(&incomplete)
-            .with_context(|| format!("removing {}", incomplete.display()))?;
+        // Another process downloading the same repository may have removed it already.
+        if let Err(error) = fs::remove_file(&incomplete)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error).with_context(|| format!("removing {}", incomplete.display()));
+        }
         repo.get("config.json")
             .or_else(|_| repo.get("model.onnx"))
             .or_else(|_| repo.get("encoder-model.onnx"))

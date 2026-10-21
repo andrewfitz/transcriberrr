@@ -17,6 +17,8 @@ diarization = ["parakeet"]
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hf-hub = "0.4"
+## SIGTERM handling for graceful cancellation (already in the dependency tree).
+libc = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 qwen3_asr = { git = "https://github.com/lumosimmo/qwen3-asr-rs.git", package = "qwen3_asr", features = ["metal", "forced-aligner", "audio-loading"] }
 candle-core = { version = "0.9", features = ["metal"] }

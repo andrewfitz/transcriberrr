@@ -244,11 +244,14 @@ pub(crate) fn normalize_word_timing(words: &mut [Word], duration: f32) {
 
 /// Write via a temporary sibling and rename so a crash or cancellation never leaves a
 /// truncated transcript at the final path (which `--resume` would then refuse to replace).
+/// Without `overwrite`, the file is published with a hard link, which fails if the path exists,
+/// so two processes cannot both pass an earlier existence check and replace each other's output.
 pub(crate) fn write_output(
     doc: &TranscriptDocument,
     path: &Path,
     format: OutputFormat,
     timestamps: TimestampGranularity,
+    overwrite: bool,
 ) -> Result<()> {
     let content = render_output(doc, format, timestamps)?;
     if path.file_name().is_none() {
@@ -257,12 +260,29 @@ pub(crate) fn write_output(
     // Fixed-length name: deriving it from a near-255-byte file name would exceed NAME_MAX.
     // One process writes one output at a time, so the PID keeps it unique.
     let temporary = path.with_file_name(format!(".transcriberrr-{}.tmp", std::process::id()));
-    let result =
-        std::fs::write(&temporary, content).and_then(|()| std::fs::rename(&temporary, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+    let result = std::fs::write(&temporary, content).and_then(|()| {
+        if overwrite {
+            std::fs::rename(&temporary, path)
+        } else {
+            // exFAT and some network volumes have no hard links; fall back to check-then-rename.
+            std::fs::hard_link(&temporary, path).or_else(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Err(error)
+                } else if path.exists() {
+                    Err(std::io::ErrorKind::AlreadyExists.into())
+                } else {
+                    std::fs::rename(&temporary, path)
+                }
+            })
+        }
+    });
+    let _ = std::fs::remove_file(&temporary);
+    match result {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("output exists (use --overwrite): {}", path.display())
+        }
+        result => result.with_context(|| format!("writing {}", path.display())),
     }
-    result.with_context(|| format!("writing {}", path.display()))
 }
 
 pub(crate) fn render_output(
@@ -460,8 +480,24 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("out.txt");
         std::fs::write(&path, "stale").unwrap();
-        write_output(&doc, &path, OutputFormat::Txt, TimestampGranularity::None).unwrap();
+        write_output(
+            &doc,
+            &path,
+            OutputFormat::Txt,
+            TimestampGranularity::None,
+            true,
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd\n");
+        let error = write_output(
+            &doc,
+            &path,
+            OutputFormat::Txt,
+            TimestampGranularity::None,
+            false,
+        )
+        .expect_err("must not replace an existing output without overwrite");
+        assert!(error.to_string().contains("output exists"));
         assert_eq!(
             std::fs::read_dir(&directory).unwrap().count(),
             1,

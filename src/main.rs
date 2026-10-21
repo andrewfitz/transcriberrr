@@ -19,10 +19,11 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -403,6 +404,8 @@ struct AlignedWord {
 }
 
 fn main() -> Result<()> {
+    install_cancel_handler();
+    audio_convert::remove_stale_temp_files();
     let mut cli = Cli::parse();
     if let Some(CliCommand::Convert(args)) = cli.command.take() {
         return convert_transcript(args);
@@ -469,8 +472,9 @@ fn main() -> Result<()> {
     // across cache revisions and machines.
     let model_label = model_display_name(&cli.model);
     ensure_apple_silicon()?;
-    let jobs = collect_jobs(&cli)?;
-    if jobs.is_empty() {
+    let mut rejected = Vec::new();
+    let jobs = collect_jobs(&cli, &mut rejected)?;
+    if jobs.is_empty() && rejected.is_empty() {
         bail!("no supported audio files were found");
     }
     ensure_unique_outputs(&cli, &jobs)?;
@@ -512,6 +516,21 @@ fn main() -> Result<()> {
 
     fs::create_dir_all(&cli.output_dir)?;
     let mut progress = ProgressLog::open(cli.progress_file.as_deref(), cli.resume)?;
+    for (input, error) in &rejected {
+        eprintln!("error processing {}: {error}", input.display());
+        progress.record(ProgressEvent {
+            input: input_key(input),
+            status: "failed".to_owned(),
+            output: None,
+            error: Some(error.clone()),
+            elapsed_seconds: None,
+            progress: None,
+            phase: Some("Failed".to_owned()),
+        })?;
+    }
+    if !rejected.is_empty() && (cli.fail_fast || jobs.is_empty()) {
+        bail!("{} input file(s) failed", rejected.len());
+    }
     if cli.resume
         && jobs
             .iter()
@@ -527,6 +546,9 @@ fn main() -> Result<()> {
                 progress: Some(1.0),
                 phase: Some("Skipped".to_owned()),
             })?;
+        }
+        if !rejected.is_empty() {
+            bail!("{} input file(s) failed", rejected.len());
         }
         return Ok(());
     }
@@ -551,7 +573,9 @@ fn main() -> Result<()> {
             Qwen3Asr::from_pretrained(path, &device, &load_options)
                 .with_context(|| format!("loading Qwen3-ASR model {}", cli.model))
         })?);
-        if cli.timestamps != TimestampGranularity::None {
+        // Speaker labels are assigned per word, so diarization needs word timings even
+        // when the requested output has no timestamps.
+        if cli.timestamps != TimestampGranularity::None || wants_diarization {
             aligner = Some(load_model(&model_cache, &cli.forced_aligner, |path| {
                 let path = path
                     .to_str()
@@ -597,8 +621,11 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "diarization"))]
     let mut diarizer: Option<Diarizer> = None;
 
-    let mut failures = 0usize;
+    let mut failures = rejected.len();
     for job in jobs {
+        if cancel_requested() {
+            break;
+        }
         let key = input_key(&job.input);
         let predicted_output = output_path(&cli, &job);
         if cli.resume && progress.is_completed(&job.input) && predicted_output.exists() {
@@ -624,6 +651,7 @@ fn main() -> Result<()> {
         })?;
         let started = Instant::now();
         let mut report = |value: f32, phase: &str| {
+            check_cancelled()?;
             progress.record(ProgressEvent {
                 input: key.clone(),
                 status: "running".to_owned(),
@@ -655,6 +683,20 @@ fn main() -> Result<()> {
                 progress: Some(1.0),
                 phase: Some("Complete".to_owned()),
             })?,
+            // Not a failure of this input: record it so the app shows the row as
+            // canceled rather than failed, then stop.
+            Err(_) if cancel_requested() => {
+                progress.record(ProgressEvent {
+                    input: key,
+                    status: "canceled".to_owned(),
+                    output: None,
+                    error: None,
+                    elapsed_seconds: Some(started.elapsed().as_secs_f32()),
+                    progress: None,
+                    phase: Some("Canceled".to_owned()),
+                })?;
+                break;
+            }
             Err(error) => {
                 eprintln!("error processing {}: {error:#}", job.input.display());
                 failures += 1;
@@ -673,8 +715,45 @@ fn main() -> Result<()> {
             }
         }
     }
+    check_cancelled()?;
     if failures > 0 {
         bail!("{failures} input file(s) failed");
+    }
+    Ok(())
+}
+
+/// Set by the first SIGTERM/SIGINT. The app cancels a run with SIGTERM; checking this at job
+/// and chunk boundaries lets the CLI stop the Apple helper and drop temporary files instead of
+/// dying mid-job and orphaning both.
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_cancel(signal: libc::c_int) {
+    CANCELLED.store(true, Ordering::SeqCst);
+    // Restore the default action so a second signal (e.g. Ctrl-C twice) exits immediately.
+    // signal(2) is async-signal-safe.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+    }
+}
+
+fn install_cancel_handler() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        unsafe {
+            libc::signal(
+                signal,
+                request_cancel as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            );
+        }
+    }
+}
+
+fn cancel_requested() -> bool {
+    CANCELLED.load(Ordering::SeqCst)
+}
+
+fn check_cancelled() -> Result<()> {
+    if cancel_requested() {
+        bail!("canceled");
     }
     Ok(())
 }
@@ -834,7 +913,8 @@ fn process_one(
         );
     }
     report(0.2, "Transcribing")?;
-    let want_timestamps = cli.timestamps != TimestampGranularity::None;
+    // Diarized jobs need word timings to attach speakers, whatever the output granularity.
+    let want_timestamps = cli.timestamps != TimestampGranularity::None || job.diarize;
     let (text, language, aligned) = if let Some(parakeet) = models.parakeet {
         #[cfg(feature = "parakeet")]
         {
@@ -955,7 +1035,13 @@ fn process_one(
     if output_path.exists() && !cli.overwrite {
         bail!("output exists (use --overwrite): {}", output_path.display());
     }
-    write_output(&doc, &output_path, cli.format, cli.timestamps)?;
+    write_output(
+        &doc,
+        &output_path,
+        cli.format,
+        cli.timestamps,
+        cli.overwrite,
+    )?;
     eprintln!(
         "{} -> {} ({:.2}s)",
         job.input.display(),
@@ -1002,25 +1088,44 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
     let helper_input = converted
         .as_ref()
         .map_or(job.input.as_path(), audio_convert::TempPath::path);
-    let result = Command::new(&helper)
+    let mut child = Command::new(&helper)
         .arg(helper_input)
         .args(["--format", "json", "--timestamps", "words"])
-        .stderr(std::process::Stdio::inherit())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
         .with_context(|| {
             format!(
                 "launching Apple SpeechTranscriber helper {}",
                 helper.display()
             )
         })?;
-    if !result.status.success() {
-        bail!(
-            "Apple SpeechTranscriber failed with status {}",
-            result.status
-        );
+    // Drain stdout on a thread (a full pipe would block the helper) while polling for
+    // cancellation, so a canceled run stops the helper instead of leaving it running.
+    let mut stdout = child.stdout.take().context("helper stdout")?;
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stdout.read_to_end(&mut buffer).map(|_| buffer)
+    });
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if cancel_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("canceled");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let stdout = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("helper output reader panicked"))??;
+    if !status.success() {
+        bail!("Apple SpeechTranscriber failed with status {status}");
     }
-    let mut doc: TranscriptDocument = serde_json::from_slice(&result.stdout)
-        .context("reading Apple SpeechTranscriber transcript")?;
+    let mut doc: TranscriptDocument =
+        serde_json::from_slice(&stdout).context("reading Apple SpeechTranscriber transcript")?;
     // Describe the user's file and this build, not a temporary WAV or the helper's own
     // version constant.
     doc.source = job.input.display().to_string();
@@ -1031,7 +1136,13 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
     if cli.timestamps != TimestampGranularity::Words {
         doc.collapse_words();
     }
-    write_output(&doc, &output_path, cli.format, cli.timestamps)?;
+    write_output(
+        &doc,
+        &output_path,
+        cli.format,
+        cli.timestamps,
+        cli.overwrite,
+    )?;
     Ok(output_path)
 }
 
@@ -1042,17 +1153,21 @@ fn apple_native_helper() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let executable = std::env::current_exe().ok()?;
+    let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    // Bundled: the helper sits beside the CLI in Contents/Helpers. Development: a cargo build
+    // in target/release finds the SwiftPM build of the helper in the repository.
     let candidates = [
-        executable.parent()?.join("transcriberrr-native"),
-        executable
-            .parent()?
-            .join("../Resources/transcriberrr-native"),
+        directory.join("transcriberrr-native"),
+        directory.join("../../ui/.build/out/Products/Release/transcriberrr-native"),
+        directory.join("../../ui/.build/release/transcriberrr-native"),
     ];
     candidates.into_iter().find(|path| path.is_file())
 }
 
-fn collect_jobs(cli: &Cli) -> Result<Vec<Job>> {
+/// Manifest items whose input is missing or unsupported are returned in `rejected` rather than
+/// failing the run: a queue item deleted (or on an unmounted drive) since it was queued should
+/// fail alone, not take the other thousands of tracks with it.
+fn collect_jobs(cli: &Cli, rejected: &mut Vec<(PathBuf, String)>) -> Result<Vec<Job>> {
     if let Some(manifest) = &cli.manifest {
         let manifest_path = expand_home(manifest);
         let content = fs::read_to_string(&manifest_path)
@@ -1063,7 +1178,10 @@ fn collect_jobs(cli: &Cli) -> Result<Vec<Job>> {
         let mut jobs = Vec::with_capacity(manifest_data.items.len());
         for item in manifest_data.items {
             let input = resolve_manifest_path(base, &item.input);
-            validate_input(&input)?;
+            if let Err(error) = validate_input(&input) {
+                rejected.push((input, format!("{error:#}")));
+                continue;
+            }
             let speakers = item.speakers.or(cli.speakers);
             let diarize = item.diarize.unwrap_or(cli.diarize) || speakers.is_some();
             if let Some(count) = speakers {
@@ -1089,7 +1207,8 @@ fn collect_jobs(cli: &Cli) -> Result<Vec<Job>> {
         if cli.recursive {
             for entry in WalkDir::new(dir) {
                 let entry = entry?;
-                if entry.file_type().is_file() && is_audio_path(entry.path()) {
+                // `path().is_file()` follows symlinks, matching the non-recursive branch.
+                if entry.path().is_file() && is_audio_path(entry.path()) {
                     paths.push(entry.into_path());
                 }
             }
@@ -1114,21 +1233,23 @@ fn collect_jobs(cli: &Cli) -> Result<Vec<Job>> {
             })
             .collect())
     } else {
-        cli.inputs
-            .iter()
-            .map(|path| {
-                let path = expand_home(path);
-                validate_input(&path)?;
-                Ok(Job {
-                    input: path,
-                    diarize: cli.diarize || cli.speakers.is_some(),
-                    speakers: cli.speakers,
-                    output: None,
-                    output_dir: cli.output_dir.clone(),
-                    output_location: cli.output_location,
-                })
-            })
-            .collect()
+        let mut jobs = Vec::with_capacity(cli.inputs.len());
+        for path in &cli.inputs {
+            let path = expand_home(path);
+            if let Err(error) = validate_input(&path) {
+                rejected.push((path, format!("{error:#}")));
+                continue;
+            }
+            jobs.push(Job {
+                input: path,
+                diarize: cli.diarize || cli.speakers.is_some(),
+                speakers: cli.speakers,
+                output: None,
+                output_dir: cli.output_dir.clone(),
+                output_location: cli.output_location,
+            });
+        }
+        Ok(jobs)
     }
 }
 
@@ -1182,9 +1303,15 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
         &MetadataOptions::default(),
     )?;
     let mut format = probed.format;
+    // Not `default_track()`, which is just the first track: browser screen recordings put
+    // the video track first, and it has no sample rate.
     let track = format
-        .default_track()
-        .context("audio file has no default track")?;
+        .tracks()
+        .iter()
+        .find(|track| {
+            track.codec_params.codec != CODEC_TYPE_NULL && track.codec_params.sample_rate.is_some()
+        })
+        .context("file has no audio track")?;
     let track_id = track.id;
     let sample_rate = track
         .codec_params
@@ -1462,7 +1589,20 @@ fn output_path(cli: &Cli, job: &Job) -> PathBuf {
         OutputFormat::Vtt => "vtt",
     };
     if let Some(path) = &job.output {
-        return path.with_extension(extension);
+        // Replace a transcript extension the caller supplied; otherwise append, so a dotted
+        // name such as `out/meeting.2024` keeps its last component.
+        let has_output_extension = path.extension().is_some_and(|existing| {
+            ["txt", "json", "srt", "vtt"]
+                .iter()
+                .any(|known| existing.eq_ignore_ascii_case(known))
+        });
+        if has_output_extension {
+            return path.with_extension(extension);
+        }
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".");
+        name.push(extension);
+        return PathBuf::from(name);
     }
     let parent = match job.output_location {
         OutputLocation::Folder => job.output_dir.clone(),
@@ -1525,6 +1665,14 @@ fn speaker_count(value: &str) -> std::result::Result<usize, String> {
     }
 }
 fn is_audio_path(path: &Path) -> bool {
+    // AppleDouble `._name.m4a` metadata files (exFAT, SMB) are not audio.
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("._"))
+    {
+        return false;
+    }
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| {
@@ -1811,6 +1959,91 @@ mod tests {
             .map(PathBuf::from)
             .find(|path| path.is_file())
             .ok_or(())
+    }
+
+    #[test]
+    fn decodes_the_audio_track_of_a_video_webm() {
+        let Ok(ffmpeg) = which_ffmpeg() else {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        };
+        let source = audio_convert::TempPath::new("wav");
+        audio_convert::write_float_wav(source.path(), &tone(440.0, 48_000, 1.0), 48_000).unwrap();
+        // Video first, as in browser screen recordings.
+        let video = audio_convert::TempPath::new("webm");
+        let status = Command::new(&ffmpeg)
+            .args(["-loglevel", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "color=c=blue:s=64x64:d=1", "-i"])
+            .arg(source.path())
+            .args([
+                "-map", "0:v", "-map", "1:a", "-c:v", "libvpx", "-c:a", "libopus",
+            ])
+            .arg(video.path())
+            .status()
+            .unwrap();
+        if !status.success() {
+            eprintln!("skipping: VP8/Opus encoders unavailable");
+            return;
+        }
+        let audio = decode_audio(video.path()).unwrap();
+        assert!((audio.duration_seconds - 1.0).abs() < 0.1);
+        assert!(rms(&audio.samples) > 0.3);
+    }
+
+    #[test]
+    fn missing_inputs_and_appledouble_files_do_not_abort_the_queue() {
+        let directory = audio_convert::TempPath::new("dir");
+        fs::create_dir_all(directory.path()).unwrap();
+        let real = directory.path().join("real.wav");
+        audio_convert::write_float_wav(&real, &[0.0; 16], 16_000).unwrap();
+        fs::write(directory.path().join("._real.wav"), b"metadata").unwrap();
+        let missing = directory.path().join("gone.wav");
+        let cli = Cli::parse_from([
+            "transcriberrr".as_ref(),
+            real.as_os_str(),
+            missing.as_os_str(),
+        ]);
+        let mut rejected = Vec::new();
+        let jobs = collect_jobs(&cli, &mut rejected).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].0, missing);
+        let cli = Cli::parse_from([
+            "transcriberrr".as_ref(),
+            "--input-dir".as_ref(),
+            directory.path().as_os_str(),
+        ]);
+        let jobs = collect_jobs(&cli, &mut Vec::new()).unwrap();
+        assert_eq!(
+            jobs.iter().map(|job| job.input.clone()).collect::<Vec<_>>(),
+            vec![real]
+        );
+        fs::remove_dir_all(directory.path()).unwrap();
+    }
+
+    #[test]
+    fn explicit_outputs_keep_dotted_names() {
+        let cli = Cli::parse_from(["transcriberrr", "--format", "json", "x.wav"]);
+        let job = |output: &str| Job {
+            input: PathBuf::from("x.wav"),
+            diarize: false,
+            speakers: None,
+            output: Some(PathBuf::from(output)),
+            output_dir: PathBuf::from("."),
+            output_location: OutputLocation::Folder,
+        };
+        assert_eq!(
+            output_path(&cli, &job("out/meeting.2024")),
+            PathBuf::from("out/meeting.2024.json")
+        );
+        assert_eq!(
+            output_path(&cli, &job("out/meeting.TXT")),
+            PathBuf::from("out/meeting.json")
+        );
+        assert_eq!(
+            output_path(&cli, &job("out/meeting.json")),
+            PathBuf::from("out/meeting.json")
+        );
     }
 
     #[test]
