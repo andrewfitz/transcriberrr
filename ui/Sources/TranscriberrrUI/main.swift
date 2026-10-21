@@ -5,9 +5,14 @@ import UniformTypeIdentifiers
 
 @main
 struct TranscriberrrUIApp: App {
+    // One queue per app: it owns queue.json and the running CLI. Held by the App so closing
+    // the window during a run does not orphan it, and `Window` prevents a second window
+    // (and a second AppState) from overwriting the same queue file.
+    @StateObject private var state = AppState()
+
     var body: some Scene {
-        WindowGroup("Transcriberrr") {
-            ContentView()
+        Window("Transcriberrr", id: "main") {
+            ContentView(state: state)
                 .frame(minWidth: 780, minHeight: 560)
         }
         .windowResizability(.contentSize)
@@ -322,8 +327,14 @@ final class AppState: ObservableObject {
         if isCancelling { return "Stopping safely…" }
         return items.first(where: { $0.state == .processing })?.resultSummary ?? "Preparing…"
     }
+    /// Items in the current run. Progress and ETA cover only these: counting tracks finished
+    /// in earlier runs as done made the estimate start near zero.
+    private var runItemIDs: Set<UUID> = []
+
     var queueProgress: Double {
-        let tracked = selectedItems
+        let tracked = isRunning && !runItemIDs.isEmpty
+            ? items.filter { runItemIDs.contains($0.id) }
+            : selectedItems
         guard !tracked.isEmpty else { return 0 }
         return tracked.reduce(0) { total, item in
             if item.state == .done { return total + 1 }
@@ -374,7 +385,9 @@ final class AppState: ObservableObject {
         let model = effectiveModelID
         modelStatus = "Checking the local model cache…"
         modelStatusTask = Task { @MainActor [weak self] in
-            guard let self else { return }
+            // Debounce typing in the model field: one CLI query after a pause, not per key.
+            try? await Task.sleep(for: .milliseconds(400))
+            guard let self, !Task.isCancelled else { return }
             let cached = await self.cachedModels([model])?[model]
             guard !Task.isCancelled else { return }
             let local = self.isLocalModelPath(model)
@@ -500,11 +513,20 @@ final class AppState: ObservableObject {
         guard isRunning else { return }
         isCancelling = true
         modelActivityMessage = "Stopping safely and cleaning temporary queue files…"
-        activeProcess?.terminate()
+        guard let process = activeProcess else { return }
+        // SIGTERM lets the CLI stop at the next chunk, stop its helper, and remove temp
+        // files. Model loading has no checkpoints, so force-stop if it takes too long.
+        process.terminate()
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(20))
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
     }
 
     private func markCanceled(_ pending: [AudioItem]) {
+        // Finished tracks keep their result; only unfinished ones become canceled.
         for item in pending where item.state != .done {
+            if case .failed = item.state { continue }
             item.state = .canceled
             item.progress = 0
             item.resultSummary = "Canceled"
@@ -514,7 +536,8 @@ final class AppState: ObservableObject {
     }
 
     func transcribe() {
-        guard !items.isEmpty, !isRunning else { return }
+        // Nothing selected or everything done: do not start a run (or model downloads).
+        guard !isRunning, items.contains(where: { $0.selected && $0.state != .done }) else { return }
         isRunning = true
         isCancelling = false
         startQueueClock()
@@ -522,7 +545,25 @@ final class AppState: ObservableObject {
             if outputDestination == .folder {
                 try? FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
             }
-            let pending = items.filter { $0.selected && $0.state != .done }
+            // A file deleted or on an unmounted drive since it was queued would make the CLI
+            // reject the whole manifest; fail just that row instead.
+            for item in items where item.selected && item.state != .done
+                && !FileManager.default.fileExists(atPath: item.url.path) {
+                item.state = .failed("File not found")
+                item.resultSummary = "File not found: \(item.url.path)"
+            }
+            let pending = items.filter {
+                guard $0.selected, $0.state != .done else { return false }
+                if case .failed("File not found") = $0.state { return false }
+                return true
+            }
+            runItemIDs = Set(pending.map(\.id))
+            guard !pending.isEmpty else {
+                finishQueueClock()
+                isRunning = false
+                saveQueue()
+                return
+            }
             for (index, item) in pending.enumerated() {
                 item.state = .queued
                 item.progress = 0
@@ -579,6 +620,7 @@ final class AppState: ObservableObject {
             if !pending.isEmpty, !isCancelling {
                 let result = await runBulkCLI(for: pending)
                 if isCancelling {
+                    applyFinished(result, to: pending)
                     markCanceled(pending)
                 } else {
                     applyBulk(result, to: pending)
@@ -632,10 +674,12 @@ final class AppState: ObservableObject {
             candidates.append(value)
         }
         append(effectiveModelID)
-        if engine == "qwen" && timestamps != "none" {
+        let diarizing = pending.contains(where: { $0.diarize || $0.speakerCount != nil })
+        // The CLI loads the aligner for diarization too: speakers attach to word timings.
+        if engine == "qwen" && (timestamps != "none" || diarizing) {
             append("Qwen/Qwen3-ForcedAligner-0.6B")
         }
-        if pending.contains(where: { $0.diarize || $0.speakerCount != nil }) {
+        if diarizing {
             append(diarizationModelArgument)
         }
         guard !candidates.isEmpty else { return [] }
@@ -752,22 +796,59 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Applies one CLI progress event. The live poller and the end-of-run pass
+    /// share this, so a track is marked done as soon as the CLI finishes it and
+    /// stays done if the rest of the run is canceled or the app quits.
+    private func apply(_ event: ProgressEvent, to item: AudioItem) {
+        switch event.status {
+        case "running":
+            item.state = .processing
+            item.progress = event.progress ?? max(item.progress, 0.05)
+            if let elapsed = event.elapsedSeconds {
+                item.elapsedSeconds = elapsed
+                item.estimatedRemainingSeconds = item.progress > 0.01
+                    ? max(0, elapsed * (1 / item.progress - 1))
+                    : nil
+            }
+            item.resultSummary = event.phase ?? "Transcribing…"
+        case "completed", "skipped":
+            let output = event.output.map(URL.init(fileURLWithPath:))
+            item.progress = 1
+            item.elapsedSeconds = event.elapsedSeconds ?? item.elapsedSeconds
+            item.estimatedRemainingSeconds = nil
+            item.state = .done
+            item.outputURL = output
+            item.resultSummary = output.map { "Saved to \($0.path)" } ?? "Transcription complete"
+        case "failed":
+            let message = event.error ?? "Transcription failed"
+            item.elapsedSeconds = event.elapsedSeconds ?? item.elapsedSeconds
+            item.estimatedRemainingSeconds = nil
+            item.state = .failed(message)
+            item.resultSummary = message
+        default:
+            break
+        }
+    }
+
+    private static let finalStatuses: Set<String> = ["completed", "skipped", "failed"]
+
+    /// Applies only finished-track events; used when a run is canceled.
+    private func applyFinished(_ result: BulkResult, to items: [AudioItem]) {
+        for item in items {
+            if let event = result.progress[progressKey(item.url.path)], Self.finalStatuses.contains(event.status) {
+                apply(event, to: item)
+            }
+        }
+    }
+
     private func applyBulk(_ result: BulkResult, to items: [AudioItem]) {
         // stderr holds a line per finished track; the last line is the run's error.
         let fallback = result.message.split(whereSeparator: \.isNewline).last
             .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
         for item in items {
-            let key = progressKey(item.url.path)
-            let event = result.progress[key]
-                ?? result.progress[item.url.path]
-            if let event, (event.status == "completed" || event.status == "skipped") {
-                let output = event.output.map(URL.init(fileURLWithPath:))
-                item.progress = 1
-                item.elapsedSeconds = event.elapsedSeconds ?? item.elapsedSeconds
-                item.estimatedRemainingSeconds = nil
-                item.state = .done
-                item.outputURL = output
-                item.resultSummary = output.map { "Saved to \($0.path)" } ?? "Transcription complete"
+            let event = result.progress[progressKey(item.url.path)]
+            if let event, Self.finalStatuses.contains(event.status) {
+                apply(event, to: item)
             } else if result.status == 0 {
                 // Use the path the manifest actually requested; `expectedOutput` ignores
                 // the `-2` suffix added for duplicate basenames.
@@ -794,9 +875,20 @@ final class AppState: ObservableObject {
             .appendingPathExtension(format)
     }
 
-    private func uniqueOutput(_ candidate: URL, reserved: inout Set<String>) -> URL {
-        let key = candidate.standardizedFileURL.path.lowercased()
-        if reserved.insert(key).inserted { return candidate }
+    /// Picks an output path that no other row uses and that does not replace an existing
+    /// file, unless that file is this row's own earlier transcript. The CLI runs with
+    /// --overwrite, so this is the only guard against clobbering, e.g., `notes.txt` beside
+    /// `notes.m4a`.
+    private func uniqueOutput(_ candidate: URL, for item: AudioItem, reserved: inout Set<String>) -> URL {
+        let own = item.outputURL?.standardizedFileURL.path.lowercased()
+        func available(_ url: URL) -> Bool {
+            let key = url.standardizedFileURL.path.lowercased()
+            guard !reserved.contains(key) else { return false }
+            guard key == own || !FileManager.default.fileExists(atPath: url.path) else { return false }
+            reserved.insert(key)
+            return true
+        }
+        if available(candidate) { return candidate }
         let stem = candidate.deletingPathExtension().lastPathComponent
         let ext = candidate.pathExtension
         var suffix = 2
@@ -804,9 +896,7 @@ final class AppState: ObservableObject {
             let numbered = candidate.deletingLastPathComponent()
                 .appendingPathComponent("\(stem)-\(suffix)")
                 .appendingPathExtension(ext)
-            if reserved.insert(numbered.standardizedFileURL.path.lowercased()).inserted {
-                return numbered
-            }
+            if available(numbered) { return numbered }
             suffix += 1
         }
     }
@@ -833,10 +923,14 @@ final class AppState: ObservableObject {
             let location = outputDestination == .folder ? "folder" : "next-to-source"
             // Explicit output paths keep duplicate basenames from different source folders from
             // overwriting each other when a large queue is written to one destination folder.
-            var reserved = Set<String>()
+            // Reserve transcripts that other rows already point at, so a same-named file
+            // from another folder in a later run cannot replace them.
+            let runIDs = Set(items.map(\.id))
+            var reserved = Set(self.items.filter { !runIDs.contains($0.id) }
+                .compactMap { $0.outputURL?.standardizedFileURL.path.lowercased() })
             var outputs: [UUID: URL] = [:]
             let manifestItems = items.map { item -> ManifestItem in
-                let output = uniqueOutput(expectedOutput(for: item), reserved: &reserved)
+                let output = uniqueOutput(expectedOutput(for: item), for: item, reserved: &reserved)
                 outputs[item.id] = output
                 return ManifestItem(input: item.url.standardizedFileURL.path, diarize: item.diarize,
                                     speakers: item.speakerCount, output: output.path,
@@ -871,27 +965,11 @@ final class AppState: ObservableObject {
                     try? await Task.sleep(for: .milliseconds(500))
                     guard !Task.isCancelled else { break }
                     let events = progressReader.read(from: progressURL)
+                    guard let self else { break }
                     for (item, key) in zip(items, keys) {
-                        if let event = events[key] {
-                            if event.status == "running" {
-                                item.state = .processing
-                                item.progress = event.progress ?? max(item.progress, 0.05)
-                                if let elapsed = event.elapsedSeconds {
-                                    item.elapsedSeconds = elapsed
-                                    item.estimatedRemainingSeconds = item.progress > 0.01
-                                        ? max(0, elapsed * (1 / item.progress - 1))
-                                        : nil
-                                }
-                                item.resultSummary = event.phase ?? "Transcribing…"
-                            } else if event.status == "completed" {
-                                item.progress = 0.95
-                                item.elapsedSeconds = event.elapsedSeconds ?? item.elapsedSeconds
-                                item.estimatedRemainingSeconds = nil
-                                item.resultSummary = "Transcription complete; saving…"
-                            }
-                        }
+                        if let event = events[key] { self.apply(event, to: item) }
                     }
-                    self?.objectWillChange.send()
+                    self.objectWillChange.send()
                 }
             }
             let result = await withCheckedContinuation { continuation in
@@ -1014,39 +1092,33 @@ final class AppState: ObservableObject {
     }
 
     private var cliURL: URL? {
-        let environment = ProcessInfo.processInfo.environment
-        if let override = environment["TRANSCRIBERRR_CLI"], !override.isEmpty {
-            let url = URL(fileURLWithPath: override)
-            if FileManager.default.isExecutableFile(atPath: url.path) { return url }
-        }
-        if let bundled = Bundle.main.url(forResource: "transcriberrr", withExtension: nil),
-           FileManager.default.isExecutableFile(atPath: bundled.path) {
-            return bundled
-        }
-        // This fallback makes `swift run` and local development convenient while
-        // keeping Finder-launched apps independent of the user's shell PATH.
-        let repositoryCLI = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // Sources/TranscriberrrUI
-            .deletingLastPathComponent() // Sources
-            .deletingLastPathComponent() // ui
-            .deletingLastPathComponent() // repository root
-            .appendingPathComponent("target/release/transcriberrr")
-        return FileManager.default.isExecutableFile(atPath: repositoryCLI.path) ? repositoryCLI : nil
+        executable("transcriberrr", override: "TRANSCRIBERRR_CLI", development: ["../target/release/transcriberrr"])
     }
 
     private var nativeURL: URL? {
-        let environment = ProcessInfo.processInfo.environment
-        if let override = environment["TRANSCRIBERRR_NATIVE"], !override.isEmpty {
-            let url = URL(fileURLWithPath: override)
-            if FileManager.default.isExecutableFile(atPath: url.path) { return url }
+        executable("transcriberrr-native", override: "TRANSCRIBERRR_NATIVE", development: [
+            ".build/out/Products/Release/transcriberrr-native", // Swift Build (`--show-bin-path`)
+            ".build/release/transcriberrr-native" // classic SwiftPM layout
+        ])
+    }
+
+    /// Finds a bundled executable: the environment override, then `Contents/Helpers`
+    /// (where nested code belongs for signing and notarization), then development
+    /// paths relative to `ui/`, so `swift run` works without a PATH lookup.
+    private func executable(_ name: String, override: String, development: [String]) -> URL? {
+        let fileManager = FileManager.default
+        if let value = ProcessInfo.processInfo.environment[override], !value.isEmpty,
+           fileManager.isExecutableFile(atPath: value) {
+            return URL(fileURLWithPath: value)
         }
-        if let bundled = Bundle.main.url(forResource: "transcriberrr-native", withExtension: nil),
-           FileManager.default.isExecutableFile(atPath: bundled.path) { return bundled }
-        // Three components up from this file is already `ui/`.
-        let repositoryHelper = URL(fileURLWithPath: #filePath)
+        let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/\(name)")
+        if fileManager.isExecutableFile(atPath: helper.path) { return helper }
+        // Three components up from this file is `ui/`.
+        let ui = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent(".build/out/Products/Release/transcriberrr-native")
-        return FileManager.default.isExecutableFile(atPath: repositoryHelper.path) ? repositoryHelper : nil
+        return development
+            .map { ui.appendingPathComponent($0).standardizedFileURL }
+            .first { fileManager.isExecutableFile(atPath: $0.path) }
     }
 
     private func isSupported(_ url: URL) -> Bool {
@@ -1127,7 +1199,7 @@ private struct ModelActivitySheet: View {
 }
 
 struct ContentView: View {
-    @StateObject private var state = AppState()
+    @ObservedObject var state: AppState
     @State private var dropTargeted = false
     @State private var queueFilter = ""
     @State private var compiledFilter: NSRegularExpression?
