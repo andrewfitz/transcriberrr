@@ -5,11 +5,13 @@
 //! processes without duplicating files.
 
 use anyhow::{Context, Result, bail};
-use hf_hub::api::sync::ApiBuilder;
+use hf_hub::api::Progress;
+use hf_hub::api::sync::{ApiBuilder, ApiError, ApiRepo};
 use hf_hub::{Cache, Repo, RepoType};
 use serde::Serialize;
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 pub const QWEN3_ASR_17B: &str = "Qwen/Qwen3-ASR-1.7B";
@@ -139,8 +141,8 @@ impl ModelCache {
             .context("creating Hugging Face client")?;
         let repo = api.repo(Repo::new(id_or_path.clone(), RepoType::Model));
         if id_or_path == SORTFORMER_4SPK {
-            return repo
-                .get(SORTFORMER_FILE)
+            return self
+                .get_file(&repo, &id_or_path, SORTFORMER_FILE)
                 .with_context(|| format!("downloading {id_or_path}/{SORTFORMER_FILE}"));
         }
         if id_or_path == PARAKEET_UNIFIED_EN {
@@ -152,7 +154,7 @@ impl ModelCache {
                 "onnx_fp32/tokenizer.model",
             ];
             for file in files {
-                repo.get(file)
+                self.get_file(&repo, &id_or_path, file)
                     .with_context(|| format!("downloading {id_or_path}/{file}"))?;
             }
             return repo
@@ -183,7 +185,7 @@ impl ModelCache {
             if !is_model_asset(&sibling.rfilename) {
                 continue;
             }
-            repo.get(&sibling.rfilename)
+            self.get_file(&repo, &id_or_path, &sibling.rfilename)
                 .with_context(|| format!("downloading {id_or_path}/{}", sibling.rfilename))?;
         }
         // Another process downloading the same repository may have removed it already.
@@ -198,6 +200,22 @@ impl ModelCache {
             .or_else(|_| repo.get("diar_streaming_sortformer_4spk-v2.1.nemo"))
             .map(snapshot_dir)
             .with_context(|| format!("model {id_or_path:?} has no recognised entry point"))
+    }
+
+    /// `ApiRepo::get` with progress the app can show. hf-hub's progress bar draws nothing when
+    /// stderr is not a terminal, so the app's download window sat on a spinner for gigabytes;
+    /// there, report plain `Downloading FILE: NN%` lines instead.
+    fn get_file(&self, repo: &ApiRepo, id: &str, filename: &str) -> Result<PathBuf, ApiError> {
+        if std::io::stderr().is_terminal() {
+            return repo.get(filename);
+        }
+        let cached = Cache::new(self.root.clone())
+            .repo(Repo::new(id.to_owned(), RepoType::Model))
+            .get(filename);
+        match cached {
+            Some(path) => Ok(path),
+            None => repo.download_with_progress(filename, LineProgress::default()),
+        }
     }
 
     /// Download one or more known or arbitrary Hugging Face model IDs and return local snapshots.
@@ -293,6 +311,41 @@ impl ModelCache {
         }
         None
     }
+}
+
+/// Download progress as one stderr line per percent, readable from a pipe.
+#[derive(Default)]
+struct LineProgress {
+    filename: String,
+    total: usize,
+    received: usize,
+    reported: Option<usize>,
+}
+
+impl Progress for LineProgress {
+    fn init(&mut self, size: usize, filename: &str) {
+        // hf-hub may call init more than once for the same file.
+        if self.filename == filename && self.total == size {
+            return;
+        }
+        self.filename = filename.to_owned();
+        self.total = size;
+        eprintln!("Downloading {filename} ({:.1} MB)", size as f64 / 1e6);
+    }
+
+    fn update(&mut self, size: usize) {
+        self.received += size;
+        let percent = (self.received * 100)
+            .checked_div(self.total)
+            .unwrap_or(100)
+            .min(100);
+        if self.reported != Some(percent) {
+            self.reported = Some(percent);
+            eprintln!("Downloading {}: {percent}%", self.filename);
+        }
+    }
+
+    fn finish(&mut self) {}
 }
 
 fn snapshot_dir(entry_point: PathBuf) -> PathBuf {

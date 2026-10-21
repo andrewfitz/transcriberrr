@@ -41,8 +41,11 @@ type ParakeetEngine = ();
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "aac", "aif", "aiff", "caf", "flac", "m4a", "mp3", "ogg", "wav", "webm",
+    "aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "mp3", "mp4", "ogg", "opus", "wav", "webm",
 ];
+/// Upper bound on Qwen output tokens per second of audio: fast speech is about 4 words (~6
+/// tokens) per second, so this leaves headroom while still stopping a runaway generation.
+const QWEN_TOKENS_PER_SECOND: f32 = 15.0;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -476,7 +479,12 @@ fn main() -> Result<()> {
             return Ok(());
         }
     }
-    if matches!(cli.engine, EngineKind::ParakeetV3) && cli.model == "Qwen/Qwen3-ASR-1.7B" {
+    // `--model` defaults to Qwen, and the app keeps the last Qwen model in its field. Any Qwen
+    // ASR model (any size or alias) means "use the Parakeet default" for this engine; only
+    // the exact default string used to be recognised, so Qwen 0.6B was loaded as Parakeet.
+    if matches!(cli.engine, EngineKind::ParakeetV3)
+        && model_cache::canonical_id(&cli.model).starts_with("Qwen/Qwen3-ASR")
+    {
         #[cfg(feature = "parakeet")]
         {
             cli.model = parakeet_engine::DEFAULT_MODEL_ID.to_owned();
@@ -636,6 +644,7 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "diarization"))]
     let mut diarizer: Option<Diarizer> = None;
 
+    JOBS_STARTED.store(true, Ordering::SeqCst);
     let mut failures = rejected.len();
     for job in jobs {
         if cancel_requested() {
@@ -741,8 +750,16 @@ fn main() -> Result<()> {
 /// and chunk boundaries lets the CLI stop the Apple helper and drop temporary files instead of
 /// dying mid-job and orphaning both.
 static CANCELLED: AtomicBool = AtomicBool::new(false);
+/// Set once jobs start. Before that (model downloads and loading) there is nothing to clean
+/// up and no checkpoint to stop at, so a signal exits at once instead of after the app's
+/// 20 s force-kill. hf-hub's download locks are flock(2) locks, released on exit.
+static JOBS_STARTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn request_cancel(signal: libc::c_int) {
+    if !JOBS_STARTED.load(Ordering::SeqCst) {
+        // _exit is async-signal-safe; 128 + signal is the conventional status.
+        unsafe { libc::_exit(128 + signal) }
+    }
     CANCELLED.store(true, Ordering::SeqCst);
     // Restore the default action so a second signal (e.g. Ctrl-C twice) exits immediately.
     // signal(2) is async-signal-safe.
@@ -839,7 +856,9 @@ fn transcribe_qwen_chunks(
             context: Batch::one(String::new()),
             language: Batch::one(Some("English".to_owned())),
             return_timestamps: want_timestamps,
-            max_new_tokens: 0,
+            // 0 means the crate's default of 256 tokens, which silently truncates a chunk of
+            // ordinary speech (~4 tokens/s) well before 120 s. Allow a generous rate instead.
+            max_new_tokens: ((cli.chunk_seconds * QWEN_TOKENS_PER_SECOND).ceil() as usize).max(256),
             max_batch_size: 1,
             chunk_max_sec: Some(cli.chunk_seconds),
             bucket_by_length: false,
@@ -924,6 +943,11 @@ fn process_one(
         let output = process_apple_native(cli, job)?;
         report(0.95, "Writing output")?;
         return Ok(output);
+    }
+    // Fail before decoding and inference, not after minutes of work.
+    let destination = output_path(cli, job);
+    if destination.exists() && !cli.overwrite {
+        bail!("output exists (use --overwrite): {}", destination.display());
     }
     let started = Instant::now();
     report(0.05, "Decoding audio")?;
@@ -1054,9 +1078,6 @@ fn process_one(
     {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating output directory {}", parent.display()))?;
-    }
-    if output_path.exists() && !cli.overwrite {
-        bail!("output exists (use --overwrite): {}", output_path.display());
     }
     write_output(&doc, &output_path, render_options(cli), cli.overwrite)?;
     eprintln!(
@@ -1324,15 +1345,16 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
         })
         .context("file has no audio track")?;
     let track_id = track.id;
-    let sample_rate = track
+    let container_rate = track
         .codec_params
         .sample_rate
         .context("audio stream has no sample rate")?;
-    if sample_rate == 0 {
-        bail!("audio stream has an invalid zero sample rate");
-    }
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
     let mut mono = Vec::new();
+    // Resample from the decoder's output rate. Apple's ALAC encoder writes 44100 in the MP4
+    // sample entry for every file; the true rate is in the codec config, which the decoder
+    // uses. Trusting the container stretched 48 kHz Voice Memos by 9%.
+    let mut decoded_rate = None;
     let mut decoded_packets = 0usize;
     let mut skipped_packets = 0usize;
     loop {
@@ -1353,6 +1375,7 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
         };
         match decoder.decode(&packet) {
             Ok(buffer) => {
+                decoded_rate.get_or_insert(buffer.spec().rate);
                 append_decoded(buffer, &mut mono);
                 decoded_packets += 1;
             }
@@ -1370,6 +1393,10 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
             "warning: skipped {skipped_packets} undecodable packet(s) in {}",
             path.display()
         );
+    }
+    let sample_rate = decoded_rate.unwrap_or(container_rate);
+    if sample_rate == 0 {
+        bail!("audio stream has an invalid zero sample rate");
     }
     let samples = resample(mono, sample_rate, TARGET_SAMPLE_RATE);
     Ok(Audio {
