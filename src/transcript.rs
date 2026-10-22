@@ -243,6 +243,8 @@ pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
 /// and every word ends at or after its start. Padded final chunks can otherwise report words
 /// past the end of the audio.
 pub(crate) fn normalize_word_timing(words: &mut [Word], duration: f32) {
+    /// Longest plausible duration of one aligned word.
+    const MAX_WORD_SECONDS: f32 = 2.0;
     let duration = if duration.is_finite() {
         duration.max(0.0)
     } else {
@@ -257,6 +259,14 @@ pub(crate) fn normalize_word_timing(words: &mut [Word], duration: f32) {
     };
     let mut previous_start = 0.0f32;
     for word in words {
+        // The aligner can stretch a word's start back across a long pause (one word spanned
+        // 18 s in noisy audio). No spoken word is that long; keep the end, which was right.
+        if word.start.is_finite()
+            && word.end.is_finite()
+            && word.end - word.start > MAX_WORD_SECONDS
+        {
+            word.start = word.end - MAX_WORD_SECONDS;
+        }
         word.start = clamp(word.start, previous_start);
         word.end = clamp(word.end, word.start);
         previous_start = word.start;
@@ -494,6 +504,18 @@ mod tests {
         preserve_word_text("École été.", &mut words).unwrap();
         assert_eq!(words[0].text, "École");
         assert_eq!(words[1].text, " été.");
+    }
+
+    #[test]
+    fn caps_a_word_stretched_back_across_a_pause() {
+        let mut words = words(&["Does", "anyone"]);
+        words[0].start = 26.74;
+        words[0].end = 45.22;
+        words[1].start = 45.3;
+        words[1].end = 45.7;
+        normalize_word_timing(&mut words, 60.0);
+        assert_eq!((words[0].start, words[0].end), (43.22, 45.22));
+        assert!(words[1].start >= words[0].start);
     }
 
     #[test]

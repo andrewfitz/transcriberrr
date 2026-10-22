@@ -978,10 +978,14 @@ const SPEECH_SPREAD_DB: f32 = 5.0;
 /// dropping speech silently is far worse than an occasional invented word.
 const EMPHASIZED_SPREAD_DB: f32 = 12.0;
 
-/// Windows at or below this are digital silence (muted tracks, noise gates, edits).
-const DIGITAL_SILENCE_DB: f32 = -80.0;
-/// Fewer non-silent 100 ms windows than this (1 s) are kept without judging.
+/// Windows at or below this are digital silence (muted tracks, noise gates, edits). At -80 the
+/// gaps between words of quiet clean 24-bit speech (peaks near -60 dBFS) counted as silence and
+/// whole sentences were dropped; -85 keeps them and still separates muted room tone.
+const DIGITAL_SILENCE_DB: f32 = -85.0;
+/// Under this many non-silent 100 ms windows (1 s), judge with the edge windows included.
 const SHORTEST_JUDGED_WINDOWS: usize = 10;
+/// Clicks and bumps span 1-2 non-silent windows; the shortest words 4 or more.
+const SHORTEST_SPEECH_WINDOWS: usize = 3;
 
 /// Loudest 100 ms window and its spread over the 10th-percentile window, in dB, measured on
 /// the non-silent part of the chunk only. Digital-silence windows (and the half-filled windows
@@ -1004,27 +1008,27 @@ fn level_spread(samples: impl Iterator<Item = f32>) -> Option<(f32, f32)> {
             .get(index)
             .is_some_and(|&level| level <= DIGITAL_SILENCE_DB)
     };
-    let audible = (0..levels.len()).filter(|&index| !silent(index)).count();
-    if audible == 0 {
+    let audible = levels
+        .iter()
+        .copied()
+        .filter(|&level| level > DIGITAL_SILENCE_DB)
+        .collect::<Vec<_>>();
+    // Nothing, or only a click or bump, between digital silence.
+    if audible.len() < SHORTEST_SPEECH_WINDOWS {
         return None;
     }
-    // Under ~1 s of non-silent audio is too little to judge, and in a muted meeting track it
-    // is typically a short reply ("No.", "Right."). Keep it: report a spread no gate rejects.
-    if audible < SHORTEST_JUDGED_WINDOWS {
-        return Some((0.0, f32::INFINITY));
-    }
-    let mut usable = (0..levels.len())
+    let interior = (0..levels.len())
         .filter(|&index| !silent(index) && !silent(index + 1) && !(index > 0 && silent(index - 1)))
         .map(|index| levels[index])
         .collect::<Vec<_>>();
-    if usable.len() < 3 {
-        // Many tiny blips between zeros: judge them with their edge windows included.
-        usable = levels
-            .iter()
-            .copied()
-            .filter(|&level| level > DIGITAL_SILENCE_DB)
-            .collect();
-    }
+    // Under ~1 s of audio (a lone "No." in a muted meeting track) has too few interior windows,
+    // so judge it with its edge windows, where words keep a large spread; likewise many tiny
+    // blips between zeros.
+    let mut usable = if audible.len() < SHORTEST_JUDGED_WINDOWS || interior.len() < 3 {
+        audible
+    } else {
+        interior
+    };
     usable.sort_unstable_by(f32::total_cmp);
     let loudest = usable[usable.len() - 1];
     Some((loudest, loudest - usable[usable.len() / 10]))
@@ -1049,7 +1053,7 @@ fn is_speechless(samples: &[f32]) -> bool {
     let Some((loudest, spread)) = level_spread(filtered.iter().copied()) else {
         return true;
     };
-    if loudest <= SILENCE_FLOOR_DB && spread.is_finite() {
+    if loudest <= SILENCE_FLOOR_DB {
         return true;
     }
     if spread >= SPEECH_SPREAD_DB {
@@ -2164,6 +2168,13 @@ mod tests {
             chunk.extend(noise(burst, rate * 2).iter().map(|n| n * 0.003));
         }
         assert!(is_speechless(&chunk));
+        // Quiet clean speech (peaks ~-60 dBFS) whose word gaps fall to ~-86 dBFS is kept.
+        assert!(!is_speechless(&speech_like(0.001, 0.000_08)));
+        // An isolated click between muted stretches is not speech.
+        let mut click = vec![0.0; rate * 12];
+        click.extend(noise(9, rate / 20).iter().map(|n| n * 0.3));
+        click.extend(std::iter::repeat_n(0.0, rate * 17));
+        assert!(is_speechless(&click));
         // A lone short reply between long muted stretches is kept.
         let mut reply = vec![0.0; rate * 12];
         reply.extend(speech_like(0.1, 0.0).into_iter().take(rate / 2));
