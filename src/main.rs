@@ -3,7 +3,7 @@ mod model_cache;
 mod transcript;
 use transcript::{
     DiarizationMetadata, RenderOptions, Segment, TranscriptDocument, TranscriptMetadata, Word,
-    build_segments, normalize_word_timing, preserve_word_text, write_output,
+    build_segments, is_word_char, normalize_word_timing, preserve_word_text, write_output,
 };
 
 use anyhow::{Context, Result, bail};
@@ -46,6 +46,8 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 /// Upper bound on Qwen output tokens per second of audio: fast speech is about 4 words (~6
 /// tokens) per second, so this leaves headroom while still stopping a runaway generation.
 const QWEN_TOKENS_PER_SECOND: f32 = 15.0;
+/// qwen3_asr's MAX_FORCE_ALIGN_INPUT_SECONDS.
+const QWEN_MAX_CHUNK_SECONDS: f32 = 180.0;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -493,6 +495,13 @@ fn main() -> Result<()> {
     // Keep the user-facing model identifier before replacing it with a local cache snapshot path.
     // Inference needs the resolved directory, while transcript metadata should remain stable
     // across cache revisions and machines.
+    // Subtitles need cue timing. Without timestamps, Qwen loads no aligner and produced one
+    // cue spanning the whole file; give subtitle formats sentence cues instead.
+    if matches!(cli.format, OutputFormat::Srt | OutputFormat::Vtt)
+        && cli.timestamps == TimestampGranularity::None
+    {
+        cli.timestamps = TimestampGranularity::Sentences;
+    }
     let model_label = model_display_name(&cli.model);
     ensure_apple_silicon()?;
     let mut rejected = Vec::new();
@@ -839,9 +848,10 @@ fn transcribe_qwen_chunks(
     want_timestamps: bool,
     report: &mut dyn FnMut(f32, &str) -> Result<()>,
 ) -> Result<(String, String, Vec<AlignedWord>)> {
-    let chunk_samples = (cli.chunk_seconds * TARGET_SAMPLE_RATE as f32)
-        .round()
-        .max(1.0) as usize;
+    // Above 180 s the crate splits the aligner input again and joins the pieces without a
+    // space ("station?Samuel"), so never hand it longer chunks.
+    let chunk_seconds = cli.chunk_seconds.min(QWEN_MAX_CHUNK_SECONDS);
+    let chunk_samples = (chunk_seconds * TARGET_SAMPLE_RATE as f32).round().max(1.0) as usize;
     let chunks = chunk_ranges(samples, chunk_samples);
     let total = chunks.len().max(1);
     let mut text_parts = Vec::with_capacity(chunks.len());
@@ -858,9 +868,9 @@ fn transcribe_qwen_chunks(
             return_timestamps: want_timestamps,
             // 0 means the crate's default of 256 tokens, which silently truncates a chunk of
             // ordinary speech (~4 tokens/s) well before 120 s. Allow a generous rate instead.
-            max_new_tokens: ((cli.chunk_seconds * QWEN_TOKENS_PER_SECOND).ceil() as usize).max(256),
+            max_new_tokens: ((chunk_seconds * QWEN_TOKENS_PER_SECOND).ceil() as usize).max(256),
             max_batch_size: 1,
-            chunk_max_sec: Some(cli.chunk_seconds),
+            chunk_max_sec: Some(chunk_seconds),
             bucket_by_length: false,
         };
         let result = if let Some(aligner) = aligner {
@@ -1013,9 +1023,12 @@ fn process_one(
             end: item.end_time,
             speaker: speaker_at(&speaker_segments, item.start_time, item.end_time),
         })
-        .filter(|word| !word.text.trim().is_empty())
+        // Parakeet times punctuation as its own token, often 0.3-1.4 s late and inside the
+        // next sentence; as a word it became a separate segment (or the next speaker's).
+        // preserve_word_text attaches it to the preceding word with that word's timing.
+        .filter(|word| word.text.chars().any(is_word_char))
         .collect::<Vec<_>>();
-    if want_timestamps && !text.trim().is_empty() && words.is_empty() {
+    if want_timestamps && text.chars().any(is_word_char) && words.is_empty() {
         bail!("recognizer returned text without word timestamps");
     }
     normalize_word_timing(&mut words, audio.duration_seconds);

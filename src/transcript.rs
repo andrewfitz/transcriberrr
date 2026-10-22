@@ -116,11 +116,16 @@ pub(crate) fn build_segments(words: Vec<Word>) -> Vec<Segment> {
     let mut current = Vec::new();
     for word in words {
         let split = current.last().is_some_and(|last: &Word| {
+            let ending = last
+                .text
+                .trim_end_matches(['”', '’', '"', '\'', ')', ']', '」', '』']);
             word.start - last.end > 1.0
-                || last
-                    .text
-                    .trim_end_matches(['”', '’', '"', '\'', ')', ']', '」', '』'])
-                    .ends_with(['.', '?', '!', '。', '？', '！'])
+                // Full-width terminators end a sentence outright. ASCII ones only when a space
+                // follows: recognizers split "3.45pm" and "$5.50" into "3." + "45pm", which
+                // otherwise cut segments (and subtitle cues) mid-number.
+                || ending.ends_with(['。', '？', '！'])
+                || (ending.ends_with(['.', '?', '!'])
+                    && word.text.starts_with(char::is_whitespace))
                 || word.speaker != last.speaker
         });
         if split && !current.is_empty() {
@@ -144,6 +149,25 @@ fn segment_from_words(words: Vec<Word>) -> Segment {
     }
 }
 
+/// The Qwen aligner's notion of a word character: Unicode letters and numbers only (its
+/// `is_kept_char`, minus the apostrophe, which this matcher skips on both sides).
+/// `char::is_alphanumeric` also counts combining vowel signs (Devanagari, Thai), which the
+/// aligner drops, so matching failed whole files of such speech after transcription.
+pub(crate) fn is_word_char(c: char) -> bool {
+    use unicode_general_category::{GeneralCategory, get_general_category};
+    matches!(
+        get_general_category(c),
+        GeneralCategory::UppercaseLetter
+            | GeneralCategory::LowercaseLetter
+            | GeneralCategory::TitlecaseLetter
+            | GeneralCategory::ModifierLetter
+            | GeneralCategory::OtherLetter
+            | GeneralCategory::DecimalNumber
+            | GeneralCategory::LetterNumber
+            | GeneralCategory::OtherNumber
+    )
+}
+
 /// Restore exact source fragments to aligner tokens, which may omit punctuation.
 /// Match every letter/number in order; never silently discard or invent spoken text.
 pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
@@ -154,7 +178,7 @@ pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
     let mut spans = Vec::with_capacity(words.len());
     for word in words.iter() {
         let token = word.text.trim();
-        let letters: Vec<char> = token.chars().filter(|c| c.is_alphanumeric()).collect();
+        let letters: Vec<char> = token.chars().filter(|&c| is_word_char(c)).collect();
         let mut start = None;
         if letters.is_empty() {
             if token.is_empty() {
@@ -163,10 +187,7 @@ pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
             let offset = text[cursor..]
                 .find(token)
                 .context("aligned punctuation does not match transcript")?;
-            if text[cursor..cursor + offset]
-                .chars()
-                .any(char::is_alphanumeric)
-            {
+            if text[cursor..cursor + offset].chars().any(is_word_char) {
                 bail!("aligned punctuation skips transcript words");
             }
             start = Some(cursor + offset);
@@ -175,7 +196,7 @@ pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
             for expected in letters {
                 let (offset, actual) = text[cursor..]
                     .char_indices()
-                    .find(|(_, c)| c.is_alphanumeric())
+                    .find(|&(_, c)| is_word_char(c))
                     .context("aligned words extend beyond transcript text")?;
                 // Aligners may case-fold non-ASCII letters too ("École" vs "école").
                 if actual != expected && !actual.to_lowercase().eq(expected.to_lowercase()) {
@@ -191,7 +212,7 @@ pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
         }
         spans.push((start.unwrap_or(cursor), cursor));
     }
-    if text[cursor..].chars().any(char::is_alphanumeric) {
+    if text[cursor..].chars().any(is_word_char) {
         bail!("transcript contains words without timestamps");
     }
     let mut previous_end = 0;
@@ -590,6 +611,29 @@ mod tests {
         assert_eq!(
             render_output(&doc, turns).unwrap(),
             render_output(&doc, PLAIN).unwrap()
+        );
+    }
+
+    #[test]
+    fn matches_devanagari_without_the_aligners_dropped_vowel_signs() {
+        // The aligner strips combining marks: "मेरा" arrives as "मर".
+        let mut words = words(&["नमसत", "मर", "नम"]);
+        preserve_word_text("नमस्ते, मेरा नाम", &mut words).unwrap();
+        assert_eq!(words[1].text, " मेरा");
+        assert_eq!(words[2].text, " नाम");
+    }
+
+    #[test]
+    fn sentences_do_not_split_inside_numbers() {
+        let mut words = words(&["It's", "3.", "45pm.", "Next"]);
+        for word in &mut words {
+            word.speaker = None;
+        }
+        preserve_word_text("It's 3.45pm. Next", &mut words).unwrap();
+        let segments = build_segments(words);
+        assert_eq!(
+            segments.iter().map(Segment::content).collect::<Vec<_>>(),
+            vec!["It's 3.45pm.", " Next"]
         );
     }
 
