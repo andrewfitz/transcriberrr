@@ -42,7 +42,8 @@ type ParakeetEngine = ();
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "mp3", "mp4", "ogg", "opus", "wav", "webm",
+    "aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "m4v", "mov", "mp3", "mp4", "ogg", "opus",
+    "wav", "webm",
 ];
 /// Upper bound on Qwen output tokens per second of audio: fast speech is about 4 words (~6
 /// tokens) per second, so this leaves headroom while still stopping a runaway generation.
@@ -1200,12 +1201,11 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
     if output_path.exists() && !cli.overwrite {
         bail!("output exists (use --overwrite): {}", output_path.display());
     }
-    // AVFoundation cannot open Matroska/WebM; decode it here and hand the helper a WAV.
-    let converted = if job
-        .input
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("webm"))
-    {
+    // AVFoundation cannot open Matroska/WebM, and the helper hangs forever on FLAC in Ogg;
+    // decode those here and hand the helper a WAV.
+    let converted = if job.input.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("webm") || extension.eq_ignore_ascii_case("ogg")
+    }) {
         let audio = decode_audio(&job.input)
             .with_context(|| format!("decoding {}", job.input.display()))?;
         let wav = audio_convert::TempPath::new("wav");
@@ -1438,13 +1438,10 @@ fn validate_input(path: &Path) -> Result<()> {
 
 fn decode_audio(path: &Path) -> Result<Audio> {
     match decode_with_symphonia(path) {
-        // Symphonia has no Opus decoder; Core Audio does (see audio_convert).
-        Err(error)
-            if matches!(
-                error.downcast_ref::<SymphoniaError>(),
-                Some(SymphoniaError::Unsupported(_))
-            ) =>
-        {
+        // Symphonia has no Opus decoder, and it rejects files Apple's own encoders write
+        // (afconvert ADTS AAC: "end of stream"; μ-law/A-law WAV: "malformed fmt chunk"). Core
+        // Audio reads all of them (see audio_convert), so try it on any failure.
+        Err(error) if path.is_file() => {
             let wav = audio_convert::convert_with_core_audio(path)
                 .with_context(|| format!("{error:#}; the Core Audio fallback also failed"))?;
             decode_with_symphonia(wav.path())
@@ -2194,6 +2191,31 @@ mod tests {
             .map(PathBuf::from)
             .find(|path| path.is_file())
             .ok_or(())
+    }
+
+    #[test]
+    fn decodes_apple_written_files_symphonia_rejects() {
+        let source = audio_convert::TempPath::new("wav");
+        audio_convert::write_float_wav(source.path(), &tone(440.0, 16_000, 1.0), 16_000).unwrap();
+        // afconvert writes μ-law WAV with a fmt chunk Symphonia calls malformed, and ADTS AAC
+        // with an MPEG-2 header it cannot read.
+        for (extension, format, codec) in [("wav", "WAVE", "ulaw"), ("aac", "adts", "aac")] {
+            let encoded = audio_convert::TempPath::new(extension);
+            let status = Command::new("/usr/bin/afconvert")
+                .args(["-f", format, "-d", codec])
+                .arg(source.path())
+                .arg(encoded.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let audio = decode_audio(encoded.path()).unwrap();
+            // AAC adds up to ~0.2 s of encoder priming and padding.
+            assert!(
+                (audio.duration_seconds - 1.0).abs() < 0.25,
+                "{codec}: {}",
+                audio.duration_seconds
+            );
+        }
     }
 
     #[test]

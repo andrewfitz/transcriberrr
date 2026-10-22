@@ -300,7 +300,7 @@ final class AppState: ObservableObject {
     @Published var isCancelling = false
 
     // Keep in sync with AUDIO_EXTENSIONS in src/main.rs.
-    private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "mp3", "mp4", "ogg", "opus", "wav", "webm"]
+    private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "m4v", "mov", "mp3", "mp4", "ogg", "opus", "wav", "webm"]
     private var pendingSave: Task<Void, Never>?
     @Published private(set) var modelStatus = "Checking the local model cache…"
     private var modelStatusTask: Task<Void, Never>?
