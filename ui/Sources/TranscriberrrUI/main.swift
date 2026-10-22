@@ -1015,7 +1015,12 @@ final class AppState: ObservableObject {
                     Task { @MainActor in
                         if self.activeProcess === process { self.activeProcess = nil }
                     }
-                    continuation.resume(returning: (process.terminationStatus, message))
+                    // Killed by a signal (out-of-memory, crash): stderr's last line is usually the
+                    // previous track's success line, which made a misleading failure reason.
+                    let reason = process.terminationReason == .uncaughtSignal
+                        ? "Transcriber stopped unexpectedly (signal \(process.terminationStatus)). If this repeats, try the smaller Qwen3-ASR-0.6B model."
+                        : message
+                    continuation.resume(returning: (process.terminationStatus, reason))
                 }
                 launch(process) { error in
                     _ = errors.finish()
@@ -1310,7 +1315,7 @@ struct ContentView: View {
                 .foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary)
             Text(dropTargeted ? "Release to add audio" : "Drop audio files or folders here")
                 .font(.headline)
-            Text("WAV, AIFF, CAF, M4A, MP3, FLAC, AAC, OGG, or WebM")
+            Text("WAV, AIFF, CAF, M4A, M4B, MP3, MP4, FLAC, AAC, OGG, Opus, or WebM")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -1617,7 +1622,9 @@ struct ContentView: View {
                     .disabled(state.items.isEmpty || state.isCancelling)
             }
             if state.timestamps != "none" {
-                Text("JSON stores each word with start and end seconds; SRT and VTT write one cue per word.")
+                Text(state.timestamps == "words"
+                     ? "JSON stores each word with start and end seconds; SRT and VTT write one cue per word."
+                     : "JSON, SRT, and VTT store one timed entry per sentence.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
