@@ -18,6 +18,9 @@ use parakeet_rs::{
 /// `encoder.onnx`, `decoder_joint.onnx`, and `tokenizer.model`.
 pub const DEFAULT_MODEL_ID: &str = crate::model_cache::PARAKEET_UNIFIED_EN;
 
+/// Longest chunk the Parakeet Unified encoder accepts, with margin below its ~400 s limit.
+const MAX_CHUNK_SECONDS: f32 = 300.0;
+
 /// A timestamped item returned by Parakeet.  Times are seconds from the start of
 /// the input and are suitable for the common JSON/SRT/VTT writers.
 #[derive(Debug, Clone)]
@@ -117,6 +120,9 @@ impl ParakeetEngine {
         chunk_seconds: f32,
         report: &mut dyn FnMut(f32, &str) -> Result<()>,
     ) -> Result<ParakeetTranscript> {
+        // The Unified encoder's positional embedding covers ~5000 frames (~400 s); longer
+        // chunks panic inside Burn and fail the file.
+        let chunk_seconds = chunk_seconds.min(MAX_CHUNK_SECONDS);
         let chunk_samples = (chunk_seconds * 16_000.0).round().max(1.0) as usize;
         // Cut in pauses (as for Qwen) so words are not split across independent decodes.
         let chunks = crate::chunk_ranges(samples, chunk_samples);
