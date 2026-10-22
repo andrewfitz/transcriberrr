@@ -7,7 +7,7 @@ use transcript::{
 };
 
 use anyhow::{Context, Result, bail};
-use candle_core::Device;
+use candle_core::{DType, Device};
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "diarization")]
@@ -46,6 +46,11 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 /// Upper bound on Qwen output tokens per second of audio: fast speech is about 4 words (~6
 /// tokens) per second, so this leaves headroom while still stopping a runaway generation.
 const QWEN_TOKENS_PER_SECOND: f32 = 15.0;
+/// Measured on Metal (BF16, aligner on): 30 s chunks peak near 8 GB for a 10-minute file and run
+/// about twice as fast as 120 s chunks, with the same word error rate.
+const QWEN_DEFAULT_CHUNK_SECONDS: f32 = 30.0;
+#[cfg_attr(not(feature = "parakeet"), allow(dead_code))]
+const PARAKEET_DEFAULT_CHUNK_SECONDS: f32 = 120.0;
 /// qwen3_asr's MAX_FORCE_ALIGN_INPUT_SECONDS.
 const QWEN_MAX_CHUNK_SECONDS: f32 = 180.0;
 
@@ -111,8 +116,10 @@ struct Cli {
     format: OutputFormat,
     #[arg(long, value_enum, default_value_t = TimestampGranularity::Words)]
     timestamps: TimestampGranularity,
-    #[arg(long, default_value_t = 120.0, value_parser = positive_f32)]
-    chunk_seconds: f32,
+    /// Seconds of audio per model call. Defaults to 30 for Qwen3 (memory grows faster than chunk
+    /// length; 120 s chunks peaked above 20 GB) and 120 for Parakeet.
+    #[arg(long, value_parser = positive_f32)]
+    chunk_seconds: Option<f32>,
     #[arg(long)]
     overwrite: bool,
     /// With `--format txt --timestamps none`, write one `[Speaker N]` paragraph per speaker
@@ -596,7 +603,18 @@ fn main() -> Result<()> {
     };
     let mut asr: Option<Qwen3Asr> = None;
     let mut aligner: Option<Qwen3ForcedAligner> = None;
-    let load_options = LoadOptions::default();
+    // The checkpoints are BF16. The crate's default F32 upcasts every weight, and Metal rounds
+    // each buffer up to a power of two: default runs peaked at 21-26 GB. BF16 on Metal measured
+    // ~2.5x less memory with the same transcript and word timings. Candle's CPU BF16 is slow,
+    // so keep F32 there.
+    let load_options = LoadOptions {
+        dtype: if matches!(device, Device::Metal(_)) {
+            DType::BF16
+        } else {
+            DType::F32
+        },
+        ..LoadOptions::default()
+    };
     if matches!(cli.engine, EngineKind::Qwen3) {
         asr = Some(load_model(&model_cache, &cli.model, |path| {
             let path = path
@@ -850,7 +868,10 @@ fn transcribe_qwen_chunks(
 ) -> Result<(String, String, Vec<AlignedWord>)> {
     // Above 180 s the crate splits the aligner input again and joins the pieces without a
     // space ("station?Samuel"), so never hand it longer chunks.
-    let chunk_seconds = cli.chunk_seconds.min(QWEN_MAX_CHUNK_SECONDS);
+    let chunk_seconds = cli
+        .chunk_seconds
+        .unwrap_or(QWEN_DEFAULT_CHUNK_SECONDS)
+        .min(QWEN_MAX_CHUNK_SECONDS);
     let chunk_samples = (chunk_seconds * TARGET_SAMPLE_RATE as f32).round().max(1.0) as usize;
     let chunks = chunk_ranges(samples, chunk_samples);
     let total = chunks.len().max(1);
@@ -978,7 +999,7 @@ fn process_one(
             let result = parakeet.transcribe_with_progress(
                 &audio.samples,
                 want_timestamps,
-                cli.chunk_seconds,
+                cli.chunk_seconds.unwrap_or(PARAKEET_DEFAULT_CHUNK_SECONDS),
                 report,
             )?;
             let parakeet_engine::ParakeetTranscript { text, words } = result;
