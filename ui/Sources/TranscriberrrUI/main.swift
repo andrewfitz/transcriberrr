@@ -157,9 +157,11 @@ private struct ProgressEvent: Decodable {
     var progress: Double?
     var phase: String?
     var elapsedSeconds: TimeInterval?
+    /// Set on a finished track that needs a look, e.g. an empty transcript.
+    var warning: String?
 
     enum CodingKeys: String, CodingKey {
-        case input, status, output, error, progress, phase
+        case input, status, output, error, progress, phase, warning
         case elapsedSeconds = "elapsed_seconds"
     }
 }
@@ -860,6 +862,14 @@ final class AppState: ObservableObject {
             item.state = .done
             item.outputURL = output
             item.resultSummary = output.map { "Saved to \($0.path)" } ?? "Transcription complete"
+            if let warning = event.warning {
+                item.resultSummary = "\(warning). \(item.resultSummary)"
+            }
+        case "canceled":
+            item.estimatedRemainingSeconds = nil
+            item.state = .canceled
+            item.progress = 0
+            item.resultSummary = "Canceled"
         case "failed":
             let message = event.error ?? "Transcription failed"
             item.elapsedSeconds = event.elapsedSeconds ?? item.elapsedSeconds
@@ -871,7 +881,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    private static let finalStatuses: Set<String> = ["completed", "skipped", "failed"]
+    private static let finalStatuses: Set<String> = ["completed", "skipped", "failed", "canceled"]
 
     /// Applies only finished-track events; used when a run is canceled.
     private func applyFinished(_ result: BulkResult, to items: [AudioItem]) {
@@ -886,10 +896,18 @@ final class AppState: ObservableObject {
         // stderr holds a line per finished track; the last line is the run's error.
         let fallback = result.message.split(whereSeparator: \.isNewline).last
             .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        // The CLI was stopped from outside the app (Activity Monitor, `kill`): tracks it never
+        // reached were canceled, not failed.
+        let canceled = result.progress.values.contains { $0.status == "canceled" }
         for item in items {
             let event = result.progress[progressKey(item.url.path)]
             if let event, Self.finalStatuses.contains(event.status) {
                 apply(event, to: item)
+            } else if canceled {
+                item.estimatedRemainingSeconds = nil
+                item.state = .canceled
+                item.progress = 0
+                item.resultSummary = "Canceled"
             } else if result.status == 0 {
                 // Use the path the manifest actually requested; `expectedOutput` ignores
                 // the `-2` suffix added for duplicate basenames.

@@ -325,6 +325,9 @@ struct ProgressEvent {
     progress: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<String>,
+    /// A finished job whose transcript needs a look, e.g. one with no words in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 struct ProgressLog {
@@ -561,6 +564,7 @@ fn main() -> Result<()> {
             elapsed_seconds: None,
             progress: None,
             phase: Some("Failed".to_owned()),
+            warning: None,
         })?;
     }
     if !rejected.is_empty() && (cli.fail_fast || jobs.is_empty()) {
@@ -580,6 +584,7 @@ fn main() -> Result<()> {
                 elapsed_seconds: None,
                 progress: Some(1.0),
                 phase: Some("Skipped".to_owned()),
+                warning: None,
             })?;
         }
         if !rejected.is_empty() {
@@ -697,6 +702,7 @@ fn main() -> Result<()> {
                 elapsed_seconds: None,
                 progress: Some(1.0),
                 phase: Some("Skipped".to_owned()),
+                warning: None,
             })?;
             continue;
         }
@@ -708,6 +714,7 @@ fn main() -> Result<()> {
             elapsed_seconds: None,
             progress: Some(0.0),
             phase: Some("Starting".to_owned()),
+            warning: None,
         })?;
         let started = Instant::now();
         let mut report = |value: f32, phase: &str| {
@@ -720,6 +727,7 @@ fn main() -> Result<()> {
                 elapsed_seconds: Some(started.elapsed().as_secs_f32()),
                 progress: Some(value),
                 phase: Some(phase.to_owned()),
+                warning: None,
             })
         };
         match process_one(
@@ -734,7 +742,7 @@ fn main() -> Result<()> {
             },
             &mut report,
         ) {
-            Ok(output) => progress.record(ProgressEvent {
+            Ok((output, warning)) => progress.record(ProgressEvent {
                 input: key,
                 status: "completed".to_owned(),
                 output: Some(output.display().to_string()),
@@ -742,6 +750,7 @@ fn main() -> Result<()> {
                 elapsed_seconds: Some(started.elapsed().as_secs_f32()),
                 progress: Some(1.0),
                 phase: Some("Complete".to_owned()),
+                warning,
             })?,
             // Not a failure of this input: record it so the app shows the row as
             // canceled rather than failed, then stop.
@@ -754,6 +763,7 @@ fn main() -> Result<()> {
                     elapsed_seconds: Some(started.elapsed().as_secs_f32()),
                     progress: None,
                     phase: Some("Canceled".to_owned()),
+                    warning: None,
                 })?;
                 break;
             }
@@ -768,6 +778,7 @@ fn main() -> Result<()> {
                     elapsed_seconds: Some(started.elapsed().as_secs_f32()),
                     progress: None,
                     phase: Some("Failed".to_owned()),
+                    warning: None,
                 })?;
                 if cli.fail_fast {
                     return Err(error);
@@ -1026,12 +1037,12 @@ fn process_one(
     job: &Job,
     models: InferenceModels<'_>,
     report: &mut dyn FnMut(f32, &str) -> Result<()>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Option<String>)> {
     if matches!(cli.engine, EngineKind::AppleNative) {
         report(0.1, "Starting Apple SpeechTranscriber")?;
         // No progress report after this: the transcript is already written, and a cancel
         // caught there would record a finished job as canceled.
-        return process_apple_native(cli, job);
+        return process_apple_native(cli, job).map(|output| (output, None));
     }
     // Fail before decoding and inference, not after minutes of work.
     let destination = output_path(cli, job);
@@ -1178,7 +1189,10 @@ fn process_one(
         output_path.display(),
         started.elapsed().as_secs_f32()
     );
-    Ok(output_path)
+    // The app shows this on the finished row; otherwise an empty transcript looks like success.
+    let warning = (!text.chars().any(is_word_char))
+        .then(|| "No speech detected; the transcript is empty".to_owned());
+    Ok((output_path, warning))
 }
 
 fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
@@ -2138,6 +2152,7 @@ mod tests {
             elapsed_seconds: None,
             progress: None,
             phase: None,
+            warning: None,
         })
         .unwrap();
         drop(log);
