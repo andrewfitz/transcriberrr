@@ -990,6 +990,8 @@ const SHORTEST_SPEECH_WINDOWS: usize = 3;
 /// speech in it, even when the overall spread is small (speech in white noise).
 const RAISED_SPEECH_WINDOWS: usize = 5;
 const RAISED_ABOVE_BACKGROUND_DB: f32 = 3.0;
+/// Local background search radius for raised windows: ±1.5 s.
+const LOCAL_BACKGROUND_WINDOWS: usize = 15;
 
 /// Loudest 100 ms window and its spread over the 10th-percentile window, in dB, measured on
 /// the non-silent part of the chunk only. Digital-silence windows (and the half-filled windows
@@ -1021,39 +1023,58 @@ fn level_spread(samples: impl Iterator<Item = f32>) -> Option<LevelSpread> {
     if audible.len() < SHORTEST_SPEECH_WINDOWS {
         return None;
     }
-    let interior = (0..levels.len())
+    let interior_indices = (0..levels.len())
         .filter(|&index| !silent(index) && !silent(index + 1) && !(index > 0 && silent(index - 1)))
-        .map(|index| levels[index])
+        .collect::<Vec<_>>();
+    let interior = interior_indices
+        .iter()
+        .map(|&index| levels[index])
         .collect::<Vec<_>>();
     // Under ~1 s of audio (a lone "No." in a muted meeting track) has too few interior windows,
     // so judge it with its edge windows, where words keep a large spread; likewise many tiny
     // blips between zeros.
     let short = audible.len() < SHORTEST_JUDGED_WINDOWS || interior.len() < 3;
-    let mut usable = if short { audible } else { interior };
-    usable.sort_unstable_by(f32::total_cmp);
-    let loudest = usable[usable.len() - 1];
-    let background = usable[usable.len() / 10];
-    // Windows clearly above the background. Not counted for short audio, where half-filled
-    // edge windows would make any noise island look raised.
-    let raised = if short {
-        0
-    } else {
-        usable
-            .iter()
-            .filter(|&&level| level >= background + RAISED_ABOVE_BACKGROUND_DB)
-            .count()
-    };
+    if short {
+        // Judged over all non-silent windows: half-filled edge windows give words a large
+        // spread, while steady blips stay flat.
+        let mut usable = audible;
+        usable.sort_unstable_by(f32::total_cmp);
+        let loudest = usable[usable.len() - 1];
+        return Some(LevelSpread {
+            loudest,
+            spread: loudest - usable[usable.len() / 10],
+            raised: 0,
+        });
+    }
+    // Each interior window against its local background, the quietest interior window within
+    // ±1.5 s. Speech rises and falls at syllable rate; noise that swells slowly over seconds
+    // (HVAC, passing traffic) does not, so a chunk-wide background would read a swell as
+    // speech dynamics.
+    let rises = interior_indices
+        .iter()
+        .map(|&index| {
+            let local_background = interior_indices
+                .iter()
+                .filter(|&&other| other.abs_diff(index) <= LOCAL_BACKGROUND_WINDOWS)
+                .map(|&other| levels[other])
+                .fold(f32::INFINITY, f32::min);
+            levels[index] - local_background
+        })
+        .collect::<Vec<_>>();
     Some(LevelSpread {
-        loudest,
-        spread: loudest - background,
-        raised,
+        loudest: interior.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        spread: rises.iter().copied().fold(0.0, f32::max),
+        raised: rises
+            .iter()
+            .filter(|&&rise| rise >= RAISED_ABOVE_BACKGROUND_DB)
+            .count(),
     })
 }
 
 struct LevelSpread {
     loudest: f32,
     spread: f32,
-    /// Windows at least RAISED_ABOVE_BACKGROUND_DB over the 10th-percentile window.
+    /// Windows at least RAISED_ABOVE_BACKGROUND_DB over their local background.
     raised: usize,
 }
 
@@ -1061,14 +1082,15 @@ struct LevelSpread {
 /// Qwen3-ASR invents text for such chunks. (Music and clicks are not detected here; that
 /// would need a voice activity model.)
 fn is_speechless(samples: &[f32]) -> bool {
-    // Remove DC and sub-20 Hz rumble first (one-pole high-pass): a mic's DC offset or handling
-    // rumble adds a constant floor to every window and hides speech dynamics.
+    // Measure above ~150 Hz (one-pole high-pass; the model still gets the full signal). DC
+    // offset and rumble add a floor that hides speech dynamics, and low-frequency hum (car,
+    // HVAC) has so few cycles per 100 ms window that its window levels jump around like speech.
     let mut previous_input = 0.0f32;
     let mut previous_output = 0.0f32;
     let filtered = samples
         .iter()
         .map(|&sample| {
-            previous_output = sample - previous_input + 0.992 * previous_output;
+            previous_output = sample - previous_input + 0.943 * previous_output;
             previous_input = sample;
             previous_output
         })
@@ -2221,6 +2243,31 @@ mod tests {
             .map(|sample| sample + 0.05)
             .collect::<Vec<_>>();
         assert!(!is_speechless(&offset));
+    }
+
+    #[test]
+    fn hum_and_slowly_swelling_noise_are_not_speech() {
+        let rate = TARGET_SAMPLE_RATE as usize;
+        // Low-frequency (brown-like) hum, as from a car or HVAC.
+        let mut state = 0.0f32;
+        let hum = noise(11, rate * 30)
+            .into_iter()
+            .map(|n| {
+                state = 0.995 * state + n * 0.002;
+                state
+            })
+            .collect::<Vec<_>>();
+        assert!(is_speechless(&hum));
+        // Broadband room tone swelling every five seconds (sox `tremolo 0.2 30`: gain 0.7-1.0).
+        let swell = noise(12, rate * 30)
+            .into_iter()
+            .enumerate()
+            .map(|(index, n)| {
+                let time = index as f32 / rate as f32;
+                n * 0.003 * (1.0 - 0.15 * (1.0 - (std::f32::consts::TAU * 0.2 * time).sin()))
+            })
+            .collect::<Vec<_>>();
+        assert!(is_speechless(&swell));
     }
 
     #[test]
