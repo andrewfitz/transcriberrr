@@ -29,6 +29,19 @@ impl VoiceDetector {
     /// Whether a chunk contains speech.
     pub(crate) fn has_speech(&self, samples: &[f32]) -> bool {
         self.0.reset_state();
+        // Judge above ~150 Hz (one-pole high-pass). Loud mains hum or rumble otherwise sets
+        // the peak, and speech 24 dB under a 60 Hz hum scored as no speech while Qwen3
+        // transcribed it word for word.
+        let mut previous_input = 0.0f32;
+        let mut previous_output = 0.0f32;
+        let samples = samples
+            .iter()
+            .map(|&sample| {
+                previous_output = sample - previous_input + 0.943 * previous_output;
+                previous_input = sample;
+                previous_output
+            })
+            .collect::<Vec<_>>();
         let peak = samples
             .iter()
             .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
@@ -154,6 +167,16 @@ mod tests {
             .map(|(s, n)| (s + n * scale) * 0.5)
             .collect::<Vec<_>>();
         assert!(detector.has_speech(&noisy));
+        // Speech 24 dB (RMS) under a loud 60 Hz mains hum; peaks 13 dB under it.
+        let hummed = speech
+            .iter()
+            .enumerate()
+            .map(|(index, s)| {
+                let time = index as f32 / RATE as f32;
+                s / peak * 0.16 + 0.7 * (std::f32::consts::TAU * 60.0 * time).sin()
+            })
+            .collect::<Vec<_>>();
+        assert!(detector.has_speech(&hummed));
         // A lone short reply between long muted stretches.
         let reply = spoken("No.").unwrap();
         let mut chunk = vec![0.0; RATE * 12];
