@@ -18,8 +18,12 @@ struct TranscriberrrUIApp: App {
         }
         .windowResizability(.contentSize)
         .commands {
-            // A second window would only mirror the same queue.
-            CommandGroup(replacing: .newItem) {}
+            // A second window would only mirror the same queue. Replacing .newItem also drops
+            // File > Close, so restore it (and Cmd-W).
+            CommandGroup(replacing: .newItem) {
+                Button("Close") { NSApp.keyWindow?.performClose(nil) }
+                    .keyboardShortcut("w")
+            }
         }
     }
 }
@@ -370,7 +374,7 @@ final class AppState: ObservableObject {
     private func isQwenModel(_ id: String) -> Bool {
         id.hasPrefix("Qwen/Qwen3-ASR") || ["qwen3-asr-1.7b", "qwen-1.7b", "qwen3-asr-0.6b", "qwen-0.6b"].contains(id)
     }
-    private func isParakeetModel(_ id: String) -> Bool { id.lowercased().contains("parakeet") }
+    private func isParakeetModel(_ id: String) -> Bool { !isLocalModelPath(id) && id.lowercased().contains("parakeet") }
 
     func selectEngine(_ value: String) {
         if value == "parakeet-v3" && isQwenModel(modelID) {
@@ -619,10 +623,8 @@ final class AppState: ObservableObject {
                     return
                 }
                 invalidateModelStatus()
-                modelActivityMessage = "Models are ready. Transcription is starting…"
-                modelActivityCanDismiss = true
-                modelActivitySucceeded = true
-                modelActivityProgress = 1
+                // Get out of the way of the run's progress once the models are ready.
+                showModelActivity = false
             }
 
             if let first = pending.first {
@@ -697,7 +699,8 @@ final class AppState: ObservableObject {
         append(effectiveModelID)
         let diarizing = pending.contains(where: { $0.diarize || $0.speakerCount != nil })
         // The CLI loads the aligner for diarization too: speakers attach to word timings.
-        if engine == "qwen" && (timestamps != "none" || diarizing) {
+        // Subtitles always get sentence timing (main.rs), which needs the aligner too.
+        if engine == "qwen" && (timestamps != "none" || diarizing || format == "srt" || format == "vtt") {
             append("Qwen/Qwen3-ForcedAligner-0.6B")
         }
         if diarizing {
@@ -1216,10 +1219,10 @@ private struct ModelActivitySheet: View {
             HStack {
                 Spacer()
                 if state.isRunning {
+                    // No Esc shortcut: pressing Esc to dismiss the panel canceled the run.
                     Button(state.isCancelling ? "Stopping…" : "Cancel") {
                         state.cancelTranscription()
                     }
-                    .keyboardShortcut(.cancelAction)
                     .disabled(state.isCancelling)
                 }
                 if state.modelActivityCanDismiss {
@@ -1232,7 +1235,6 @@ private struct ModelActivitySheet: View {
         }
         .padding(24)
         .frame(width: 620, height: 460)
-        .interactiveDismissDisabled(!state.modelActivityCanDismiss)
     }
 }
 
@@ -1270,8 +1272,17 @@ struct ContentView: View {
         .onChange(of: state.timestamps) { _, _ in state.saveQueue() }
         .onAppear { updateFilter(queueFilter) }
         .onChange(of: queueFilter) { _, value in updateFilter(value) }
-        .sheet(isPresented: $state.showModelActivity) {
-            ModelActivitySheet(state: state)
+        // An overlay rather than a sheet: macOS refuses to quit (Cmd-Q, Dock, logout) while a
+        // sheet is open, which blocked quitting for an entire first-run model download.
+        .overlay {
+            if state.showModelActivity {
+                ZStack {
+                    Color.black.opacity(0.25).ignoresSafeArea()
+                    ModelActivitySheet(state: state)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        .shadow(radius: 20)
+                }
+            }
         }
     }
 
