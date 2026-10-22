@@ -891,10 +891,12 @@ fn transcribe_qwen_chunks(
     let mut text_parts = Vec::with_capacity(chunks.len());
     let mut language = "English".to_owned();
     let mut aligned = Vec::new();
+    let mut skipped = 0;
     for (index, range) in chunks.iter().enumerate() {
         // Qwen3-ASR invents text ("I'm not sure.", "Okay.") for audio with no speech, and
         // 30 s chunks make any long pause a chunk of its own. Skip chunks without speech.
         if is_speechless(&samples[range.clone()]) {
+            skipped += 1;
             report(
                 0.2 + 0.52 * (index + 1) as f32 / total as f32,
                 &format!("Skipping silent chunk {}/{}", index + 1, total),
@@ -945,22 +947,37 @@ fn transcribe_qwen_chunks(
             &format!("Transcribing chunk {}/{}", index + 1, total),
         )?;
     }
+    if skipped == chunks.len() && !samples.is_empty() {
+        eprintln!(
+            "warning: no speech detected in any of {} chunk(s); the transcript is empty",
+            chunks.len()
+        );
+    } else if skipped > 0 {
+        eprintln!(
+            "note: skipped {skipped} of {} chunk(s) with no detectable speech",
+            chunks.len()
+        );
+    }
     Ok((text_parts.join(" "), language, aligned))
 }
 
 /// Below this, a window is digital silence or near it.
 const SILENCE_FLOOR_DB: f32 = -90.0;
-/// Speech rises well above its own background between syllables and words; steady noise
-/// (room tone, HVAC) does not. Measured spread from the 10th-percentile to the loudest 100 ms
-/// window: 3-4 dB for noise alone, 11 dB for speech at 6 dB SNR, 15-25 dB for clean or quiet
-/// speech. Level relative to the rest of the file is no signal: a loud jingle made a quiet
-/// guest look silent, and a -45 dBFS room floor looked like speech.
-const SPEECH_SPREAD_DB: f32 = 8.0;
+/// Speech rises above its own background between syllables and words; steady noise (room
+/// tone, HVAC, car, fan) does not. Spread is the loudest 100 ms window minus the
+/// 10th-percentile window. Measured: steady noise alone 3.3-4.8 dB; speech in that noise at
+/// 0 dB SNR, or heavily compressed speech, 5.4 dB and up. Level relative to the rest of the
+/// file is no signal: a loud jingle made a quiet guest look silent.
+const SPEECH_SPREAD_DB: f32 = 5.0;
+/// The same spread after pre-emphasis, which brings out consonants: compressed or noisy speech
+/// measured 18-23 dB, steady noise 0.7-2.5 dB. Either test passing keeps the chunk, because
+/// dropping speech silently is far worse than an occasional invented word.
+const EMPHASIZED_SPREAD_DB: f32 = 12.0;
 
-/// Whether a chunk has no speech: near-silent, or steady noise with no level variation.
-/// Qwen3-ASR invents text for such chunks.
-fn is_speechless(samples: &[f32]) -> bool {
+/// Loudest 100 ms window and its spread over the 10th-percentile window, in dB.
+fn level_spread(samples: impl Iterator<Item = f32>) -> Option<(f32, f32)> {
     let window = TARGET_SAMPLE_RATE as usize / 10;
+    let samples = samples.collect::<Vec<_>>();
     let mut levels = samples
         .chunks(window)
         .filter(|frame| frame.len() == window || samples.len() < window)
@@ -971,12 +988,28 @@ fn is_speechless(samples: &[f32]) -> bool {
         })
         .collect::<Vec<_>>();
     if levels.is_empty() {
-        return true;
+        return None;
     }
     levels.sort_unstable_by(f32::total_cmp);
     let loudest = levels[levels.len() - 1];
-    let background = levels[levels.len() / 10];
-    loudest <= SILENCE_FLOOR_DB || loudest - background < SPEECH_SPREAD_DB
+    Some((loudest, loudest - levels[levels.len() / 10]))
+}
+
+/// Whether a chunk has no speech: near-silent, or steady noise with no level variation.
+/// Qwen3-ASR invents text for such chunks. (Music and clicks are not detected here; that
+/// would need a voice activity model.)
+fn is_speechless(samples: &[f32]) -> bool {
+    let Some((loudest, spread)) = level_spread(samples.iter().copied()) else {
+        return true;
+    };
+    if loudest <= SILENCE_FLOOR_DB {
+        return true;
+    }
+    if spread >= SPEECH_SPREAD_DB {
+        return false;
+    }
+    let emphasized = samples.windows(2).map(|pair| pair[1] - 0.97 * pair[0]);
+    level_spread(emphasized).is_none_or(|(_, spread)| spread < EMPHASIZED_SPREAD_DB)
 }
 
 /// Split audio into chunks of at most `chunk_samples`, cutting each chunk at the quietest

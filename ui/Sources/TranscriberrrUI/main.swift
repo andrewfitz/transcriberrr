@@ -1001,6 +1001,7 @@ final class AppState: ObservableObject {
             process.environment = environment
             let errors = PipeCollector()
             process.standardError = errors.pipe
+            let qwenEngine = engine == "qwen"
             let progressReader = ProgressReader()
             // Resolve once: realpath for every row every poll is thousands of syscalls
             // per second on the main actor for a large queue.
@@ -1032,8 +1033,9 @@ final class AppState: ObservableObject {
                     }
                     // Killed by a signal (out-of-memory, crash): stderr's last line is usually the
                     // previous track's success line, which made a misleading failure reason.
+                    let advice = qwenEngine ? " If this repeats, try the smaller Qwen3-ASR-0.6B model." : ""
                     let reason = process.terminationReason == .uncaughtSignal
-                        ? "Transcriber stopped unexpectedly (signal \(process.terminationStatus)). If this repeats, try the smaller Qwen3-ASR-0.6B model."
+                        ? "Transcriber stopped unexpectedly (signal \(process.terminationStatus))." + advice
                         : message
                     continuation.resume(returning: (process.terminationStatus, reason))
                 }
