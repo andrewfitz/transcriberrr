@@ -7561,6 +7561,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustvani-vad"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cc210439bd4e6a512ea0bdd78e24cdcb69af13dfadc71fe7f07ad96e955303c"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9064,6 +9073,7 @@ dependencies = [
  "libc",
  "parakeet-rs",
  "qwen3_asr",
+ "rustvani-vad",
  "serde",
  "serde_json",
  "symphonia",

@@ -1,6 +1,7 @@
 mod audio_convert;
 mod model_cache;
 mod transcript;
+mod vad;
 use transcript::{
     DiarizationMetadata, RenderOptions, Segment, TranscriptDocument, TranscriptMetadata, Word,
     build_segments, is_word_char, normalize_word_timing, preserve_word_text, write_output,
@@ -896,61 +897,78 @@ fn transcribe_qwen_chunks(
     let mut language = "English".to_owned();
     let mut aligned = Vec::new();
     let mut skipped = 0;
-    for (index, range) in chunks.iter().enumerate() {
-        // Qwen3-ASR invents text ("I'm not sure.", "Okay.") for audio with no speech, and
-        // 30 s chunks make any long pause a chunk of its own. Skip chunks without speech.
-        if is_speechless(&samples[range.clone()]) {
-            skipped += 1;
+    let detector = vad::VoiceDetector::new()?;
+    // Judge chunks on a CPU thread (~0.2 s per 30 s chunk) while the GPU transcribes, so voice
+    // detection adds no wall-clock time. The thread stops when the receiver is dropped.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(|| {
+            for range in &chunks {
+                if sender
+                    .send(detector.has_speech(&samples[range.clone()]))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let receiver = receiver;
+        for (index, range) in chunks.iter().enumerate() {
+            // Qwen3-ASR invents text ("I'm not sure.", "Okay.") for audio with no speech.
+            if !receiver.recv().unwrap_or(true) {
+                skipped += 1;
+                report(
+                    0.2 + 0.52 * (index + 1) as f32 / total as f32,
+                    &format!("Skipping chunk {}/{} without speech", index + 1, total),
+                )?;
+                continue;
+            }
+            let audio_input = AudioInput::Waveform {
+                samples: &samples[range.clone()],
+                sample_rate: TARGET_SAMPLE_RATE,
+            };
+            let opts = TranscribeOptions {
+                context: Batch::one(String::new()),
+                language: Batch::one(Some("English".to_owned())),
+                return_timestamps: want_timestamps,
+                // 0 means the crate's default of 256 tokens, which silently truncates a chunk of
+                // ordinary speech (~4 tokens/s) well before 120 s. Allow a generous rate instead.
+                max_new_tokens: ((chunk_seconds * QWEN_TOKENS_PER_SECOND).ceil() as usize).max(256),
+                max_batch_size: 1,
+                chunk_max_sec: Some(chunk_seconds),
+                bucket_by_length: false,
+            };
+            let result = if let Some(aligner) = aligner {
+                asr.transcribe_with_forced_aligner(aligner, vec![audio_input], opts)?
+            } else {
+                asr.transcribe(vec![audio_input], opts)?
+            }
+            .into_iter()
+            .next()
+            .context("Qwen3 returned no transcription")?;
+            language = result.language;
+            if !result.text.trim().is_empty() {
+                text_parts.push(result.text);
+            }
+            // Offset by the chunk's exact starting sample; chunk lengths vary with the cut points.
+            let offset = range.start as f32 / TARGET_SAMPLE_RATE as f32;
+            if let Some(value) = result.timestamps {
+                let envelope = serde_json::from_value::<TimestampEnvelope>(value)
+                    .context("Qwen3 returned timestamps in an unexpected format")?;
+                aligned.extend(envelope.items.into_iter().map(|mut word| {
+                    word.start_time += offset;
+                    word.end_time += offset;
+                    word
+                }));
+            }
+            let progress = 0.2 + 0.52 * (index + 1) as f32 / total as f32;
             report(
-                0.2 + 0.52 * (index + 1) as f32 / total as f32,
-                &format!("Skipping silent chunk {}/{}", index + 1, total),
+                progress,
+                &format!("Transcribing chunk {}/{}", index + 1, total),
             )?;
-            continue;
         }
-        let audio_input = AudioInput::Waveform {
-            samples: &samples[range.clone()],
-            sample_rate: TARGET_SAMPLE_RATE,
-        };
-        let opts = TranscribeOptions {
-            context: Batch::one(String::new()),
-            language: Batch::one(Some("English".to_owned())),
-            return_timestamps: want_timestamps,
-            // 0 means the crate's default of 256 tokens, which silently truncates a chunk of
-            // ordinary speech (~4 tokens/s) well before 120 s. Allow a generous rate instead.
-            max_new_tokens: ((chunk_seconds * QWEN_TOKENS_PER_SECOND).ceil() as usize).max(256),
-            max_batch_size: 1,
-            chunk_max_sec: Some(chunk_seconds),
-            bucket_by_length: false,
-        };
-        let result = if let Some(aligner) = aligner {
-            asr.transcribe_with_forced_aligner(aligner, vec![audio_input], opts)?
-        } else {
-            asr.transcribe(vec![audio_input], opts)?
-        }
-        .into_iter()
-        .next()
-        .context("Qwen3 returned no transcription")?;
-        language = result.language;
-        if !result.text.trim().is_empty() {
-            text_parts.push(result.text);
-        }
-        // Offset by the chunk's exact starting sample; chunk lengths vary with the cut points.
-        let offset = range.start as f32 / TARGET_SAMPLE_RATE as f32;
-        if let Some(value) = result.timestamps {
-            let envelope = serde_json::from_value::<TimestampEnvelope>(value)
-                .context("Qwen3 returned timestamps in an unexpected format")?;
-            aligned.extend(envelope.items.into_iter().map(|mut word| {
-                word.start_time += offset;
-                word.end_time += offset;
-                word
-            }));
-        }
-        let progress = 0.2 + 0.52 * (index + 1) as f32 / total as f32;
-        report(
-            progress,
-            &format!("Transcribing chunk {}/{}", index + 1, total),
-        )?;
-    }
+        Ok(())
+    })?;
     if skipped == chunks.len() && !samples.is_empty() {
         eprintln!(
             "warning: no speech detected in any of {} chunk(s); the transcript is empty",
@@ -963,156 +981,6 @@ fn transcribe_qwen_chunks(
         );
     }
     Ok((text_parts.join(" "), language, aligned))
-}
-
-/// Below this, a window is digital silence or near it.
-const SILENCE_FLOOR_DB: f32 = -90.0;
-/// Speech rises above its own background between syllables and words; steady noise (room
-/// tone, HVAC, car, fan) does not. Spread is the loudest 100 ms window minus the
-/// 10th-percentile window. Measured: steady noise alone 3.3-4.8 dB; speech in that noise at
-/// 0 dB SNR, or heavily compressed speech, 5.4 dB and up. Level relative to the rest of the
-/// file is no signal: a loud jingle made a quiet guest look silent.
-const SPEECH_SPREAD_DB: f32 = 5.0;
-/// The same spread after pre-emphasis, which brings out consonants: compressed or noisy speech
-/// measured 18-23 dB, steady noise 0.7-2.5 dB. Either test passing keeps the chunk, because
-/// dropping speech silently is far worse than an occasional invented word.
-const EMPHASIZED_SPREAD_DB: f32 = 12.0;
-
-/// Windows at or below this are digital silence (muted tracks, noise gates, edits). At -80 the
-/// gaps between words of quiet clean 24-bit speech (peaks near -60 dBFS) counted as silence and
-/// whole sentences were dropped; -85 keeps them and still separates muted room tone.
-const DIGITAL_SILENCE_DB: f32 = -85.0;
-/// Under this many non-silent 100 ms windows (1 s), judge with the edge windows included.
-const SHORTEST_JUDGED_WINDOWS: usize = 10;
-/// Clicks and bumps span 1-2 non-silent windows; the shortest words 4 or more.
-const SHORTEST_SPEECH_WINDOWS: usize = 3;
-/// A chunk with this many 100 ms windows (0.5 s) raised this far over its background has
-/// speech in it, even when the overall spread is small (speech in white noise).
-const RAISED_SPEECH_WINDOWS: usize = 5;
-const RAISED_ABOVE_BACKGROUND_DB: f32 = 3.0;
-/// Local background search radius for raised windows: ±1.5 s.
-const LOCAL_BACKGROUND_WINDOWS: usize = 15;
-
-/// Loudest 100 ms window and its spread over the 10th-percentile window, in dB, measured on
-/// the non-silent part of the chunk only. Digital-silence windows (and the half-filled windows
-/// beside them) would otherwise set the "background" at -90 dB, so room tone in a muted or
-/// gated track looked like 40 dB of speech dynamics. None when under 3 usable windows remain.
-fn level_spread(samples: impl Iterator<Item = f32>) -> Option<LevelSpread> {
-    let window = TARGET_SAMPLE_RATE as usize / 10;
-    let samples = samples.collect::<Vec<_>>();
-    let levels = samples
-        .chunks(window)
-        .filter(|frame| frame.len() == window || samples.len() < window)
-        .map(|frame| {
-            let power =
-                frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32;
-            (10.0 * power.max(1e-20).log10()).max(SILENCE_FLOOR_DB)
-        })
-        .collect::<Vec<_>>();
-    let silent = |index: usize| {
-        levels
-            .get(index)
-            .is_some_and(|&level| level <= DIGITAL_SILENCE_DB)
-    };
-    let audible = levels
-        .iter()
-        .copied()
-        .filter(|&level| level > DIGITAL_SILENCE_DB)
-        .collect::<Vec<_>>();
-    // Nothing, or only a click or bump, between digital silence.
-    if audible.len() < SHORTEST_SPEECH_WINDOWS {
-        return None;
-    }
-    let interior_indices = (0..levels.len())
-        .filter(|&index| !silent(index) && !silent(index + 1) && !(index > 0 && silent(index - 1)))
-        .collect::<Vec<_>>();
-    let interior = interior_indices
-        .iter()
-        .map(|&index| levels[index])
-        .collect::<Vec<_>>();
-    // Under ~1 s of audio (a lone "No." in a muted meeting track) has too few interior windows,
-    // so judge it with its edge windows, where words keep a large spread; likewise many tiny
-    // blips between zeros.
-    let short = audible.len() < SHORTEST_JUDGED_WINDOWS || interior.len() < 3;
-    if short {
-        // Judged over all non-silent windows: half-filled edge windows give words a large
-        // spread, while steady blips stay flat.
-        let mut usable = audible;
-        usable.sort_unstable_by(f32::total_cmp);
-        let loudest = usable[usable.len() - 1];
-        return Some(LevelSpread {
-            loudest,
-            spread: loudest - usable[usable.len() / 10],
-            raised: 0,
-        });
-    }
-    // Each interior window against its local background, the quietest interior window within
-    // ±1.5 s. Speech rises and falls at syllable rate; noise that swells slowly over seconds
-    // (HVAC, passing traffic) does not, so a chunk-wide background would read a swell as
-    // speech dynamics.
-    let rises = interior_indices
-        .iter()
-        .map(|&index| {
-            let local_background = interior_indices
-                .iter()
-                .filter(|&&other| other.abs_diff(index) <= LOCAL_BACKGROUND_WINDOWS)
-                .map(|&other| levels[other])
-                .fold(f32::INFINITY, f32::min);
-            levels[index] - local_background
-        })
-        .collect::<Vec<_>>();
-    Some(LevelSpread {
-        loudest: interior.iter().copied().fold(f32::NEG_INFINITY, f32::max),
-        spread: rises.iter().copied().fold(0.0, f32::max),
-        raised: rises
-            .iter()
-            .filter(|&&rise| rise >= RAISED_ABOVE_BACKGROUND_DB)
-            .count(),
-    })
-}
-
-struct LevelSpread {
-    loudest: f32,
-    spread: f32,
-    /// Windows at least RAISED_ABOVE_BACKGROUND_DB over their local background.
-    raised: usize,
-}
-
-/// Whether a chunk has no speech: near-silent, or steady noise with no level variation.
-/// Qwen3-ASR invents text for such chunks. (Music and clicks are not detected here; that
-/// would need a voice activity model.)
-fn is_speechless(samples: &[f32]) -> bool {
-    // Measure above ~150 Hz (one-pole high-pass; the model still gets the full signal). DC
-    // offset and rumble add a floor that hides speech dynamics, and low-frequency hum (car,
-    // HVAC) has so few cycles per 100 ms window that its window levels jump around like speech.
-    let mut previous_input = 0.0f32;
-    let mut previous_output = 0.0f32;
-    let filtered = samples
-        .iter()
-        .map(|&sample| {
-            previous_output = sample - previous_input + 0.943 * previous_output;
-            previous_input = sample;
-            previous_output
-        })
-        .collect::<Vec<_>>();
-    let Some(LevelSpread {
-        loudest,
-        spread,
-        raised,
-    }) = level_spread(filtered.iter().copied())
-    else {
-        return true;
-    };
-    if loudest <= SILENCE_FLOOR_DB {
-        return true;
-    }
-    // Steady noise never has half a second of windows 3 dB over its own background; speech in
-    // near-white noise at 0 dB SNR (where neither spread test fires) had 10-19.
-    if spread >= SPEECH_SPREAD_DB || raised >= RAISED_SPEECH_WINDOWS {
-        return false;
-    }
-    let emphasized = filtered.windows(2).map(|pair| pair[1] - 0.97 * pair[0]);
-    level_spread(emphasized).is_none_or(|level| level.spread < EMPHASIZED_SPREAD_DB)
 }
 
 /// Split audio into chunks of at most `chunk_samples`, cutting each chunk at the quietest
@@ -2180,113 +2048,6 @@ mod tests {
         assert!(!jobs[0].diarize && jobs[0].speakers.is_none());
         assert!(jobs[1].diarize && jobs[1].speakers == Some(2));
         fs::remove_dir_all(directory.path()).unwrap();
-    }
-
-    /// Deterministic pseudo-random noise in [-1, 1].
-    fn noise(seed: u32, samples: usize) -> Vec<f32> {
-        let mut state = seed;
-        (0..samples)
-            .map(|_| {
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
-            })
-            .collect()
-    }
-
-    /// Bursts of tone ("syllables") of varying loudness, as in speech, separated by gaps,
-    /// over a noise floor.
-    fn speech_like(level: f32, floor: f32) -> Vec<f32> {
-        let rate = TARGET_SAMPLE_RATE as usize;
-        let syllable = tone(220.0, TARGET_SAMPLE_RATE, 0.25);
-        let mut out = Vec::new();
-        for index in 0..20 {
-            let stress = [1.0, 0.35, 0.6, 0.25][index % 4];
-            out.extend(syllable.iter().map(|sample| sample * level * stress));
-            out.extend(std::iter::repeat_n(0.0, rate / 5));
-        }
-        out.iter()
-            .zip(noise(7, out.len()))
-            .map(|(sample, n)| sample + n * floor)
-            .collect()
-    }
-
-    #[test]
-    fn digital_silence_beside_room_tone_is_not_speech() {
-        let rate = TARGET_SAMPLE_RATE as usize;
-        // A muted or gated track: exact zeros, then room tone, alternating.
-        let mut chunk = Vec::new();
-        for burst in 0..6 {
-            chunk.extend(std::iter::repeat_n(0.0, rate * 3));
-            chunk.extend(noise(burst, rate * 2).iter().map(|n| n * 0.003));
-        }
-        assert!(is_speechless(&chunk));
-        // Quiet clean speech (peaks ~-60 dBFS) whose word gaps fall to ~-86 dBFS is kept.
-        assert!(!is_speechless(&speech_like(0.001, 0.000_08)));
-        // An isolated click between muted stretches is not speech.
-        let mut click = vec![0.0; rate * 12];
-        click.extend(noise(9, rate / 20).iter().map(|n| n * 0.3));
-        click.extend(std::iter::repeat_n(0.0, rate * 17));
-        assert!(is_speechless(&click));
-        // A lone short reply between long muted stretches is kept.
-        let mut reply = vec![0.0; rate * 12];
-        reply.extend(speech_like(0.1, 0.0).into_iter().take(rate / 2));
-        reply.extend(std::iter::repeat_n(0.0, rate * 17));
-        assert!(!is_speechless(&reply));
-        // The same gating around speech keeps it.
-        let mut speech = vec![0.0; rate * 3];
-        speech.extend(speech_like(0.1, 0.003));
-        speech.extend(std::iter::repeat_n(0.0, rate * 3));
-        assert!(!is_speechless(&speech));
-        // A DC offset larger than quiet speech does not hide it.
-        let offset = speech_like(0.01, 0.0)
-            .iter()
-            .map(|sample| sample + 0.05)
-            .collect::<Vec<_>>();
-        assert!(!is_speechless(&offset));
-    }
-
-    #[test]
-    fn hum_and_slowly_swelling_noise_are_not_speech() {
-        let rate = TARGET_SAMPLE_RATE as usize;
-        // Low-frequency (brown-like) hum, as from a car or HVAC.
-        let mut state = 0.0f32;
-        let hum = noise(11, rate * 30)
-            .into_iter()
-            .map(|n| {
-                state = 0.995 * state + n * 0.002;
-                state
-            })
-            .collect::<Vec<_>>();
-        assert!(is_speechless(&hum));
-        // Broadband room tone swelling every five seconds (sox `tremolo 0.2 30`: gain 0.7-1.0).
-        let swell = noise(12, rate * 30)
-            .into_iter()
-            .enumerate()
-            .map(|(index, n)| {
-                let time = index as f32 / rate as f32;
-                n * 0.003 * (1.0 - 0.15 * (1.0 - (std::f32::consts::TAU * 0.2 * time).sin()))
-            })
-            .collect::<Vec<_>>();
-        assert!(is_speechless(&swell));
-    }
-
-    #[test]
-    fn speechless_chunks_are_judged_within_the_chunk() {
-        let rate = TARGET_SAMPLE_RATE as usize;
-        // Steady room tone at -45 dBFS: no speech, however loud it is.
-        assert!(is_speechless(
-            &noise(1, rate * 10)
-                .iter()
-                .map(|n| n * 0.01)
-                .collect::<Vec<_>>()
-        ));
-        assert!(is_speechless(&vec![0.0; rate * 10]));
-        // A quiet talker (~-60 dBFS) stays speech even if the file has a loud jingle elsewhere.
-        assert!(!is_speechless(&speech_like(0.001, 0.0)));
-        // Speech in white noise at roughly 0 dB SNR is still speech.
-        assert!(!is_speechless(&speech_like(0.1, 0.07)));
-        // Speech over a steady noise floor is still speech.
-        assert!(!is_speechless(&speech_like(0.1, 0.02)));
     }
 
     #[test]
