@@ -540,17 +540,6 @@ fn main() -> Result<()> {
         bail!("Parakeet support is not included in this build; rebuild with --features parakeet");
     }
     let wants_diarization = jobs.iter().any(|job| job.diarize);
-    #[cfg(feature = "diarization")]
-    let diarization_model_path = if wants_diarization {
-        let value = cli.diarization_model.as_ref().expect("validated above");
-        if value.is_file() {
-            Some(value.clone())
-        } else {
-            Some(model_cache.ensure(&value.to_string_lossy())?)
-        }
-    } else {
-        None
-    };
     #[cfg(not(feature = "diarization"))]
     if wants_diarization {
         bail!(
@@ -596,6 +585,19 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // Resolved after the --resume early exit so an already-finished queue needs no model
+    // (and no network to fetch one).
+    #[cfg(feature = "diarization")]
+    let diarization_model_path = if wants_diarization {
+        let value = cli.diarization_model.as_ref().expect("validated above");
+        if value.is_file() {
+            Some(value.clone())
+        } else {
+            Some(model_cache.ensure(&value.to_string_lossy())?)
+        }
+    } else {
+        None
+    };
     // The native Apple engine runs in Speech.framework and does not need a Candle device.
     // Avoid initializing Metal for that path so helper startup stays lightweight.
     let device = if matches!(cli.engine, EngineKind::AppleNative) {
@@ -978,6 +980,8 @@ const EMPHASIZED_SPREAD_DB: f32 = 12.0;
 
 /// Windows at or below this are digital silence (muted tracks, noise gates, edits).
 const DIGITAL_SILENCE_DB: f32 = -80.0;
+/// Fewer non-silent 100 ms windows than this (1 s) are kept without judging.
+const SHORTEST_JUDGED_WINDOWS: usize = 10;
 
 /// Loudest 100 ms window and its spread over the 10th-percentile window, in dB, measured on
 /// the non-silent part of the chunk only. Digital-silence windows (and the half-filled windows
@@ -1000,12 +1004,26 @@ fn level_spread(samples: impl Iterator<Item = f32>) -> Option<(f32, f32)> {
             .get(index)
             .is_some_and(|&level| level <= DIGITAL_SILENCE_DB)
     };
+    let audible = (0..levels.len()).filter(|&index| !silent(index)).count();
+    if audible == 0 {
+        return None;
+    }
+    // Under ~1 s of non-silent audio is too little to judge, and in a muted meeting track it
+    // is typically a short reply ("No.", "Right."). Keep it: report a spread no gate rejects.
+    if audible < SHORTEST_JUDGED_WINDOWS {
+        return Some((0.0, f32::INFINITY));
+    }
     let mut usable = (0..levels.len())
         .filter(|&index| !silent(index) && !silent(index + 1) && !(index > 0 && silent(index - 1)))
         .map(|index| levels[index])
         .collect::<Vec<_>>();
     if usable.len() < 3 {
-        return None;
+        // Many tiny blips between zeros: judge them with their edge windows included.
+        usable = levels
+            .iter()
+            .copied()
+            .filter(|&level| level > DIGITAL_SILENCE_DB)
+            .collect();
     }
     usable.sort_unstable_by(f32::total_cmp);
     let loudest = usable[usable.len() - 1];
@@ -1031,7 +1049,7 @@ fn is_speechless(samples: &[f32]) -> bool {
     let Some((loudest, spread)) = level_spread(filtered.iter().copied()) else {
         return true;
     };
-    if loudest <= SILENCE_FLOOR_DB {
+    if loudest <= SILENCE_FLOOR_DB && spread.is_finite() {
         return true;
     }
     if spread >= SPEECH_SPREAD_DB {
@@ -2146,6 +2164,11 @@ mod tests {
             chunk.extend(noise(burst, rate * 2).iter().map(|n| n * 0.003));
         }
         assert!(is_speechless(&chunk));
+        // A lone short reply between long muted stretches is kept.
+        let mut reply = vec![0.0; rate * 12];
+        reply.extend(speech_like(0.1, 0.0).into_iter().take(rate / 2));
+        reply.extend(std::iter::repeat_n(0.0, rate * 17));
+        assert!(!is_speechless(&reply));
         // The same gating around speech keeps it.
         let mut speech = vec![0.0; rate * 3];
         speech.extend(speech_like(0.1, 0.003));

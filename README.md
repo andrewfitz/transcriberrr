@@ -96,11 +96,12 @@ Qwen word timestamps use `Qwen/Qwen3-ForcedAligner-0.6B`. JSON places words in `
 
 ## Diarization
 
-Build with `--features diarization`, then provide a Sortformer ONNX export:
+Build with `--features diarization`. `--diarize` (or `--speakers N`) downloads the compatible Sortformer ONNX export on first use; `--diarization-model` selects a different model ID or a local file:
 
 ```bash
+./target/release/transcriberrr meeting.wav --diarize --speakers 2
 ./target/release/transcriberrr meeting.wav --diarize \
-  --diarization-model /models/nemotron3_diar_v3.onnx --speakers 2
+  --diarization-model /models/nemotron3_diar_v3.onnx
 ```
 
 The ONNX graph must be a Sortformer v3 export with `preds_diar` and `preds_hires` outputs. The original NVIDIA `.nemo` checkpoint is not directly loadable by this binary; use an ONNX export such as [altunenes/parakeet-rs](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-3-diarization), or pass a compatible local file. A manifest enables per-track settings:
