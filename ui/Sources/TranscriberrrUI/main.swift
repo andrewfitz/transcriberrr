@@ -5,17 +5,22 @@ import UniformTypeIdentifiers
 
 @main
 struct TranscriberrrUIApp: App {
-    // One queue per app: it owns queue.json and the running CLI. Held by the App so closing
-    // the window during a run does not orphan it, and `Window` prevents a second window
-    // (and a second AppState) from overwriting the same queue file.
+    // One queue per app: it owns queue.json and the running CLI, and every window shows it,
+    // so windows cannot overwrite each other's queue file. A WindowGroup (not `Window`)
+    // keeps the app running when its window closes, so a run continues and the Dock
+    // reopens the window; as the only scene, `Window` quits the app on close.
     @StateObject private var state = AppState()
 
     var body: some Scene {
-        Window("Transcriberrr", id: "main") {
+        WindowGroup("Transcriberrr") {
             ContentView(state: state)
                 .frame(minWidth: 780, minHeight: 560)
         }
         .windowResizability(.contentSize)
+        .commands {
+            // A second window would only mirror the same queue.
+            CommandGroup(replacing: .newItem) {}
+        }
     }
 }
 
@@ -761,8 +766,11 @@ final class AppState: ObservableObject {
             modelActivityMessage = last.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         // No trailing \b: after "%" it requires a word character, so "45% " never matched.
-        if let match = normalized.range(of: #"\b\d{1,3}(\.\d+)?%"#, options: .regularExpression),
-           let percent = Double(normalized[match].dropLast()) {
+        // The last percentage in the chunk is the current one.
+        if let regex = try? NSRegularExpression(pattern: #"\b(\d{1,3}(?:\.\d+)?)%"#),
+           let match = regex.matches(in: normalized, range: NSRange(normalized.startIndex..., in: normalized)).last,
+           let range = Range(match.range(at: 1), in: normalized),
+           let percent = Double(normalized[range]) {
             modelActivityProgress = min(max(percent / 100, 0), 1)
         }
     }
@@ -985,10 +993,17 @@ final class AppState: ObservableObject {
                     guard !Task.isCancelled else { break }
                     let events = progressReader.read(from: progressURL)
                     guard let self else { break }
+                    var finished = false
                     for (item, key) in zip(items, keys) {
-                        if let event = events[key] { self.apply(event, to: item) }
+                        guard let event = events[key] else { continue }
+                        let wasDone = item.state == .done
+                        self.apply(event, to: item)
+                        finished = finished || (!wasDone && item.state == .done)
                     }
                     self.objectWillChange.send()
+                    // Persist finished rows now: after a crash or force quit they would
+                    // otherwise reload as queued and be transcribed again as `name-2`.
+                    if finished { self.saveQueue() }
                 }
             }
             let result = await withCheckedContinuation { continuation in
@@ -1584,7 +1599,9 @@ struct ContentView: View {
                 Button(state.isRunning ? (state.isCancelling ? "Stopping…" : "Cancel") : "Transcribe") {
                     if state.isRunning { state.cancelTranscription() } else { state.transcribe() }
                 }
-                .keyboardShortcut(state.isRunning ? .cancelAction : .defaultAction)
+                // Not Return/Esc: text fields (model ID, regex filter) pass those through, so
+                // confirming a field started the queue and Esc in the filter canceled a run.
+                .keyboardShortcut(state.isRunning ? "." : .return, modifiers: .command)
                     .buttonStyle(.borderedProminent)
                     .disabled(state.items.isEmpty || state.isCancelling)
             }
