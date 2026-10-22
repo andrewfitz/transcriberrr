@@ -79,13 +79,13 @@ Use `--help` for all options. `--model-status` reports the local cache without n
 ./target/release/transcriberrr convert interview.json --format json -o segments.json
 ```
 
-Conversion defaults to TXT and `--timestamps sentences` (`segments` is an alias). It preserves the existing segment boundaries and speaker IDs. Without `-o/--output`, it writes `INPUT.converted.EXT` beside the input. Existing files require `--overwrite`. Plain text is the exact transcript; add `--speaker-turns` (also accepted when transcribing, and the app's "Speaker turns" option for Text) to start a `[Speaker N]` paragraph at each speaker change of a diarized transcript. Subtitle exports flatten whitespace inside each cue so transcript blank lines cannot split cues. Word export requires word timing data; segment-only JSON cannot recreate word timestamps. No audio, model downloads, GPU initialization, or inference is needed.
+Conversion defaults to TXT and `--timestamps sentences` (`segments` is an alias). It preserves the existing segment boundaries and speaker IDs. Without `-o/--output`, it writes `INPUT.converted.EXT` beside the input. Existing files require `--overwrite`. Plain text is the exact transcript; add `--speaker-turns` (also accepted when transcribing, and the app's "Speaker turns" option for Text) to start a `[Speaker N]` paragraph at each speaker change of a diarized transcript. Subtitle exports flatten whitespace inside each cue so transcript blank lines cannot split cues, and always carry cue timing: `--timestamps none` with SRT/VTT gives sentence cues. Word export requires word timing data; segment-only JSON cannot recreate word timestamps. No audio, model downloads, GPU initialization, or inference is needed.
 
 Timestamped TXT looks like:
 
 ```text
-[00:00:00.000 --> 00:00:02.400] [Speaker 1] Hello, world!
-[00:00:02.600 --> 00:00:03.200] [Speaker 2] Hi!
+[00:00:00.000 --> 00:00:02.400] [Speaker 0] Hello, world!
+[00:00:02.600 --> 00:00:03.200] [Speaker 1] Hi!
 ```
 
 The compact JSON schema stores each piece of transcript text **once**. There is no top-level `text`. In word mode, `segments[].words[].text` contains exact text fragments, including punctuation and preceding whitespace; segments omit `text`. Concatenate word texts in segment order **without inserting separators or trimming** to reconstruct the transcript. Speaker IDs and timing remain on the words and segments. For sentence/no-word JSON, each segment contains `text` instead of `words`; concatenate those strings without separators. This is a breaking schema change; the converter reads the compact schema, not the old duplicated-text JSON.
@@ -114,7 +114,7 @@ The ONNX graph must be a Sortformer v3 export with `preds_diar` and `preds_hires
 
 ## Model and audio notes
 
-Supported inputs are AAC, AIFF/AIF, CAF, FLAC, M4A/M4B, MP3, MP4 (audio track), OGG, Opus, WAV, and WebM (including video recordings; the audio track is used). Qwen3-ASR and the forced aligner are downloaded from their Hugging Face repositories. The default Parakeet engine uses the newer English Unified model, [nvidia/parakeet-unified-en-0.6b](https://huggingface.co/nvidia/parakeet-unified-en-0.6b), through the Rust-compatible [eschmidbauer/parakeet-unified-en-0.6b-onnx](https://huggingface.co/eschmidbauer/parakeet-unified-en-0.6b-onnx) export. The previous TDT v3 export remains available for compatibility with `--model istupakov/parakeet-tdt-0.6b-v3-onnx`. Sortformer and Parakeet exports are third-party artifacts; review and accept each repository license before downloading or redistributing them. Transcriberrr does not bundle model weights or grant rights to redistribute them. Source code is MIT licensed; see [LICENSE](LICENSE).
+Supported inputs are AAC, AIFF/AIF, CAF, FLAC, M4A/M4B, MP3, MP4 (audio track), OGG, Opus, WAV, and WebM (including video recordings; the audio track is used). Qwen3-ASR and the forced aligner are downloaded from their Hugging Face repositories. The default Parakeet engine uses the newer English Unified model, [nvidia/parakeet-unified-en-0.6b](https://huggingface.co/nvidia/parakeet-unified-en-0.6b), through the Rust-compatible [eschmidbauer/parakeet-unified-en-0.6b-onnx](https://huggingface.co/eschmidbauer/parakeet-unified-en-0.6b-onnx) export. The previous TDT v3 export remains available for compatibility with `--engine parakeet-v3 --model istupakov/parakeet-tdt-0.6b-v3-onnx`. Sortformer and Parakeet exports are third-party artifacts; review and accept each repository license before downloading or redistributing them. Transcriberrr does not bundle model weights or grant rights to redistribute them. Source code is MIT licensed; see [LICENSE](LICENSE).
 
 The Rust Qwen and Parakeet backends use Metal; they do not use the Apple Neural Engine. `--device coreml` reports an explicit unsupported-device error for those engines. Apple-native mode uses Apple on-device Speech framework.
 

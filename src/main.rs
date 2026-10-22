@@ -103,7 +103,8 @@ struct Cli {
     diarization_model: Option<PathBuf>,
     #[arg(long)]
     diarize: bool,
-    /// Limit diarization output to at most N speakers (Sortformer supports up to 8).
+    /// Limit diarization output to at most N speakers (Sortformer supports up to 8). Implies
+    /// --diarize.
     #[arg(long, alias = "speaker-count", value_parser = speaker_count)]
     speakers: Option<usize>,
     #[arg(long, short = 'o', default_value = ".")]
@@ -878,7 +879,17 @@ fn transcribe_qwen_chunks(
     let mut text_parts = Vec::with_capacity(chunks.len());
     let mut language = "English".to_owned();
     let mut aligned = Vec::new();
+    let file_peak = loudest_window_db(samples);
     for (index, range) in chunks.iter().enumerate() {
+        // Qwen3-ASR invents text ("I'm not sure.", "Okay.") for audio with no speech, and
+        // 30 s chunks make any long pause a chunk of its own. Skip chunks without speech.
+        if is_speechless(loudest_window_db(&samples[range.clone()]), file_peak) {
+            report(
+                0.2 + 0.52 * (index + 1) as f32 / total as f32,
+                &format!("Skipping silent chunk {}/{}", index + 1, total),
+            )?;
+            continue;
+        }
         let audio_input = AudioInput::Waveform {
             samples: &samples[range.clone()],
             sample_rate: TARGET_SAMPLE_RATE,
@@ -924,6 +935,27 @@ fn transcribe_qwen_chunks(
         )?;
     }
     Ok((text_parts.join(" "), language, aligned))
+}
+
+/// Below this, a window is digital silence or near it, whatever the rest of the file does.
+const SILENCE_FLOOR_DB: f32 = -90.0;
+/// A chunk whose loudest 100 ms is this far below the file's loudest has no speech in it.
+/// Measured: room tone sat ~60 dB under speech, while the quietest intelligible speech tested
+/// was ~45 dB under the loudest in its file.
+const SPEECHLESS_MARGIN_DB: f32 = 50.0;
+
+/// Level of the loudest 100 ms window, in dBFS (RMS).
+fn loudest_window_db(samples: &[f32]) -> f32 {
+    let window = TARGET_SAMPLE_RATE as usize / 10;
+    let loudest = samples
+        .chunks(window)
+        .map(|frame| frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32)
+        .fold(0.0f32, f32::max);
+    10.0 * loudest.max(1e-20).log10()
+}
+
+fn is_speechless(chunk_db: f32, file_db: f32) -> bool {
+    chunk_db < SILENCE_FLOOR_DB || chunk_db < file_db - SPEECHLESS_MARGIN_DB
 }
 
 /// Split audio into chunks of at most `chunk_samples`, cutting each chunk at the quietest
@@ -1248,7 +1280,13 @@ fn collect_jobs(cli: &Cli, rejected: &mut Vec<(PathBuf, String)>) -> Result<Vec<
                 rejected.push((input, format!("{error:#}")));
                 continue;
             }
-            let speakers = item.speakers.or(cli.speakers);
+            // An explicit per-item `"diarize": false` wins over the global --speakers, which
+            // would otherwise be inherited and switch diarization back on.
+            let speakers = if item.diarize == Some(false) {
+                None
+            } else {
+                item.speakers.or(cli.speakers)
+            };
             let diarize = item.diarize.unwrap_or(cli.diarize) || speakers.is_some();
             if let Some(count) = speakers {
                 speaker_count(&count.to_string()).map_err(|error| anyhow::anyhow!(error))?;
@@ -1279,7 +1317,9 @@ fn collect_jobs(cli: &Cli, rejected: &mut Vec<(PathBuf, String)>) -> Result<Vec<
                 }
             }
         } else {
-            for entry in fs::read_dir(dir)? {
+            for entry in fs::read_dir(&dir)
+                .with_context(|| format!("reading input directory {}", dir.display()))?
+            {
                 let path = entry?.path();
                 if path.is_file() && is_audio_path(&path) {
                     paths.push(path);
@@ -1923,6 +1963,56 @@ mod tests {
         ids.dedup();
         assert_eq!(ids, vec![2, 1]);
         assert_eq!(limit_speakers(spans, 3).len(), 4);
+    }
+
+    #[test]
+    fn manifest_diarize_false_overrides_global_speakers() {
+        let directory = audio_convert::TempPath::new("dir");
+        fs::create_dir_all(directory.path()).unwrap();
+        for name in ["solo.wav", "meeting.wav"] {
+            audio_convert::write_float_wav(&directory.path().join(name), &[0.0; 16], 16_000)
+                .unwrap();
+        }
+        let manifest = directory.path().join("jobs.json");
+        fs::write(
+            &manifest,
+            r#"{"items":[{"input":"solo.wav","diarize":false},{"input":"meeting.wav"}]}"#,
+        )
+        .unwrap();
+        let cli = Cli::parse_from([
+            "transcriberrr".as_ref(),
+            "--manifest".as_ref(),
+            manifest.as_os_str(),
+            "--speakers".as_ref(),
+            "2".as_ref(),
+        ]);
+        let jobs = collect_jobs(&cli, &mut Vec::new()).unwrap();
+        assert!(!jobs[0].diarize && jobs[0].speakers.is_none());
+        assert!(jobs[1].diarize && jobs[1].speakers == Some(2));
+        fs::remove_dir_all(directory.path()).unwrap();
+    }
+
+    #[test]
+    fn speechless_chunks_are_detected_relative_to_the_file() {
+        let speech = tone(300.0, TARGET_SAMPLE_RATE, 1.0); // ~-3 dBFS
+        let room_tone = speech
+            .iter()
+            .map(|sample| sample * 0.000_3)
+            .collect::<Vec<_>>(); // ~-73
+        let quiet_speech = speech
+            .iter()
+            .map(|sample| sample * 0.01)
+            .collect::<Vec<_>>(); // ~-43
+        let file = loudest_window_db(&speech);
+        assert!(is_speechless(loudest_window_db(&room_tone), file));
+        assert!(!is_speechless(loudest_window_db(&quiet_speech), file));
+        assert!(!is_speechless(file, file));
+        // An all-silent file is speechless even relative to itself.
+        let silence = vec![0.0; 16_000];
+        assert!(is_speechless(
+            loudest_window_db(&silence),
+            loudest_window_db(&silence)
+        ));
     }
 
     #[test]
