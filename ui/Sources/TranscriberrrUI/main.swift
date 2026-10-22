@@ -1597,7 +1597,8 @@ struct ContentView: View {
                 }
             }
             .disabled(state.isRunning)
-            if state.diarize {
+            // Also when only individual tracks diarize: they use this model too.
+            if state.diarize || state.items.contains(where: \.diarize) {
                 HStack {
                     Text("Diarization model").foregroundStyle(.secondary)
                     Text(state.diarizationModelArgument).lineLimit(1).foregroundStyle(.secondary)
