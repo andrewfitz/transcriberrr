@@ -337,14 +337,16 @@ impl ProgressLog {
             if path.exists() {
                 let file = File::open(path)
                     .with_context(|| format!("opening progress file {}", path.display()))?;
-                for (index, line) in BufReader::new(file).lines().enumerate() {
+                // Bytes, not `lines()`: a torn final line can end inside a multibyte character,
+                // and invalid UTF-8 there must not stop the resume either.
+                for (index, line) in BufReader::new(file).split(b'\n').enumerate() {
                     let line = line?;
-                    if line.trim().is_empty() {
+                    if line.iter().all(u8::is_ascii_whitespace) {
                         continue;
                     }
                     // A crash or kill can leave a torn final line. Losing one status event only
                     // means that input is processed again, so never let it block a resume.
-                    match serde_json::from_str::<ProgressEvent>(&line) {
+                    match serde_json::from_slice::<ProgressEvent>(&line) {
                         Ok(event) => {
                             latest.insert(event.input.clone(), event);
                         }
@@ -808,7 +810,17 @@ fn install_cancel_handler() {
 }
 
 fn cancel_requested() -> bool {
-    CANCELLED.load(Ordering::SeqCst)
+    CANCELLED.load(Ordering::SeqCst) || launcher_exited()
+}
+
+/// The app sets TRANSCRIBERRR_PARENT_PID. If it crashes or is force-quit, the CLI is
+/// reparented and would keep the GPU busy, then die mid-write without recording the track.
+/// Opt-in, so `nohup transcriberrr … &` from a closed terminal keeps running.
+fn launcher_exited() -> bool {
+    std::env::var("TRANSCRIBERRR_PARENT_PID")
+        .ok()
+        .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        .is_some_and(|pid| unsafe { libc::getppid() } != pid)
 }
 
 fn check_cancelled() -> Result<()> {
@@ -879,11 +891,10 @@ fn transcribe_qwen_chunks(
     let mut text_parts = Vec::with_capacity(chunks.len());
     let mut language = "English".to_owned();
     let mut aligned = Vec::new();
-    let file_peak = loudest_window_db(samples);
     for (index, range) in chunks.iter().enumerate() {
         // Qwen3-ASR invents text ("I'm not sure.", "Okay.") for audio with no speech, and
         // 30 s chunks make any long pause a chunk of its own. Skip chunks without speech.
-        if is_speechless(loudest_window_db(&samples[range.clone()]), file_peak) {
+        if is_speechless(&samples[range.clone()]) {
             report(
                 0.2 + 0.52 * (index + 1) as f32 / total as f32,
                 &format!("Skipping silent chunk {}/{}", index + 1, total),
@@ -937,25 +948,35 @@ fn transcribe_qwen_chunks(
     Ok((text_parts.join(" "), language, aligned))
 }
 
-/// Below this, a window is digital silence or near it, whatever the rest of the file does.
+/// Below this, a window is digital silence or near it.
 const SILENCE_FLOOR_DB: f32 = -90.0;
-/// A chunk whose loudest 100 ms is this far below the file's loudest has no speech in it.
-/// Measured: room tone sat ~60 dB under speech, while the quietest intelligible speech tested
-/// was ~45 dB under the loudest in its file.
-const SPEECHLESS_MARGIN_DB: f32 = 50.0;
+/// Speech rises well above its own background between syllables and words; steady noise
+/// (room tone, HVAC) does not. Measured spread from the 10th-percentile to the loudest 100 ms
+/// window: 3-4 dB for noise alone, 11 dB for speech at 6 dB SNR, 15-25 dB for clean or quiet
+/// speech. Level relative to the rest of the file is no signal: a loud jingle made a quiet
+/// guest look silent, and a -45 dBFS room floor looked like speech.
+const SPEECH_SPREAD_DB: f32 = 8.0;
 
-/// Level of the loudest 100 ms window, in dBFS (RMS).
-fn loudest_window_db(samples: &[f32]) -> f32 {
+/// Whether a chunk has no speech: near-silent, or steady noise with no level variation.
+/// Qwen3-ASR invents text for such chunks.
+fn is_speechless(samples: &[f32]) -> bool {
     let window = TARGET_SAMPLE_RATE as usize / 10;
-    let loudest = samples
+    let mut levels = samples
         .chunks(window)
-        .map(|frame| frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32)
-        .fold(0.0f32, f32::max);
-    10.0 * loudest.max(1e-20).log10()
-}
-
-fn is_speechless(chunk_db: f32, file_db: f32) -> bool {
-    chunk_db < SILENCE_FLOOR_DB || chunk_db < file_db - SPEECHLESS_MARGIN_DB
+        .filter(|frame| frame.len() == window || samples.len() < window)
+        .map(|frame| {
+            let power =
+                frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32;
+            (10.0 * power.max(1e-20).log10()).max(SILENCE_FLOOR_DB)
+        })
+        .collect::<Vec<_>>();
+    if levels.is_empty() {
+        return true;
+    }
+    levels.sort_unstable_by(f32::total_cmp);
+    let loudest = levels[levels.len() - 1];
+    let background = levels[levels.len() / 10];
+    loudest <= SILENCE_FLOOR_DB || loudest - background < SPEECH_SPREAD_DB
 }
 
 /// Split audio into chunks of at most `chunk_samples`, cutting each chunk at the quietest
@@ -1003,9 +1024,9 @@ fn process_one(
 ) -> Result<PathBuf> {
     if matches!(cli.engine, EngineKind::AppleNative) {
         report(0.1, "Starting Apple SpeechTranscriber")?;
-        let output = process_apple_native(cli, job)?;
-        report(0.95, "Writing output")?;
-        return Ok(output);
+        // No progress report after this: the transcript is already written, and a cancel
+        // caught there would record a finished job as canceled.
+        return process_apple_native(cli, job);
     }
     // Fail before decoding and inference, not after minutes of work.
     let destination = output_path(cli, job);
@@ -1196,7 +1217,7 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
         .arg(helper_input)
         .args(["--format", "json", "--timestamps", "words"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| {
             format!(
@@ -1210,6 +1231,16 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
     let reader = std::thread::spawn(move || {
         let mut buffer = Vec::new();
         stdout.read_to_end(&mut buffer).map(|_| buffer)
+    });
+    // Capture stderr too (still echoed) so a failure names the helper's reason, e.g. the
+    // macOS version or a missing speech asset, rather than only an exit status.
+    let mut stderr = child.stderr.take().context("helper stderr")?;
+    let error_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr.read_to_end(&mut buffer);
+        let text = String::from_utf8_lossy(&buffer).into_owned();
+        eprint!("{text}");
+        text
     });
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -1225,8 +1256,16 @@ fn process_apple_native(cli: &Cli, job: &Job) -> Result<PathBuf> {
     let stdout = reader
         .join()
         .map_err(|_| anyhow::anyhow!("helper output reader panicked"))??;
+    let helper_errors = error_reader.join().unwrap_or_default();
     if !status.success() {
-        bail!("Apple SpeechTranscriber failed with status {status}");
+        match helper_errors
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+        {
+            Some(reason) => bail!("Apple SpeechTranscriber failed: {}", reason.trim()),
+            None => bail!("Apple SpeechTranscriber failed with status {status}"),
+        }
     }
     let mut doc: TranscriptDocument =
         serde_json::from_slice(&stdout).context("reading Apple SpeechTranscriber transcript")?;
@@ -1288,8 +1327,11 @@ fn collect_jobs(cli: &Cli, rejected: &mut Vec<(PathBuf, String)>) -> Result<Vec<
                 item.speakers.or(cli.speakers)
             };
             let diarize = item.diarize.unwrap_or(cli.diarize) || speakers.is_some();
-            if let Some(count) = speakers {
-                speaker_count(&count.to_string()).map_err(|error| anyhow::anyhow!(error))?;
+            if let Some(count) = speakers
+                && let Err(error) = speaker_count(&count.to_string())
+            {
+                rejected.push((input, format!("invalid speakers {count}: {error}")));
+                continue;
             }
             jobs.push(Job {
                 input,
@@ -1309,8 +1351,20 @@ fn collect_jobs(cli: &Cli, rejected: &mut Vec<(PathBuf, String)>) -> Result<Vec<
         let dir = expand_home(dir);
         let mut paths = Vec::new();
         if cli.recursive {
-            for entry in WalkDir::new(dir) {
-                let entry = entry?;
+            // Skip hidden entries (.Trashes, .Spotlight-V100, .fseventsd on volume roots hold
+            // deleted or system files) and keep going past unreadable folders: an error on
+            // any entry used to abort the whole run before a single file was transcribed.
+            let walker = WalkDir::new(&dir).into_iter().filter_entry(|entry| {
+                entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
+            });
+            for entry in walker {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        eprintln!("warning: skipping {error}");
+                        continue;
+                    }
+                };
                 // `path().is_file()` follows symlinks, matching the non-recursive branch.
                 if entry.path().is_file() && is_audio_path(entry.path()) {
                     paths.push(entry.into_path());
@@ -1992,27 +2046,85 @@ mod tests {
         fs::remove_dir_all(directory.path()).unwrap();
     }
 
+    /// Deterministic pseudo-random noise in [-1, 1].
+    fn noise(seed: u32, samples: usize) -> Vec<f32> {
+        let mut state = seed;
+        (0..samples)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Bursts of tone ("syllables") separated by gaps, over a noise floor.
+    fn speech_like(level: f32, floor: f32) -> Vec<f32> {
+        let rate = TARGET_SAMPLE_RATE as usize;
+        let syllable = tone(220.0, TARGET_SAMPLE_RATE, 0.25);
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            out.extend(syllable.iter().map(|sample| sample * level));
+            out.extend(std::iter::repeat_n(0.0, rate / 5));
+        }
+        out.iter()
+            .zip(noise(7, out.len()))
+            .map(|(sample, n)| sample + n * floor)
+            .collect()
+    }
+
     #[test]
-    fn speechless_chunks_are_detected_relative_to_the_file() {
-        let speech = tone(300.0, TARGET_SAMPLE_RATE, 1.0); // ~-3 dBFS
-        let room_tone = speech
-            .iter()
-            .map(|sample| sample * 0.000_3)
-            .collect::<Vec<_>>(); // ~-73
-        let quiet_speech = speech
-            .iter()
-            .map(|sample| sample * 0.01)
-            .collect::<Vec<_>>(); // ~-43
-        let file = loudest_window_db(&speech);
-        assert!(is_speechless(loudest_window_db(&room_tone), file));
-        assert!(!is_speechless(loudest_window_db(&quiet_speech), file));
-        assert!(!is_speechless(file, file));
-        // An all-silent file is speechless even relative to itself.
-        let silence = vec![0.0; 16_000];
+    fn speechless_chunks_are_judged_within_the_chunk() {
+        let rate = TARGET_SAMPLE_RATE as usize;
+        // Steady room tone at -45 dBFS: no speech, however loud it is.
         assert!(is_speechless(
-            loudest_window_db(&silence),
-            loudest_window_db(&silence)
+            &noise(1, rate * 10)
+                .iter()
+                .map(|n| n * 0.01)
+                .collect::<Vec<_>>()
         ));
+        assert!(is_speechless(&vec![0.0; rate * 10]));
+        // A quiet talker (~-60 dBFS) stays speech even if the file has a loud jingle elsewhere.
+        assert!(!is_speechless(&speech_like(0.001, 0.0)));
+        // Speech over a steady noise floor is still speech.
+        assert!(!is_speechless(&speech_like(0.1, 0.02)));
+    }
+
+    #[test]
+    fn recursive_walk_skips_hidden_and_unreadable_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = audio_convert::TempPath::new("dir");
+        let root = directory.path();
+        for folder in ["keep", ".Trashes", "locked"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+            audio_convert::write_float_wav(&root.join(folder).join("a.wav"), &[0.0; 16], 16_000)
+                .unwrap();
+        }
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o300)).unwrap();
+        let cli = Cli::parse_from([
+            "transcriberrr".as_ref(),
+            "--recursive".as_ref(),
+            "--input-dir".as_ref(),
+            root.as_os_str(),
+        ]);
+        let jobs = collect_jobs(&cli, &mut Vec::new());
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
+        let inputs = jobs
+            .unwrap()
+            .into_iter()
+            .map(|job| job.input)
+            .collect::<Vec<_>>();
+        assert_eq!(inputs, vec![root.join("keep/a.wav")]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_tolerates_a_line_torn_inside_a_multibyte_character() {
+        let path = audio_convert::TempPath::new("jsonl");
+        let mut bytes = b"{\"input\":\"/a.wav\",\"status\":\"completed\"}\n".to_vec();
+        bytes.extend_from_slice(&"{\"input\":\"/é".as_bytes()[..13]);
+        fs::write(path.path(), bytes).unwrap();
+        let log = ProgressLog::open(Some(path.path()), true).expect("torn UTF-8 must not abort");
+        assert!(log.latest.contains_key("/a.wav"));
     }
 
     #[test]
