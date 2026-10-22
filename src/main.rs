@@ -99,6 +99,7 @@ struct Cli {
     forced_aligner: String,
     #[arg(long, value_enum, default_value_t = DeviceKind::Metal)]
     device: DeviceKind,
+    /// Sortformer ONNX file, or a model ID/alias. Defaults to `sortformer` when diarizing.
     #[arg(long)]
     diarization_model: Option<PathBuf>,
     #[arg(long)]
@@ -521,7 +522,8 @@ fn main() -> Result<()> {
     }
     ensure_unique_outputs(&cli, &jobs)?;
     if jobs.iter().any(|job| job.diarize) && cli.diarization_model.is_none() {
-        bail!("--diarize requires --diarization-model PATH");
+        // The bundled-compatible Sortformer export; downloaded on first use like other models.
+        cli.diarization_model = Some(PathBuf::from("sortformer"));
     }
     if matches!(cli.engine, EngineKind::AppleNative) && wants_diarization_jobs(&jobs) {
         bail!(
@@ -974,11 +976,17 @@ const SPEECH_SPREAD_DB: f32 = 5.0;
 /// dropping speech silently is far worse than an occasional invented word.
 const EMPHASIZED_SPREAD_DB: f32 = 12.0;
 
-/// Loudest 100 ms window and its spread over the 10th-percentile window, in dB.
+/// Windows at or below this are digital silence (muted tracks, noise gates, edits).
+const DIGITAL_SILENCE_DB: f32 = -80.0;
+
+/// Loudest 100 ms window and its spread over the 10th-percentile window, in dB, measured on
+/// the non-silent part of the chunk only. Digital-silence windows (and the half-filled windows
+/// beside them) would otherwise set the "background" at -90 dB, so room tone in a muted or
+/// gated track looked like 40 dB of speech dynamics. None when under 3 usable windows remain.
 fn level_spread(samples: impl Iterator<Item = f32>) -> Option<(f32, f32)> {
     let window = TARGET_SAMPLE_RATE as usize / 10;
     let samples = samples.collect::<Vec<_>>();
-    let mut levels = samples
+    let levels = samples
         .chunks(window)
         .filter(|frame| frame.len() == window || samples.len() < window)
         .map(|frame| {
@@ -987,19 +995,40 @@ fn level_spread(samples: impl Iterator<Item = f32>) -> Option<(f32, f32)> {
             (10.0 * power.max(1e-20).log10()).max(SILENCE_FLOOR_DB)
         })
         .collect::<Vec<_>>();
-    if levels.is_empty() {
+    let silent = |index: usize| {
+        levels
+            .get(index)
+            .is_some_and(|&level| level <= DIGITAL_SILENCE_DB)
+    };
+    let mut usable = (0..levels.len())
+        .filter(|&index| !silent(index) && !silent(index + 1) && !(index > 0 && silent(index - 1)))
+        .map(|index| levels[index])
+        .collect::<Vec<_>>();
+    if usable.len() < 3 {
         return None;
     }
-    levels.sort_unstable_by(f32::total_cmp);
-    let loudest = levels[levels.len() - 1];
-    Some((loudest, loudest - levels[levels.len() / 10]))
+    usable.sort_unstable_by(f32::total_cmp);
+    let loudest = usable[usable.len() - 1];
+    Some((loudest, loudest - usable[usable.len() / 10]))
 }
 
 /// Whether a chunk has no speech: near-silent, or steady noise with no level variation.
 /// Qwen3-ASR invents text for such chunks. (Music and clicks are not detected here; that
 /// would need a voice activity model.)
 fn is_speechless(samples: &[f32]) -> bool {
-    let Some((loudest, spread)) = level_spread(samples.iter().copied()) else {
+    // Remove DC and sub-20 Hz rumble first (one-pole high-pass): a mic's DC offset or handling
+    // rumble adds a constant floor to every window and hides speech dynamics.
+    let mut previous_input = 0.0f32;
+    let mut previous_output = 0.0f32;
+    let filtered = samples
+        .iter()
+        .map(|&sample| {
+            previous_output = sample - previous_input + 0.992 * previous_output;
+            previous_input = sample;
+            previous_output
+        })
+        .collect::<Vec<_>>();
+    let Some((loudest, spread)) = level_spread(filtered.iter().copied()) else {
         return true;
     };
     if loudest <= SILENCE_FLOOR_DB {
@@ -1008,7 +1037,7 @@ fn is_speechless(samples: &[f32]) -> bool {
     if spread >= SPEECH_SPREAD_DB {
         return false;
     }
-    let emphasized = samples.windows(2).map(|pair| pair[1] - 0.97 * pair[0]);
+    let emphasized = filtered.windows(2).map(|pair| pair[1] - 0.97 * pair[0]);
     level_spread(emphasized).is_none_or(|(_, spread)| spread < EMPHASIZED_SPREAD_DB)
 }
 
@@ -2090,19 +2119,44 @@ mod tests {
             .collect()
     }
 
-    /// Bursts of tone ("syllables") separated by gaps, over a noise floor.
+    /// Bursts of tone ("syllables") of varying loudness, as in speech, separated by gaps,
+    /// over a noise floor.
     fn speech_like(level: f32, floor: f32) -> Vec<f32> {
         let rate = TARGET_SAMPLE_RATE as usize;
         let syllable = tone(220.0, TARGET_SAMPLE_RATE, 0.25);
         let mut out = Vec::new();
-        for _ in 0..20 {
-            out.extend(syllable.iter().map(|sample| sample * level));
+        for index in 0..20 {
+            let stress = [1.0, 0.35, 0.6, 0.25][index % 4];
+            out.extend(syllable.iter().map(|sample| sample * level * stress));
             out.extend(std::iter::repeat_n(0.0, rate / 5));
         }
         out.iter()
             .zip(noise(7, out.len()))
             .map(|(sample, n)| sample + n * floor)
             .collect()
+    }
+
+    #[test]
+    fn digital_silence_beside_room_tone_is_not_speech() {
+        let rate = TARGET_SAMPLE_RATE as usize;
+        // A muted or gated track: exact zeros, then room tone, alternating.
+        let mut chunk = Vec::new();
+        for burst in 0..6 {
+            chunk.extend(std::iter::repeat_n(0.0, rate * 3));
+            chunk.extend(noise(burst, rate * 2).iter().map(|n| n * 0.003));
+        }
+        assert!(is_speechless(&chunk));
+        // The same gating around speech keeps it.
+        let mut speech = vec![0.0; rate * 3];
+        speech.extend(speech_like(0.1, 0.003));
+        speech.extend(std::iter::repeat_n(0.0, rate * 3));
+        assert!(!is_speechless(&speech));
+        // A DC offset larger than quiet speech does not hide it.
+        let offset = speech_like(0.01, 0.0)
+            .iter()
+            .map(|sample| sample + 0.05)
+            .collect::<Vec<_>>();
+        assert!(!is_speechless(&offset));
     }
 
     #[test]
