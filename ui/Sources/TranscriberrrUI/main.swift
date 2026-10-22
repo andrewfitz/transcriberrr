@@ -18,11 +18,12 @@ struct TranscriberrrUIApp: App {
         }
         .windowResizability(.contentSize)
         .commands {
-            // A second window would only mirror the same queue. Replacing .newItem also drops
-            // File > Close, so restore it (and Cmd-W).
+            // A second window would only mirror the same queue. The group must not be empty
+            // (that removes the whole File menu, including Close / Cmd-W).
             CommandGroup(replacing: .newItem) {
-                Button("Close") { NSApp.keyWindow?.performClose(nil) }
-                    .keyboardShortcut("w")
+                Button("Add Files…") { state.chooseFiles() }
+                    .keyboardShortcut("o")
+                    .disabled(state.isRunning)
             }
         }
     }
@@ -512,6 +513,19 @@ final class AppState: ObservableObject {
         saveQueue()
     }
 
+    func chooseFiles() {
+        guard !isRunning else { return }
+        let panel = NSOpenPanel()
+        // Filter supported extensions after selection so folders and formats such
+        // as FLAC, OGG, AAC, and WebM can be selected consistently.
+        panel.allowedContentTypes = []
+        panel.allowsOtherFileTypes = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK { add(urls: panel.urls) }
+    }
+
     func chooseFolder(_ current: URL, completion: @escaping (URL) -> Void) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -979,11 +993,12 @@ final class AppState: ObservableObject {
             let process = Process()
             process.executableURL = executableURL
             process.arguments = arguments
-            if let nativeURL {
-                // Lets a development CLI (target/release) find the Speech helper.
-                process.environment = ProcessInfo.processInfo.environment
-                    .merging(["TRANSCRIBERRR_NATIVE": nativeURL.path]) { _, new in new }
-            }
+            // TRANSCRIBERRR_PARENT_PID: the CLI stops if this app crashes or is force-quit.
+            // TRANSCRIBERRR_NATIVE: lets a development CLI (target/release) find the helper.
+            var environment = ProcessInfo.processInfo.environment
+            environment["TRANSCRIBERRR_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
+            if let nativeURL { environment["TRANSCRIBERRR_NATIVE"] = nativeURL.path }
+            process.environment = environment
             let errors = PipeCollector()
             process.standardError = errors.pipe
             let progressReader = ProgressReader()
@@ -1667,18 +1682,7 @@ struct ContentView: View {
         }
     }
 
-    private func chooseFiles() {
-        guard !state.isRunning else { return }
-        let panel = NSOpenPanel()
-        // Filter supported extensions after selection so folders and formats such
-        // as FLAC, OGG, AAC, and WebM can be selected consistently.
-        panel.allowedContentTypes = []
-        panel.allowsOtherFileTypes = true
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = true
-        if panel.runModal() == .OK { state.add(urls: panel.urls) }
-    }
+    private func chooseFiles() { state.chooseFiles() }
 
     private func color(for itemState: ItemState) -> Color {
         switch itemState { case .done: .green; case .failed: .red; default: .secondary }
