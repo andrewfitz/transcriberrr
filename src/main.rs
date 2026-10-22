@@ -986,12 +986,16 @@ const DIGITAL_SILENCE_DB: f32 = -85.0;
 const SHORTEST_JUDGED_WINDOWS: usize = 10;
 /// Clicks and bumps span 1-2 non-silent windows; the shortest words 4 or more.
 const SHORTEST_SPEECH_WINDOWS: usize = 3;
+/// A chunk with this many 100 ms windows (0.5 s) raised this far over its background has
+/// speech in it, even when the overall spread is small (speech in white noise).
+const RAISED_SPEECH_WINDOWS: usize = 5;
+const RAISED_ABOVE_BACKGROUND_DB: f32 = 3.0;
 
 /// Loudest 100 ms window and its spread over the 10th-percentile window, in dB, measured on
 /// the non-silent part of the chunk only. Digital-silence windows (and the half-filled windows
 /// beside them) would otherwise set the "background" at -90 dB, so room tone in a muted or
 /// gated track looked like 40 dB of speech dynamics. None when under 3 usable windows remain.
-fn level_spread(samples: impl Iterator<Item = f32>) -> Option<(f32, f32)> {
+fn level_spread(samples: impl Iterator<Item = f32>) -> Option<LevelSpread> {
     let window = TARGET_SAMPLE_RATE as usize / 10;
     let samples = samples.collect::<Vec<_>>();
     let levels = samples
@@ -1024,14 +1028,33 @@ fn level_spread(samples: impl Iterator<Item = f32>) -> Option<(f32, f32)> {
     // Under ~1 s of audio (a lone "No." in a muted meeting track) has too few interior windows,
     // so judge it with its edge windows, where words keep a large spread; likewise many tiny
     // blips between zeros.
-    let mut usable = if audible.len() < SHORTEST_JUDGED_WINDOWS || interior.len() < 3 {
-        audible
-    } else {
-        interior
-    };
+    let short = audible.len() < SHORTEST_JUDGED_WINDOWS || interior.len() < 3;
+    let mut usable = if short { audible } else { interior };
     usable.sort_unstable_by(f32::total_cmp);
     let loudest = usable[usable.len() - 1];
-    Some((loudest, loudest - usable[usable.len() / 10]))
+    let background = usable[usable.len() / 10];
+    // Windows clearly above the background. Not counted for short audio, where half-filled
+    // edge windows would make any noise island look raised.
+    let raised = if short {
+        0
+    } else {
+        usable
+            .iter()
+            .filter(|&&level| level >= background + RAISED_ABOVE_BACKGROUND_DB)
+            .count()
+    };
+    Some(LevelSpread {
+        loudest,
+        spread: loudest - background,
+        raised,
+    })
+}
+
+struct LevelSpread {
+    loudest: f32,
+    spread: f32,
+    /// Windows at least RAISED_ABOVE_BACKGROUND_DB over the 10th-percentile window.
+    raised: usize,
 }
 
 /// Whether a chunk has no speech: near-silent, or steady noise with no level variation.
@@ -1050,17 +1073,24 @@ fn is_speechless(samples: &[f32]) -> bool {
             previous_output
         })
         .collect::<Vec<_>>();
-    let Some((loudest, spread)) = level_spread(filtered.iter().copied()) else {
+    let Some(LevelSpread {
+        loudest,
+        spread,
+        raised,
+    }) = level_spread(filtered.iter().copied())
+    else {
         return true;
     };
     if loudest <= SILENCE_FLOOR_DB {
         return true;
     }
-    if spread >= SPEECH_SPREAD_DB {
+    // Steady noise never has half a second of windows 3 dB over its own background; speech in
+    // near-white noise at 0 dB SNR (where neither spread test fires) had 10-19.
+    if spread >= SPEECH_SPREAD_DB || raised >= RAISED_SPEECH_WINDOWS {
         return false;
     }
     let emphasized = filtered.windows(2).map(|pair| pair[1] - 0.97 * pair[0]);
-    level_spread(emphasized).is_none_or(|(_, spread)| spread < EMPHASIZED_SPREAD_DB)
+    level_spread(emphasized).is_none_or(|level| level.spread < EMPHASIZED_SPREAD_DB)
 }
 
 /// Split audio into chunks of at most `chunk_samples`, cutting each chunk at the quietest
@@ -2206,6 +2236,8 @@ mod tests {
         assert!(is_speechless(&vec![0.0; rate * 10]));
         // A quiet talker (~-60 dBFS) stays speech even if the file has a loud jingle elsewhere.
         assert!(!is_speechless(&speech_like(0.001, 0.0)));
+        // Speech in white noise at roughly 0 dB SNR is still speech.
+        assert!(!is_speechless(&speech_like(0.1, 0.07)));
         // Speech over a steady noise floor is still speech.
         assert!(!is_speechless(&speech_like(0.1, 0.02)));
     }

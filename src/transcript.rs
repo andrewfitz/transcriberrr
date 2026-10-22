@@ -244,7 +244,7 @@ pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
 /// past the end of the audio.
 pub(crate) fn normalize_word_timing(words: &mut [Word], duration: f32) {
     /// Longest plausible duration of one aligned word.
-    const MAX_WORD_SECONDS: f32 = 2.0;
+    const MAX_WORD_SECONDS: f32 = 1.2;
     let duration = if duration.is_finite() {
         duration.max(0.0)
     } else {
@@ -514,7 +514,7 @@ mod tests {
         words[1].start = 45.3;
         words[1].end = 45.7;
         normalize_word_timing(&mut words, 60.0);
-        assert_eq!((words[0].start, words[0].end), (43.22, 45.22));
+        assert!((words[0].start - 44.02).abs() < 1e-3 && words[0].end == 45.22);
         assert!(words[1].start >= words[0].start);
     }
 
