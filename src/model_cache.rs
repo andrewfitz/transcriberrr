@@ -181,12 +181,18 @@ impl ModelCache {
         // Download every repository file.  Model indexes reference shard names, tokenizer files
         // are loaded separately, and optional config files vary between engines. Skip README,
         // image, and metadata assets so a fresh install downloads only inference inputs.
-        for sibling in info.siblings {
-            if !is_model_asset(&sibling.rfilename) {
-                continue;
+        // Twice: hf-hub looks files up in the snapshot `refs/main` names and moves that ref to
+        // the newest commit on the first file it downloads. Resuming after the repository got a
+        // new commit left the files found before then in the old snapshot, and the new one
+        // incomplete; the second pass fills it (and only looks files up otherwise).
+        for _ in 0..2 {
+            for sibling in &info.siblings {
+                if !is_model_asset(&sibling.rfilename) {
+                    continue;
+                }
+                self.get_file(&repo, &id_or_path, &sibling.rfilename)
+                    .with_context(|| format!("downloading {id_or_path}/{}", sibling.rfilename))?;
             }
-            self.get_file(&repo, &id_or_path, &sibling.rfilename)
-                .with_context(|| format!("downloading {id_or_path}/{}", sibling.rfilename))?;
         }
         // Another process downloading the same repository may have removed it already.
         if let Err(error) = fs::remove_file(&incomplete)

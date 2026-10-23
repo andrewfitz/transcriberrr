@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 
 - `src/main.rs` contains the Rust CLI: job collection, audio decoding/resampling, chunking, Qwen3 inference, alignment, diarization, and progress reporting.
-- `src/transcript.rs` holds the transcript schema, validation, and TXT/JSON/SRT/VTT writers; `src/model_cache.rs` resolves, downloads, and repairs Hugging Face models; `src/audio_convert.rs` holds the Core Audio and WebM→Ogg Opus fallbacks; `src/parakeet_engine.rs` wraps Parakeet (feature `parakeet`); `src/vad.rs` runs Silero VAD to skip Qwen3 chunks without speech.
+- `src/transcript.rs` holds the transcript schema, validation, and TXT/JSON/SRT/VTT writers; `src/model_cache.rs` resolves, downloads, and repairs Hugging Face models; `src/audio_convert.rs` holds the Core Audio and WebM→Ogg Opus fallbacks; `src/parakeet_engine.rs` wraps Parakeet (feature `parakeet`); `src/vad.rs` runs Silero VAD to skip Qwen3 chunks without speech; `src/merge.rs` merges per-speaker track transcripts and names speakers from track file names; `src/bleed.rs` mutes other speakers' bleed in a session's tracks before transcription.
 - `ui/Sources/TranscriberrrUI/main.swift` contains the SwiftUI drag-and-drop macOS front end; `ui/Sources/TranscriberrrNative/main.swift` is the Apple SpeechTranscriber helper the CLI runs for `--engine apple-native`; `ui/Package.swift` defines both.
 - `scripts/build-macos-app.sh` assembles and signs `dist/Transcriberrr.app` (CLI and helper in `Contents/Helpers`); `scripts/build-release-dmg.sh` builds the DMG and optionally notarizes it.
 - `tests/` holds Rust integration tests; add tests there as behavior grows. Do not commit `target/`, `ui/.build/`, model weights, recordings, or `dist/` artifacts.

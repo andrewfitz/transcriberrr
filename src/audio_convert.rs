@@ -47,15 +47,20 @@ impl Drop for TempPath {
 /// Remove temporary files left by CLI processes that were force-killed (SIGKILL skips `Drop`).
 /// Names carry the owning PID; files whose process no longer exists are stale.
 pub(crate) fn remove_stale_temp_files() {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+    remove_stale_files(&std::env::temp_dir(), "transcriberrr-", '-');
+}
+
+/// Remove the files in `folder` named `{prefix}{pid}{separator}…` whose process is gone.
+pub(crate) fn remove_stale_files(folder: &Path, prefix: &str, separator: char) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(pid) = name
             .to_str()
-            .and_then(|name| name.strip_prefix("transcriberrr-"))
-            .and_then(|rest| rest.split('-').next())
+            .and_then(|name| name.strip_prefix(prefix))
+            .and_then(|rest| rest.split(separator).next())
             .and_then(|pid| pid.parse::<libc::pid_t>().ok())
         else {
             continue;
@@ -154,6 +159,16 @@ fn remux_opus_to_ogg(input: &Path) -> Result<Option<TempPath>> {
             Err(symphonia::core::errors::Error::IoError(error))
                 if error.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
+                break;
+            }
+            // A truncated recording (a browser upload cut short) ends in a damaged element;
+            // keep what came before it.
+            Err(error) if pending.is_some() => {
+                eprintln!(
+                    "warning: {}: stopped reading at {:.1} s: {error}",
+                    input.display(),
+                    granule as f64 / 48_000.0
+                );
                 break;
             }
             Err(error) => return Err(error.into()),

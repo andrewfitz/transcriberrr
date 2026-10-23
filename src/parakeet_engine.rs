@@ -130,6 +130,17 @@ impl ParakeetEngine {
         let mut text_parts = Vec::with_capacity(chunks.len());
         let mut words = Vec::new();
         for (index, range) in chunks.iter().enumerate() {
+            let progress = 0.2 + 0.52 * (index + 1) as f32 / total as f32;
+            // Exact silence: Zoom pads a participant's track before they join and after they
+            // leave, and bleed muting zeroes long stretches of a listener's track. Qwen's
+            // voice detector skips such chunks; Parakeet would decode 120 s of nothing.
+            if samples[range.clone()].iter().all(|&sample| sample == 0.0) {
+                report(
+                    progress,
+                    &format!("Skipping silent chunk {}/{}", index + 1, total),
+                )?;
+                continue;
+            }
             let mut result = self.transcribe(&samples[range.clone()], timestamps)?;
             let offset = range.start as f32 / 16_000.0;
             for word in &mut result.words {
@@ -140,7 +151,6 @@ impl ParakeetEngine {
                 text_parts.push(result.text);
             }
             words.extend(result.words);
-            let progress = 0.2 + 0.52 * (index + 1) as f32 / total as f32;
             report(
                 progress,
                 &format!("Transcribing chunk {}/{}", index + 1, total),
