@@ -34,7 +34,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(
-            path.join("holly.json"),
+            path.join("hana.json"),
             track(
                 "audioHana31067067067",
                 r#"{"start":0.6,"end":1.2,"words":[{"text":"Yeah.","start":0.6,"end":1.2}]}"#,
@@ -73,7 +73,7 @@ fn merges_zoom_tracks_into_named_speaker_text() {
     let f = Fixture::new();
     let output = f.run(&[
         "andrew.json",
-        "holly.json",
+        "hana.json",
         "--format",
         "txt",
         "--timestamps",
@@ -97,7 +97,7 @@ fn word_timestamps_interleave_like_a_diarized_transcript() {
     let f = Fixture::new();
     success(&f.run(&[
         "andrew.json",
-        "holly.json",
+        "hana.json",
         "--format",
         "srt",
         "-o",
@@ -117,7 +117,7 @@ fn merged_json_keeps_words_and_names_and_converts() {
     let f = Fixture::new();
     success(&f.run(&[
         "andrew.json",
-        "holly.json",
+        "hana.json",
         "--name",
         "Andrew",
         "-o",
@@ -157,11 +157,11 @@ fn one_track_or_a_folder_finds_the_rest_of_the_session() {
     // Another meeting's track in the same folder must be left out.
     fs::write(
         f.0.join("other.json"),
-        f.read("holly.json")
+        f.read("hana.json")
             .replace("audioHana31067067067", "audioSam12062062062"),
     )
     .unwrap();
-    let output = f.run(&["holly.json", "-o", "talk.json"]);
+    let output = f.run(&["hana.json", "-o", "talk.json"]);
     success(&output);
     let doc: serde_json::Value = serde_json::from_str(&f.read("talk.json")).unwrap();
     assert_eq!(
@@ -192,8 +192,8 @@ fn one_track_or_a_folder_finds_the_rest_of_the_session() {
 #[test]
 fn refuses_existing_output() {
     let f = Fixture::new();
-    success(&f.run(&["andrew.json", "holly.json", "-o", "talk.json"]));
-    let again = f.run(&["andrew.json", "holly.json", "-o", "talk.json"]);
+    success(&f.run(&["andrew.json", "hana.json", "-o", "talk.json"]));
+    let again = f.run(&["andrew.json", "hana.json", "-o", "talk.json"]);
     assert!(!again.status.success());
     assert!(String::from_utf8_lossy(&again.stderr).contains("--overwrite"));
 }
