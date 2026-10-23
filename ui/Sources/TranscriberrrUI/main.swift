@@ -40,17 +40,25 @@ final class AudioItem: ObservableObject, Identifiable {
     @Published var diarize = false
     /// Nil asks the diarizer to infer speakers. When set, it is passed per item.
     @Published var speakerCount: Int?
+    /// One speaker's track of a multi-track recording (a Zoom participant file, say): its
+    /// session's tracks are transcribed together with bleed muted, then merged.
+    @Published var isoTrack = false
+    /// The speaker the CLI named this track after.
+    @Published var speakerName: String?
+    /// The session the CLI grouped this track into.
+    @Published var sessionLabel: String?
     @Published var outputURL: URL?
     @Published var resultSummary = ""
     @Published var elapsedSeconds: TimeInterval = 0
     @Published var estimatedRemainingSeconds: TimeInterval?
 
-    init(url: URL, id: UUID = UUID(), duration: TimeInterval = 0, diarize: Bool = false, speakerCount: Int? = nil) {
+    init(url: URL, id: UUID = UUID(), duration: TimeInterval = 0, diarize: Bool = false, speakerCount: Int? = nil, isoTrack: Bool = false) {
         self.id = id
         self.url = url
         self.duration = duration
-        self.diarize = diarize
-        self.speakerCount = speakerCount
+        self.diarize = diarize && !isoTrack
+        self.speakerCount = diarize && !isoTrack ? speakerCount : nil
+        self.isoTrack = isoTrack
     }
 }
 
@@ -107,6 +115,19 @@ private struct SavedItem: Codable {
     var speakerCount: Int?
     var outputPath: String?
     var resultSummary: String
+    /// Optional so queue files from older versions still decode.
+    var isoTrack: Bool?
+    var speakerName: String?
+    var sessionLabel: String?
+}
+
+/// A session's merged transcript, reported by the CLI.
+struct MergedSession: Codable, Identifiable, Equatable {
+    /// The merged transcript's path.
+    var id: String
+    var label: String
+    var state: String
+    var message: String
 }
 
 private struct SavedQueue: Codable {
@@ -122,6 +143,7 @@ private struct SavedQueue: Codable {
     var engine: String?
     /// Optional so queue files from older versions still decode.
     var speakerTurns: Bool?
+    var mergedSessions: [MergedSession]?
 }
 
 /// The Rust CLI manifest is intentionally small and stable.  Keeping a typed
@@ -134,6 +156,7 @@ private struct ManifestItem: Codable {
     var output: String?
     var outputDir: String
     var outputLocation: String
+    var isoTrack: Bool
 
     enum CodingKeys: String, CodingKey {
         case input
@@ -142,6 +165,7 @@ private struct ManifestItem: Codable {
         case output
         case outputDir = "output_dir"
         case outputLocation = "output_location"
+        case isoTrack = "iso_track"
     }
 }
 
@@ -159,9 +183,14 @@ private struct ProgressEvent: Decodable {
     var elapsedSeconds: TimeInterval?
     /// Set on a finished track that needs a look, e.g. an empty transcript.
     var warning: String?
+    /// Speaker tracks: the session and the speaker the CLI named.
+    var group: String?
+    var speaker: String?
+    /// `merge` for a session's merged transcript; `input` is its path.
+    var kind: String?
 
     enum CodingKeys: String, CodingKey {
-        case input, status, output, error, progress, phase, warning
+        case input, status, output, error, progress, phase, warning, group, speaker, kind
         case elapsedSeconds = "elapsed_seconds"
     }
 }
@@ -229,34 +258,42 @@ private final class PipeCollector: @unchecked Sendable {
     init(onData: (@Sendable (Data) -> Void)? = nil) {
         self.onData = onData
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            // Read under the lock, so `finish`'s read cannot overtake a chunk read here and
+            // append the end of the output before it.
+            guard let self else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
             let chunk = handle.availableData
             // Empty data means EOF; without clearing, the handler is re-invoked in a busy loop.
             if chunk.isEmpty {
                 handle.readabilityHandler = nil
                 return
             }
-            self?.append(chunk)
+            self.append(chunk)
             onData?(chunk)
         }
     }
 
+    /// With the lock held.
     private func append(_ chunk: Data) {
-        lock.lock()
         data.append(chunk)
         if data.count > limit { data.removeFirst(data.count - limit) }
-        lock.unlock()
     }
 
-    /// Call from the termination handler: stops the reader and collects anything left.
+    /// Call from the termination handler (or after a failed launch): stops the reader and
+    /// collects anything left.
     func finish() -> String {
         pipe.fileHandleForReading.readabilityHandler = nil
+        // A process that never started leaves this the only write end, and reading to EOF
+        // would wait forever; after a launch, closing this copy changes nothing.
+        try? pipe.fileHandleForWriting.close()
+        lock.lock()
+        defer { lock.unlock() }
         let rest = pipe.fileHandleForReading.readDataToEndOfFile()
         if !rest.isEmpty {
             append(rest)
             onData?(rest)
         }
-        lock.lock()
-        defer { lock.unlock() }
         return String(decoding: data, as: UTF8.self)
     }
 }
@@ -300,6 +337,7 @@ final class AppState: ObservableObject {
     @Published var modelActivityCanDismiss = false
     @Published var modelActivitySucceeded = false
     @Published var isCancelling = false
+    @Published var mergedSessions: [MergedSession] = []
 
     // Keep in sync with AUDIO_EXTENSIONS in src/main.rs.
     private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "m4v", "mov", "mp3", "mp4", "ogg", "opus", "wav", "webm"]
@@ -425,10 +463,26 @@ final class AppState: ObservableObject {
     }
 
     func add(urls: [URL]) {
+        // Walking a large or network folder takes a while; keep the window responsive.
+        let extensions = supportedExtensions
+        Task.detached(priority: .userInitiated) {
+            let discovered = Self.audioFiles(in: urls, extensions: extensions)
+            await MainActor.run { self.add(discovered: discovered) }
+        }
+    }
+
+    /// The audio files among `urls` and in the folders among them. Not inside packages: a
+    /// Photos, iMovie or Logic library dropped with ~/Pictures or ~/Movies holds media too.
+    nonisolated private static func audioFiles(in urls: [URL], extensions: Set<String>) -> [URL] {
+        let isSupported = { (url: URL) in extensions.contains(url.pathExtension.lowercased()) }
         var discovered: [URL] = []
         for url in urls {
-            if isDirectory(url) {
-                if let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
+            let isDirectory = url.hasDirectoryPath
+                || (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            if isDirectory {
+                if let enumerator = FileManager.default.enumerator(
+                    at: url, includingPropertiesForKeys: [.isRegularFileKey],
+                    options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
                     for case let child as URL in enumerator where isSupported(child) {
                         discovered.append(child)
                     }
@@ -437,13 +491,19 @@ final class AppState: ObservableObject {
                 discovered.append(url)
             }
         }
+        return discovered
+    }
+
+    private func add(discovered: [URL]) {
         // Keep one queue entry per path, including when a dropped folder contains
         // the same file as another dropped folder or an existing queue item.
         var known = Set(items.map { $0.url.standardizedFileURL })
         let newURLs = discovered
             .filter { known.insert($0.standardizedFileURL).inserted }
             .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-        items.append(contentsOf: newURLs.map { AudioItem(url: $0, diarize: diarize) })
+        items.append(contentsOf: newURLs.map {
+            AudioItem(url: $0, diarize: diarize, isoTrack: isZoomParticipantTrack($0))
+        })
         saveQueue()
         loadDurations(for: newURLs)
     }
@@ -455,6 +515,7 @@ final class AppState: ObservableObject {
 
     func clearCompleted() {
         items.removeAll { if case .done = $0.state { return true }; return false }
+        mergedSessions.removeAll { $0.state == "done" }
         saveQueue()
     }
 
@@ -466,9 +527,66 @@ final class AppState: ObservableObject {
 
     func setDiarization(for item: AudioItem, enabled: Bool) {
         item.diarize = enabled
+        if enabled { item.isoTrack = false }
         if !enabled { item.speakerCount = nil }
         objectWillChange.send()
         saveQueue()
+    }
+
+    /// A speaker track holds one speaker, so it is never diarized.
+    func setIsoTrack(for item: AudioItem, enabled: Bool) {
+        item.isoTrack = enabled
+        if enabled {
+            item.diarize = false
+            item.speakerCount = nil
+        }
+        objectWillChange.send()
+        saveQueue()
+    }
+
+    /// Marks the visible rows as speaker tracks, or unmarks them if all already are.
+    func toggleIsoTracks(_ visibleItems: [AudioItem]) {
+        let enable = !visibleItems.allSatisfy(\.isoTrack)
+        for item in visibleItems {
+            item.isoTrack = enable
+            if enable {
+                item.diarize = false
+                item.speakerCount = nil
+            }
+        }
+        objectWillChange.send()
+        saveQueue()
+    }
+
+    func revealMerged(_ session: MergedSession) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: session.id)])
+    }
+
+    /// Zoom's "separate audio file for each participant" names, e.g.
+    /// `audioAndrewDaniel21076959768.m4a`. Keep in sync with parse_track_name in src/merge.rs.
+    /// The speaker-track session a row belongs to, as the CLI groups them: the meeting folder
+    /// (Zoom's `Audio Record` folder stands for its parent) and Zoom's 9-digit meeting ID. Also
+    /// for Zoom's mixed recording, which a meeting with one participant's track merges.
+    private func sessionKey(_ item: AudioItem) -> String? {
+        let stem = item.url.deletingPathExtension().lastPathComponent
+        let mixed = [#"^audio\d{9,10}$"#, #"^audio_only\d*$"#]
+            .contains { stem.range(of: $0, options: .regularExpression) != nil }
+        guard item.isoTrack || mixed else { return nil }
+        var folder = item.url.deletingLastPathComponent()
+        if folder.lastPathComponent.caseInsensitiveCompare("Audio Record") == .orderedSame {
+            folder = folder.deletingLastPathComponent()
+        }
+        let meeting = stem.range(of: #"\d{9}$"#, options: .regularExpression).map { String(stem[$0]) }
+        return canonicalPath(folder.path) + "|" + (meeting ?? "")
+    }
+
+    private func isZoomParticipantTrack(_ url: URL) -> Bool {
+        let stem = url.deletingPathExtension().lastPathComponent
+        // Name, then a 1–2 digit part number, the segment digit and the 9-digit meeting ID.
+        // As the CLI's parse_track_name: letters, accents and `'’-` (`_.` too after `audio_`).
+        return [#"^audio\p{L}[\p{L}\p{M}'’-]*\d{10,12}$"#, #"^audio_\p{L}[\p{L}\p{M}_.'’-]*\d{10,12}$"#,
+                #"^audio_only_\d+_.+$"#]
+            .contains { stem.range(of: $0, options: .regularExpression) != nil }
     }
 
     func setSpeakerCount(for item: AudioItem, _ value: Int?) {
@@ -555,10 +673,12 @@ final class AppState: ObservableObject {
         modelActivityMessage = "Stopping safely and cleaning temporary queue files…"
         guard let process = activeProcess else { return }
         // SIGTERM lets the CLI stop at the next chunk, stop its helper, and remove temp
-        // files. Model loading has no checkpoints, so force-stop if it takes too long.
+        // files; before its first job (model loading) it exits at once. A long step without a
+        // checkpoint (decoding hours of audio, diarizing) can take a while, and killing it
+        // then orphans the helper, so force-stop only a CLI that seems stuck.
         process.terminate()
         Task { @MainActor in
-            try? await Task.sleep(for: .seconds(20))
+            try? await Task.sleep(for: .seconds(120))
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         }
     }
@@ -595,7 +715,20 @@ final class AppState: ObservableObject {
                 item.state = .failed("File not found")
                 item.resultSummary = "File not found: \(item.url.path)"
             }
-            let pending = items.filter { $0.selected && $0.state != .done && !missing.contains($0.id) }
+            var pending = items.filter { $0.selected && $0.state != .done && !missing.contains($0.id) }
+            // The CLI merges only tracks transcribed in the same run, so a session with a track
+            // still to do runs whole again, with its mixed recording; otherwise its merge would
+            // lack the finished speakers, or with one track left not happen at all.
+            let sessions = Set(pending.filter(\.isoTrack).compactMap(sessionKey))
+            if !sessions.isEmpty {
+                let ids = Set(pending.map(\.id))
+                pending += items.filter {
+                    $0.selected && !ids.contains($0.id) && !missing.contains($0.id)
+                        && sessionKey($0).map(sessions.contains) == true
+                }
+                let order = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($1.id, $0) })
+                pending.sort { order[$0.id, default: 0] < order[$1.id, default: 0] }
+            }
             runItemIDs = Set(pending.map(\.id))
             guard !pending.isEmpty else {
                 finishQueueClock()
@@ -715,8 +848,10 @@ final class AppState: ObservableObject {
         append(effectiveModelID)
         let diarizing = pending.contains(where: { $0.diarize || $0.speakerCount != nil })
         // The CLI loads the aligner for diarization too: speakers attach to word timings.
-        // Subtitles always get sentence timing (main.rs), which needs the aligner too.
-        if engine == "qwen" && (timestamps != "none" || diarizing || format == "srt" || format == "vtt") {
+        // Subtitles always get sentence timing (main.rs), which needs the aligner too, and
+        // merging speaker tracks needs every track's word timings.
+        let merging = pending.contains(where: \.isoTrack)
+        if engine == "qwen" && (timestamps != "none" || diarizing || merging || format == "srt" || format == "vtt") {
             append("Qwen/Qwen3-ForcedAligner-0.6B")
         }
         if diarizing {
@@ -843,6 +978,8 @@ final class AppState: ObservableObject {
     /// share this, so a track is marked done as soon as the CLI finishes it and
     /// stays done if the rest of the run is canceled or the app quits.
     private func apply(_ event: ProgressEvent, to item: AudioItem) {
+        if let speaker = event.speaker { item.speakerName = speaker }
+        if let group = event.group { item.sessionLabel = group }
         switch event.status {
         case "running":
             item.state = .processing
@@ -863,7 +1000,8 @@ final class AppState: ObservableObject {
             item.outputURL = output
             item.resultSummary = output.map { "Saved to \($0.path)" } ?? "Transcription complete"
             if let warning = event.warning {
-                item.resultSummary = "\(warning). \(item.resultSummary)"
+                // A file the CLI planned out (a meeting's video, say) has no output of its own.
+                item.resultSummary = output == nil ? warning : "\(warning). \(item.resultSummary)"
             }
         case "canceled":
             item.estimatedRemainingSeconds = nil
@@ -883,8 +1021,46 @@ final class AppState: ObservableObject {
 
     private static let finalStatuses: Set<String> = ["completed", "skipped", "failed", "canceled"]
 
+    /// Shows a session's merged transcript from its CLI event.
+    private func applyMerge(_ event: ProgressEvent) {
+        let path = event.output ?? event.input
+        let state = switch event.status {
+        case "completed", "skipped": "done"
+        case "failed": "failed"
+        case "canceled": "canceled"
+        default: "running"
+        }
+        let message = switch state {
+        case "done": event.warning.map { "Merged with warnings: \($0)" } ?? "Merged"
+        case "failed": event.error ?? "Merge failed"
+        case "canceled": "Canceled"
+        default: event.phase ?? "Waiting for its tracks…"
+        }
+        let session = MergedSession(id: path, label: event.group ?? URL(fileURLWithPath: path).lastPathComponent,
+                                    state: state, message: message)
+        if let index = mergedSessions.firstIndex(where: { $0.id == path }) {
+            if mergedSessions[index] != session { mergedSessions[index] = session }
+        } else {
+            mergedSessions.append(session)
+        }
+    }
+
+    private func applyMerges(_ events: [String: ProgressEvent]) {
+        for event in events.values where event.kind == "merge" { applyMerge(event) }
+    }
+
+    /// A canceled or interrupted run leaves no session merging.
+    private func stopRunningMerges() {
+        for index in mergedSessions.indices where mergedSessions[index].state == "running" {
+            mergedSessions[index].state = "canceled"
+            mergedSessions[index].message = "Canceled"
+        }
+    }
+
     /// Applies only finished-track events; used when a run is canceled.
     private func applyFinished(_ result: BulkResult, to items: [AudioItem]) {
+        applyMerges(result.progress)
+        stopRunningMerges()
         for item in items {
             if let event = result.progress[progressKey(item.url.path)], Self.finalStatuses.contains(event.status) {
                 apply(event, to: item)
@@ -893,12 +1069,17 @@ final class AppState: ObservableObject {
     }
 
     private func applyBulk(_ result: BulkResult, to items: [AudioItem]) {
+        applyMerges(result.progress)
+        stopRunningMerges()
         // stderr holds a line per finished track; the last line is the run's error.
         let fallback = result.message.split(whereSeparator: \.isNewline).last
             .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
         // The CLI was stopped from outside the app (Activity Monitor, `kill`): tracks it never
         // reached were canceled, not failed.
+        // Before its first job, the CLI answers SIGTERM/SIGINT by exiting 143/130 at once,
+        // with no event written.
         let canceled = result.progress.values.contains { $0.status == "canceled" }
+            || result.status == 143 || result.status == 130
         for item in items {
             let event = result.progress[progressKey(item.url.path)]
             if let event, Self.finalStatuses.contains(event.status) {
@@ -993,7 +1174,8 @@ final class AppState: ObservableObject {
                 outputs[item.id] = output
                 return ManifestItem(input: item.url.standardizedFileURL.path, diarize: item.diarize,
                                     speakers: item.speakerCount, output: output.path,
-                                    outputDir: destination.path, outputLocation: location)
+                                    outputDir: destination.path, outputLocation: location,
+                                    isoTrack: item.isoTrack)
             }
             let manifest = JobManifest(items: manifestItems)
             let data = try JSONEncoder().encode(manifest)
@@ -1037,6 +1219,7 @@ final class AppState: ObservableObject {
                         self.apply(event, to: item)
                         finished = finished || (!wasDone && item.state == .done)
                     }
+                    self.applyMerges(events)
                     self.objectWillChange.send()
                     // Persist finished rows now: after a crash or force quit they would
                     // otherwise reload as queued and be transcribed again as `name-2`.
@@ -1094,6 +1277,12 @@ final class AppState: ObservableObject {
         modelID = saved.modelID
         engine = saved.engine ?? "qwen"
         speakerTurns = saved.speakerTurns ?? false
+        mergedSessions = (saved.mergedSessions ?? []).map { session in
+            var session = session
+            // The app quit mid-merge.
+            if session.state == "running" { session.state = "canceled"; session.message = "Canceled" }
+            return session
+        }
         let savedDiarizationPath = saved.diarizationModel
         let isLegacySortformerAlias = savedDiarizationPath == "sortformer"
             || savedDiarizationPath == "/sortformer"
@@ -1122,7 +1311,10 @@ final class AppState: ObservableObject {
             // them here would erase them from queue.json on the next save. transcribe()
             // checks each file when a run starts.
             let item = AudioItem(url: url, id: value.id, duration: value.duration, diarize: value.diarize,
-                                 speakerCount: value.diarize ? value.speakerCount : nil)
+                                 speakerCount: value.diarize ? value.speakerCount : nil,
+                                 isoTrack: value.isoTrack ?? false)
+            item.speakerName = value.speakerName
+            item.sessionLabel = value.sessionLabel
             item.state = value.state == "done" ? .done : value.state == "processing" ? .queued : value.state == "canceled" ? .canceled : value.state == "failed" ? .failed(value.error ?? "Transcription failed") : .queued
             item.progress = value.progress
             item.selected = value.selected
@@ -1154,7 +1346,7 @@ final class AppState: ObservableObject {
         let saved = SavedQueue(
             items: items.map { item in
                 let error: String? = if case .failed(let message) = item.state { message } else { nil }
-                return SavedItem(id: item.id, path: item.url.path, duration: item.duration, state: item.state.stateName, error: error, progress: item.progress, selected: item.selected, diarize: item.diarize, speakerCount: item.speakerCount, outputPath: item.outputURL?.path, resultSummary: item.resultSummary)
+                return SavedItem(id: item.id, path: item.url.path, duration: item.duration, state: item.state.stateName, error: error, progress: item.progress, selected: item.selected, diarize: item.diarize, speakerCount: item.speakerCount, outputPath: item.outputURL?.path, resultSummary: item.resultSummary, isoTrack: item.isoTrack, speakerName: item.speakerName, sessionLabel: item.sessionLabel)
             },
             outputFolder: outputFolder.path,
             outputDestination: outputDestination.rawValue,
@@ -1165,7 +1357,8 @@ final class AppState: ObservableObject {
             timestamps: timestamps,
             diarizeByDefault: diarize,
             engine: engine,
-            speakerTurns: speakerTurns
+            speakerTurns: speakerTurns,
+            mergedSessions: mergedSessions
         )
         guard let data = try? JSONEncoder().encode(saved) else { return }
         try? FileManager.default.createDirectory(at: queueFile.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1387,9 +1580,13 @@ struct ContentView: View {
                 Button("Check none") { state.selectAll(visibleItems, selected: false) }
                     .buttonStyle(.borderless)
                     .disabled(state.isRunning)
+                Button("Speaker tracks") { state.toggleIsoTracks(visibleItems) }
+                    .buttonStyle(.borderless)
+                    .disabled(state.isRunning || visibleItems.isEmpty)
+                    .help("Mark the visible files as one speaker's track each (or unmark them). Tracks of one session are merged.")
                 Button("Clear completed") { state.clearCompleted() }
                     .buttonStyle(.borderless)
-                .disabled(state.completedItemCount == 0 || state.isRunning)
+                .disabled((state.completedItemCount == 0 && !state.mergedSessions.contains { $0.state == "done" }) || state.isRunning)
             }
             .padding(.horizontal, 20)
             .padding(.top, 18)
@@ -1399,6 +1596,10 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(visibleItems) { item in queueRow(item) }
+                    if !state.mergedSessions.isEmpty {
+                        Text("Merged transcripts").font(.headline).padding(.top, 14).padding(.bottom, 4)
+                        ForEach(state.mergedSessions) { session in mergedRow(session) }
+                    }
                 }
                 .padding(.horizontal, 20)
             }
@@ -1447,7 +1648,7 @@ struct ContentView: View {
                     .accessibilityLabel("Include \(item.url.lastPathComponent) in transcription")
                     .accessibilityValue(item.selected ? "On" : "Off")
                     .disabled(state.isRunning)
-                Image(systemName: item.diarize ? "person.2.wave.2" : "waveform")
+                Image(systemName: item.diarize ? "person.2.wave.2" : item.isoTrack ? "person.wave.2" : "waveform")
                     .foregroundStyle(.tint).frame(width: 22)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.url.lastPathComponent).lineLimit(1)
@@ -1514,7 +1715,55 @@ struct ContentView: View {
                     .pickerStyle(.menu).font(.caption).frame(width: 140)
                     .disabled(state.isRunning)
                 }
+                Button {
+                    state.setIsoTrack(for: item, enabled: !item.isoTrack)
+                } label: {
+                    Label("Speaker track", systemImage: item.isoTrack ? "checkmark.square.fill" : "square")
+                }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .foregroundStyle(item.isoTrack ? .primary : .secondary)
+                    .accessibilityLabel("One speaker's track, merged with its session")
+                    .accessibilityValue(item.isoTrack ? "On" : "Off")
+                    .help("This file holds one speaker. Tracks from one Zoom session or folder are transcribed together with the other speakers' bleed muted, then merged.")
+                    .disabled(state.isRunning)
+                if item.isoTrack, let speaker = item.speakerName {
+                    Text(item.sessionLabel.map { "\(speaker) • \($0)" } ?? speaker)
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
                 Spacer()
+            }
+            Divider()
+        }
+        .padding(.vertical, 7)
+    }
+
+    @ViewBuilder
+    private func mergedRow(_ session: MergedSession) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Image(systemName: "rectangle.stack.badge.person.crop").foregroundStyle(.tint).frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(session.label).lineLimit(1)
+                    if session.state == "done" {
+                        Button {
+                            state.revealMerged(session)
+                        } label: {
+                            Text(session.id).font(.caption2).lineLimit(1).truncationMode(.middle)
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.tint)
+                        .accessibilityLabel("Show merged transcript in Finder")
+                        .help("Reveal \(session.id) in Finder")
+                    }
+                    Text(session.message).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                }
+                Spacer(minLength: 8)
+                if session.state == "running" { ProgressView().controlSize(.small) }
+                Text(session.state == "done" ? "Merged" : session.state == "failed" ? "Failed" : session.state == "canceled" ? "Canceled" : "Merging")
+                    .font(.caption)
+                    .foregroundStyle(session.state == "done" ? .green : session.state == "failed" ? .red : .secondary)
+                    .frame(minWidth: 82, alignment: .trailing)
             }
             Divider()
         }
@@ -1656,6 +1905,11 @@ struct ContentView: View {
                 .keyboardShortcut(state.isRunning ? "." : .return, modifiers: .command)
                     .buttonStyle(.borderedProminent)
                     .disabled(state.items.isEmpty || state.isCancelling)
+            }
+            if state.selectedItems.contains(where: \.isoTrack) {
+                Text("Speaker tracks from one Zoom session or folder are transcribed together with the other speakers' bleed muted, then merged into one transcript per session, named after its folder.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             if state.timestamps != "none" {
                 Text(state.timestamps == "words"
