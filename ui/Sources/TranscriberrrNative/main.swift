@@ -90,7 +90,7 @@ private struct NativeDiarizationMetadata: Codable {
     let speakers: Int?
 }
 
-private let transcriberrrVersion = "0.1.0"
+private let transcriberrrVersion = "0.2.0"
 
 private enum OutputFormat: String {
     case txt, json, srt, vtt
