@@ -19,7 +19,7 @@ use parakeet_rs::sortformer::{DiarizationConfig, Sortformer};
 use qwen3_asr::forced_aligner::{ForcedAlignProcessor, Qwen3ForcedAligner};
 use qwen3_asr::{AudioInput, Batch, LoadOptions, Qwen3Asr, TranscribeOptions};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 #[cfg(feature = "parakeet")]
@@ -70,7 +71,7 @@ const QWEN_MAX_CHUNK_SECONDS: f32 = 180.0;
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
-    #[arg(value_name = "AUDIO", required_unless_present_any = ["input_dir", "manifest", "model_status", "download_model", "cached_model"])]
+    #[arg(value_name = "INPUT", required_unless_present_any = ["input_dir", "manifest", "model_status", "download_model", "cached_model"])]
     inputs: Vec<PathBuf>,
     #[arg(long, conflicts_with_all = ["inputs", "manifest"])]
     input_dir: Option<PathBuf>,
@@ -79,6 +80,12 @@ struct Cli {
     manifest: Option<PathBuf>,
     #[arg(long)]
     recursive: bool,
+    /// Print the planned inputs, Zoom meetings, and destinations as JSON without running models.
+    #[arg(long)]
+    plan: bool,
+    /// List inputs for the app before it assigns distinct output names.
+    #[arg(long, hide = true, requires = "plan")]
+    inventory_only: bool,
     /// Hugging Face model ID or local directory. Defaults to the newest 2026 1.7B model.
     #[arg(long, default_value = "Qwen/Qwen3-ASR-1.7B")]
     model: String,
@@ -136,8 +143,8 @@ struct Cli {
     /// Which inputs are per-speaker tracks: by default, Zoom's participant files
     /// (`Audio Record/audioAliceSmith21067067067.m4a`); with a bare `--iso-tracks`, every
     /// input; with `--iso-tracks=off`, none. Each session's tracks (one Zoom meeting, or one
-    /// folder) are transcribed together with other speakers' bleed muted, then merged into one
-    /// transcript beside the tracks' outputs; the meeting's mixed recording is then skipped.
+    /// folder) are transcribed together with other speakers' bleed muted. For Zoom, only the
+    /// merged transcript is written and it is reused on reruns unless --overwrite is supplied.
     #[arg(
         long,
         value_enum,
@@ -476,6 +483,8 @@ struct Job {
     parts: Vec<PathBuf>,
     /// One speaker's track of a multi-track session.
     iso: bool,
+    /// Zoom's mixed audio or video, used when participant tracks are unavailable.
+    zoom_recording: bool,
     diarize: bool,
     speakers: Option<usize>,
     output: Option<PathBuf>,
@@ -513,8 +522,12 @@ impl Unit {
     fn jobs(&self) -> Vec<&Job> {
         match self {
             Self::Single(job) => vec![job],
-            Self::Session(session) => session.jobs.iter().chain(&session.mixed).collect(),
+            Self::Session(session) => session.jobs.iter().collect(),
         }
+    }
+
+    fn writes_job_outputs(&self) -> bool {
+        !matches!(self, Self::Session(session) if session.zoom.is_some())
     }
 }
 
@@ -524,9 +537,6 @@ struct IsoSession {
     /// The Zoom meeting ID, when the tracks are Zoom participant files.
     zoom: Option<String>,
     jobs: Vec<Job>,
-    /// The meeting's mixed recording, when only one participant has tracks: it supplies the
-    /// words of everyone else.
-    mixed: Option<Job>,
     /// Each track's speaker, as the merge will name them.
     speakers: Vec<String>,
     /// The merged transcript.
@@ -540,10 +550,11 @@ struct Member<'a> {
     speaker: &'a str,
     /// Other speakers' bleed to mute; nothing for the mixed recording.
     gate: &'a bleed::Mask,
+    merged_only: bool,
 }
 
 struct Processed {
-    output: PathBuf,
+    output: Option<PathBuf>,
     warning: Option<String>,
     /// The word-level transcript, kept for a session's merge.
     words: Option<TranscriptDocument>,
@@ -552,9 +563,12 @@ struct Processed {
 #[derive(Debug, Deserialize)]
 struct JobManifest {
     items: Vec<ManifestItem>,
+    discover_zoom: Option<bool>,
+    #[serde(default)]
+    excluded_inputs: Vec<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct ManifestItem {
     input: PathBuf,
     #[serde(default)]
@@ -615,7 +629,7 @@ struct ProgressLog {
 }
 
 impl ProgressLog {
-    fn open(path: Option<&Path>, resume: bool) -> Result<Self> {
+    fn read(path: Option<&Path>, resume: bool) -> Result<Self> {
         let mut latest = HashMap::new();
         if resume {
             let path = path.context("--resume requires --progress-file")?;
@@ -644,7 +658,15 @@ impl ProgressLog {
                 }
             }
         }
-        let writer = path
+        Ok(Self {
+            writer: None,
+            latest,
+        })
+    }
+
+    fn open(path: Option<&Path>, resume: bool) -> Result<Self> {
+        let mut log = Self::read(path, resume)?;
+        log.writer = path
             .map(|path| {
                 if let Some(parent) = path
                     .parent()
@@ -673,7 +695,7 @@ impl ProgressLog {
                 Ok::<_, anyhow::Error>(BufWriter::new(file))
             })
             .transpose()?;
-        Ok(Self { writer, latest })
+        Ok(log)
     }
 
     fn is_completed(&self, input: &Path) -> bool {
@@ -747,6 +769,12 @@ fn main() -> Result<()> {
             .to_string_lossy()
             .into_owned();
     }
+    if cli.plan {
+        let (units, skips, rejected) = prepare_plan(&cli)?;
+        protect_progress_file(&cli, &units, &skips, &rejected)?;
+        println!("{}", queue_plan(&cli, &units, &skips, &rejected)?);
+        return Ok(());
+    }
     let model_cache = model_cache::ModelCache::new(cli.model_cache.clone())?;
     if !cli.cached_model.is_empty() {
         let report = cli
@@ -817,33 +845,22 @@ fn main() -> Result<()> {
             mode.display()
         );
     }
-    let mut rejected = Vec::new();
-    let mut jobs = collect_jobs(&cli, &mut rejected)?;
-    // Overlapping globs can name a file twice; it is transcribed once.
-    let mut seen = std::collections::HashSet::new();
-    jobs.retain(|job| seen.insert(input_key(&job.input)));
-    if jobs.is_empty() && rejected.is_empty() {
+    let (units, skips, rejected) = prepare_plan(&cli)?;
+    if units.is_empty() && rejected.is_empty() {
         bail!("no supported audio files were found");
     }
-    // A speaker track holds one speaker; the merge labels it, not Sortformer.
-    for job in &mut jobs {
-        if job.iso && (job.diarize || job.speakers.is_some()) {
-            eprintln!(
-                "note: not diarizing {}: it is a speaker track",
-                job.input.display()
-            );
-            job.diarize = false;
-            job.speakers = None;
-        }
-    }
-    // A clash between two files fails those files (and their sessions), not a whole library.
-    let (mut units, mut skips, unplanned) = plan_units(&cli, jobs)?;
-    rejected.extend(unplanned);
-    drop_clashes(&cli, &mut units, &mut rejected);
-    reject_uncovered(&mut skips, &mut rejected);
-    let jobs = units.iter().flat_map(Unit::jobs).collect::<Vec<_>>();
+    protect_progress_file(&cli, &units, &skips, &rejected)?;
+    let mut progress = ProgressLog::open(cli.progress_file.as_deref(), cli.resume)?;
+    let pending = units
+        .iter()
+        .filter(|unit| !unit_done(&cli, &progress, unit))
+        .collect::<Vec<_>>();
+    let jobs = pending
+        .iter()
+        .flat_map(|unit| unit.jobs())
+        .collect::<Vec<_>>();
     // Merging needs every track's word timings, whatever the requested output.
-    let wants_words = units.iter().any(|unit| matches!(unit, Unit::Session(_)));
+    let wants_words = pending.iter().any(|unit| matches!(unit, Unit::Session(_)));
     if jobs.iter().any(|job| job.diarize) && cli.diarization_model.is_none() {
         // The bundled-compatible Sortformer export; downloaded on first use like other models.
         cli.diarization_model = Some(PathBuf::from("sortformer"));
@@ -861,7 +878,7 @@ fn main() -> Result<()> {
         );
     }
     #[cfg(not(feature = "parakeet"))]
-    if matches!(cli.engine, EngineKind::ParakeetV3) {
+    if !pending.is_empty() && matches!(cli.engine, EngineKind::ParakeetV3) {
         bail!("Parakeet support is not included in this build; rebuild with --features parakeet");
     }
     let wants_diarization = jobs.iter().any(|job| job.diarize);
@@ -873,7 +890,6 @@ fn main() -> Result<()> {
     }
 
     fs::create_dir_all(&cli.output_dir)?;
-    let mut progress = ProgressLog::open(cli.progress_file.as_deref(), cli.resume)?;
     for (input, error) in &rejected {
         eprintln!("error processing {}: {error}", input.display());
         progress.record(ProgressEvent {
@@ -895,7 +911,7 @@ fn main() -> Result<()> {
             ..ProgressEvent::new(input_key(&skip.job.input), "skipped")
         })?;
     }
-    if !rejected.is_empty() && (cli.fail_fast || jobs.is_empty()) {
+    if !rejected.is_empty() && (cli.fail_fast || units.is_empty()) {
         bail!("{} input file(s) failed", rejected.len());
     }
     if units.iter().all(|unit| unit_done(&cli, &progress, unit)) {
@@ -1144,13 +1160,38 @@ fn format_extension(format: OutputFormat) -> &'static str {
 /// `input_key` for a file that may not exist yet: the canonical folder plus the name, so the
 /// events recorded before and after writing it agree.
 fn output_key(path: &Path) -> String {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    match (fs::canonicalize(parent), path.file_name()) {
-        (Ok(parent), Some(name)) => parent.join(name).display().to_string(),
-        _ => path.display().to_string(),
+    use std::path::Component;
+
+    let mut suffix = Vec::new();
+    let mut path_to_resolve = path;
+    // The destination itself may be a symlink. Resolve only its ancestors.
+    if let Some(parent) = path.parent() {
+        suffix.extend(path.components().next_back());
+        path_to_resolve = parent;
+    }
+    loop {
+        let ancestor = if path_to_resolve.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path_to_resolve
+        };
+        if let Ok(mut canonical) = fs::canonicalize(ancestor) {
+            for component in suffix.into_iter().rev() {
+                match component {
+                    Component::Normal(name) => canonical.push(name),
+                    Component::ParentDir => {
+                        canonical.pop();
+                    }
+                    _ => {}
+                }
+            }
+            return canonical.display().to_string();
+        }
+        let Some(parent) = path_to_resolve.parent() else {
+            return path.display().to_string();
+        };
+        suffix.extend(path_to_resolve.components().next_back());
+        path_to_resolve = parent;
     }
 }
 
@@ -1168,7 +1209,7 @@ fn meeting_folder(folder: PathBuf) -> PathBuf {
 
 /// The folder a track's recording session lives in.
 fn session_folder(input: &Path) -> PathBuf {
-    let input = fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
+    let input = fs::canonicalize(input).unwrap_or_else(|_| PathBuf::from(output_key(input)));
     meeting_folder(
         input
             .parent()
@@ -1190,7 +1231,32 @@ struct Skip {
 
 /// Fail the files that would write the same output, and the rest of their sessions.
 fn drop_clashes(cli: &Cli, units: &mut Vec<Unit>, rejected: &mut Vec<(PathBuf, String)>) {
-    let clashes = output_clashes(cli, &units.iter().flat_map(Unit::jobs).collect::<Vec<_>>());
+    let mut clashes = if cli.inventory_only {
+        Vec::new()
+    } else {
+        output_clashes(
+            cli,
+            &units
+                .iter()
+                .filter(|unit| unit.writes_job_outputs())
+                .flat_map(Unit::jobs)
+                .collect::<Vec<_>>(),
+        )
+    };
+    for unit in units.iter().filter(|unit| !unit.writes_job_outputs()) {
+        // Two encodings of the same participant export would duplicate its words.
+        let mut stems = HashSet::new();
+        for job in unit.jobs() {
+            let stem = folded_path(&input_key(&job.input.with_extension("")));
+            if !stems.insert(stem) {
+                clashes.push((
+                    job.input.clone(),
+                    "duplicate Zoom participant export (same file name with a different extension)"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
     if !clashes.is_empty() {
         let clashing = clashes
             .iter()
@@ -1242,216 +1308,399 @@ fn reject_uncovered(skips: &mut Vec<Skip>, rejected: &mut Vec<(PathBuf, String)>
 /// The units to run, the files left out, and the files of sessions that cannot run.
 type Plan = (Vec<Unit>, Vec<Skip>, Vec<(PathBuf, String)>);
 
-/// Plan the run from the queued files, as wisdom ingests a Zoom library:
-/// - Speaker tracks are grouped into sessions: Zoom participant files by meeting folder and
-///   meeting ID, other tracks by folder. A session's tracks run together, where its first
-///   track was queued, and are merged.
-/// - Zoom's mixed recording is left out when its meeting's tracks hold two or more speakers;
-///   with one speaker's tracks, it supplies everyone else; without tracks, it is transcribed
-///   on its own. A recording stopped and started again (`audio1…`, `audio2…`) is joined.
-/// - A video is left out when its audio is queued too: beside an audio-only copy with the
-///   same name, or in a Zoom meeting folder.
-/// - A session's only track is transcribed on its own.
-///
-/// Also returns the files of sessions that cannot be planned, with the reason.
-fn plan_units(cli: &Cli, jobs: Vec<Job>) -> Result<Plan> {
+fn prepare_plan(cli: &Cli) -> Result<Plan> {
+    let mut rejected = Vec::new();
+    let mut missing = Vec::new();
+    let mut jobs = collect_jobs(cli, &mut rejected, &mut missing)?;
+    for job in &mut jobs {
+        if job.iso {
+            job.diarize = false;
+            job.speakers = None;
+        }
+    }
+    let (mut units, mut skips, unplanned) = plan_units(cli, jobs, &missing)?;
+    reject_missing_zoom_parts(&mut units, &missing, &mut rejected);
+    rejected.extend(unplanned);
+    drop_clashes(cli, &mut units, &mut rejected);
+    reject_uncovered(&mut skips, &mut rejected);
+    Ok((units, skips, rejected))
+}
+
+/// A snapshot can name a track that disappeared after the queue was planned.
+fn reject_missing_zoom_parts(
+    units: &mut Vec<Unit>,
+    missing: &[PathBuf],
+    rejected: &mut Vec<(PathBuf, String)>,
+) {
+    let mut missing_tracks: HashMap<_, HashSet<_>> = HashMap::new();
+    let mut missing_recordings: HashMap<_, Vec<_>> = HashMap::new();
+    for path in missing {
+        let name = merge::parse_path(path);
+        if let Some(recording) = zoom_media(path, &name) {
+            if !recording.legacy_copy {
+                missing_recordings
+                    .entry(session_folder(path))
+                    .or_default()
+                    .push(recording);
+            }
+        } else if let merge::TrackName::Zoom { meeting, .. } = name {
+            missing_tracks
+                .entry(session_folder(path))
+                .or_default()
+                .insert(meeting);
+        }
+    }
+    if missing_tracks.is_empty() && missing_recordings.is_empty() {
+        return;
+    }
+    units.retain(|unit| {
+        let (folder, id, missing_segment) = match unit {
+            Unit::Session(session) if session.zoom.is_some() => (
+                session_folder(&session.jobs[0].input),
+                session.zoom.clone(),
+                false,
+            ),
+            Unit::Single(job) if job.zoom_recording => {
+                let folder = session_folder(&job.input);
+                let parts = std::iter::once(&job.input)
+                    .chain(&job.parts)
+                    .filter_map(|path| zoom_media(path, &merge::parse_path(path)))
+                    .collect::<Vec<_>>();
+                let id = parts.iter().find_map(|media| media.meeting.clone());
+                let missing_segment = missing_recordings.get(&folder).is_some_and(|missing| {
+                    missing.iter().any(|media| {
+                        (media.meeting.is_none() || id.is_none() || media.meeting == id)
+                            && !parts.iter().any(|part| part.segment == media.segment)
+                    })
+                });
+                (folder, id, missing_segment)
+            }
+            _ => return true,
+        };
+        let missing_participant = missing_tracks
+            .get(&folder)
+            .is_some_and(|ids| id.is_none_or(|id| ids.contains(&id)));
+        let reason = if missing_participant {
+            "a selected participant track from this Zoom meeting is unavailable"
+        } else if missing_segment {
+            "a selected recording segment from this Zoom meeting is unavailable"
+        } else {
+            return true;
+        };
+        rejected.extend(
+            unit.jobs()
+                .into_iter()
+                .map(|job| (job.input.clone(), reason.to_owned())),
+        );
+        false
+    });
+}
+
+fn queue_plan(
+    cli: &Cli,
+    units: &[Unit],
+    skips: &[Skip],
+    rejected: &[(PathBuf, String)],
+) -> Result<serde_json::Value> {
+    let progress = ProgressLog::read(cli.progress_file.as_deref(), cli.resume)?;
+    let mut files = Vec::new();
+    let mut meetings = Vec::new();
+    let mut meeting_members = HashMap::new();
+    for unit in units {
+        let done = unit_done(cli, &progress, unit);
+        match unit {
+            Unit::Session(session) if let Some(id) = &session.zoom => {
+                let folder = session_folder(&session.jobs[0].input);
+                let key = format!("{}|{id}", folder.display());
+                meetings.push(serde_json::json!({
+                    "id": key, "label": session.label, "output": output_key(&session.output),
+                    "done": done, "participants": session.speakers.iter().collect::<HashSet<_>>().len(),
+                }));
+                for (job, speaker) in session.jobs.iter().zip(&session.speakers) {
+                    let path = input_key(&job.input);
+                    meeting_members.insert(path.clone(), key.clone());
+                    files.push(serde_json::json!({
+                        "path": path, "meeting": key, "speaker": speaker, "iso": true, "done": done,
+                    }));
+                }
+            }
+            _ => {
+                for job in unit.jobs() {
+                    files.push(serde_json::json!({
+                        "path": input_key(&job.input), "output": output_key(&output_path(cli, job)),
+                        "iso": job.iso, "diarize": job.diarize, "done": done,
+                        "zoom_recording": job.zoom_recording,
+                    }));
+                }
+            }
+        }
+    }
+    for skip in skips {
+        let meeting = skip
+            .instead
+            .iter()
+            .find_map(|path| meeting_members.get(&input_key(path)));
+        files.push(serde_json::json!({
+            "path": input_key(&skip.job.input), "meeting": meeting, "skip": skip.reason,
+            "zoom_recording": skip.job.zoom_recording,
+            "covered_by": skip.instead.iter().map(|path| input_key(path)).collect::<Vec<_>>(),
+        }));
+    }
+    for (path, error) in rejected {
+        files.push(serde_json::json!({"path": input_key(path), "error": error}));
+    }
+    Ok(serde_json::json!({"files": files, "meetings": meetings}))
+}
+
+/// Group Zoom files by canonical meeting folder and recording ID, and manually marked
+/// non-Zoom tracks by folder. Only associate an ID-less Zoom export when its folder
+/// identifies one meeting.
+fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
     let names = merge::parse_paths(jobs.iter().map(|job| job.input.as_path()));
     let folders = jobs
         .iter()
         .map(|job| session_folder(&job.input))
         .collect::<Vec<_>>();
-    let is_zoom = |index: usize| {
-        matches!(
-            names[index],
-            merge::TrackName::Zoom { .. } | merge::TrackName::ZoomMixed { .. }
-        )
-    };
-    let is_video = |job: &Job| {
-        job.input.extension().is_some_and(|extension| {
-            VIDEO_EXTENSIONS
-                .iter()
-                .any(|video| extension.eq_ignore_ascii_case(video))
+    let media = jobs
+        .iter()
+        .zip(&names)
+        .map(|(job, name)| {
+            (!job.iso || matches!(name, merge::TrackName::ZoomMixed { .. }))
+                .then(|| zoom_media(&job.input, name))
+                .flatten()
         })
+        .collect::<Vec<_>>();
+    let mut ids_by_folder: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    for ((name, folder), recording) in names.iter().zip(&folders).zip(&media) {
+        if let Some(id) = zoom_id(name).or_else(|| {
+            recording
+                .as_ref()
+                .and_then(|export| export.meeting.as_deref())
+        }) {
+            ids_by_folder
+                .entry(folder.clone())
+                .or_default()
+                .insert(id.to_owned());
+        }
+    }
+    for path in missing {
+        if let Some(Some(id)) = zoom_candidate(path) {
+            ids_by_folder
+                .entry(session_folder(path))
+                .or_default()
+                .insert(id);
+        }
+    }
+    let resolved_id = |folder: &Path, id: Option<&str>| {
+        if let Some(id) = id {
+            Some(id.to_owned())
+        } else {
+            ids_by_folder
+                .get(folder)
+                .filter(|ids| ids.len() == 1)
+                .and_then(|ids| ids.iter().next())
+                .cloned()
+        }
     };
     let mut skips: Vec<Skip> = Vec::new();
     let mut taken = vec![false; jobs.len()];
 
+    let mut audio_by_stem: HashMap<_, Vec<_>> = HashMap::new();
+    let mut iso_by_meeting: HashMap<_, Vec<_>> = HashMap::new();
+    let stem_key = |index: usize| folded_path(&input_key(&jobs[index].input.with_extension("")));
     for (index, job) in jobs.iter().enumerate() {
-        if job.iso || !is_video(job) || !matches!(names[index], merge::TrackName::Other(_)) {
+        if is_video(&job.input) {
             continue;
         }
-        let stem = |job: &Job| {
-            job.input
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().to_lowercase())
-        };
-        let audio_copies = jobs
-            .iter()
-            .filter(|other| {
-                !is_video(other)
-                    && other.input.parent() == job.input.parent()
-                    && stem(other) == stem(job)
-            })
-            .map(|other| other.input.clone())
-            .collect::<Vec<_>>();
-        let zoom_files = (0..jobs.len())
-            .filter(|&other| is_zoom(other) && folders[other] == folders[index])
-            .map(|other| jobs[other].input.clone())
-            .collect::<Vec<_>>();
-        if !audio_copies.is_empty() {
-            skips.push(Skip {
-                job: job.clone(),
-                reason: "a video whose audio-only copy is transcribed instead".to_owned(),
-                instead: audio_copies,
-            });
-            taken[index] = true;
-        } else if !zoom_files.is_empty() {
-            // Any video there, as in wisdom's ingest: `video…`, `zoom_0`, `shared_screen…`.
-            skips.push(Skip {
-                job: job.clone(),
-                reason: "Zoom's video of the meeting, whose audio recording is transcribed instead"
-                    .to_owned(),
-                instead: zoom_files,
-            });
-            taken[index] = true;
+        audio_by_stem
+            .entry(stem_key(index))
+            .or_default()
+            .push(index);
+        if let merge::TrackName::Zoom { meeting, .. } = &names[index]
+            && job.iso
+        {
+            iso_by_meeting
+                .entry((folders[index].as_path(), meeting.clone()))
+                .or_default()
+                .push(index);
         }
     }
-
-    // Speaker tracks, by session.
-    struct Draft {
-        folder: PathBuf,
-        meeting: Option<String>,
-        zoom: bool,
-        tracks: Vec<usize>,
-        mixed: Vec<usize>,
+    let track_paths = |indices: &[usize]| {
+        indices
+            .iter()
+            .map(|&index| jobs[index].input.clone())
+            .collect::<Vec<_>>()
+    };
+    for (index, job) in jobs.iter().enumerate() {
+        let iso = media[index].as_ref().and_then(|recording| {
+            let folder = folders[index].as_path();
+            let id = resolved_id(folder, recording.meeting.as_deref())?;
+            iso_by_meeting.get(&(folder, id))
+        });
+        let (reason, replacements) = if let Some(iso) = iso {
+            let kind = if is_video(&job.input) {
+                "video"
+            } else {
+                "mixed audio"
+            };
+            (
+                format!("Zoom {kind} covered by the meeting's participant tracks"),
+                iso,
+            )
+        } else if !job.iso
+            && is_video(&job.input)
+            && let Some(audio) = audio_by_stem.get(&stem_key(index))
+        {
+            (
+                "a video whose audio-only copy is transcribed instead".to_owned(),
+                audio,
+            )
+        } else {
+            continue;
+        };
+        taken[index] = true;
+        skips.push(Skip {
+            job: job.clone(),
+            reason,
+            instead: track_paths(replacements),
+        });
     }
-    let mut drafts: Vec<Draft> = Vec::new();
+
+    let mut drafts = Vec::new();
+    let mut draft_indices = HashMap::new();
     for (index, job) in jobs.iter().enumerate() {
         if !job.iso || taken[index] {
             continue;
         }
-        let (meeting, zoom) = match &names[index] {
-            merge::TrackName::Zoom { meeting, .. } => (Some(meeting.clone()), true),
+        let meeting = match &names[index] {
+            merge::TrackName::Zoom { meeting, .. } if !is_video(&job.input) => {
+                Some(meeting.clone())
+            }
             merge::TrackName::ZoomMixed { .. } => continue,
-            merge::TrackName::Other(_) => (None, false),
+            _ => None,
         };
         taken[index] = true;
-        match drafts
-            .iter_mut()
-            .find(|draft| draft.folder == folders[index] && draft.meeting == meeting)
-        {
-            Some(draft) => draft.tracks.push(index),
-            None => drafts.push(Draft {
-                folder: folders[index].clone(),
-                meeting,
-                zoom,
-                tracks: vec![index],
-                mixed: Vec::new(),
-            }),
-        }
+        let draft = *draft_indices
+            .entry((&folders[index], meeting.clone()))
+            .or_insert_with(|| {
+                drafts.push((meeting, Vec::new()));
+                drafts.len() - 1
+            });
+        drafts[draft].1.push(index);
     }
-    let speaker_count = |draft: &Draft| {
-        draft
-            .tracks
-            .iter()
-            .map(|&index| match &names[index] {
-                merge::TrackName::Zoom { speaker, .. } => speaker.clone(),
-                _ => jobs[index].input.display().to_string(),
-            })
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-    };
 
-    // Zoom's mixed recordings, by meeting, each in segment order.
-    struct Recording {
-        folder: PathBuf,
-        meeting: Option<String>,
-        /// (segment, job index)
-        parts: Vec<(u32, usize)>,
-    }
-    let mut recordings: Vec<Recording> = Vec::new();
-    for index in 0..jobs.len() {
-        let merge::TrackName::ZoomMixed { segment, meeting } = &names[index] else {
-            continue;
-        };
+    // Pick one mixed export for each recording segment. Use video for segments that
+    // have no audio export and prefer the main video over alternate views.
+    let mut recordings = HashMap::new();
+    for (index, recording) in media.iter().enumerate() {
+        let Some(recording) = recording else { continue };
         if taken[index] {
             continue;
         }
         taken[index] = true;
-        // Two files of one segment (`audio_only` and its copy `audio_only01`, an m4a and a
-        // wav) are not a continuation: each stays a recording of its own.
-        match recordings.iter_mut().find(|recording| {
-            recording.folder == folders[index]
-                && recording.meeting == *meeting
-                && recording.parts.iter().all(|(other, _)| other != segment)
-        }) {
-            Some(recording) => recording.parts.push((*segment, index)),
-            None => recordings.push(Recording {
-                folder: folders[index].clone(),
-                meeting: meeting.clone(),
-                parts: vec![(*segment, index)],
-            }),
-        }
+        let folder = folders[index].as_path();
+        let id = resolved_id(folder, recording.meeting.as_deref());
+        let copy = recording
+            .legacy_copy
+            .then(|| jobs[index].input.file_stem())
+            .flatten();
+        let segments = recordings
+            .entry((folder, id, copy))
+            .or_insert_with(BTreeMap::new);
+        segments
+            .entry(recording.segment)
+            .or_insert_with(Vec::new)
+            .push(index);
     }
     let mut singles: Vec<usize> = Vec::new();
-    let mut joined: HashMap<usize, Vec<usize>> = HashMap::new();
-    for Recording {
-        folder,
-        meeting,
-        mut parts,
-    } in recordings
-    {
-        parts.sort_unstable();
-        let parts = parts
-            .into_iter()
-            .map(|(_, index)| index)
-            .collect::<Vec<_>>();
-        let same_meeting = |draft: &Draft| {
-            draft.zoom
-                && draft.folder == folder
-                && (meeting.is_none() || draft.meeting.is_none() || draft.meeting == meeting)
-        };
-        let tracks = drafts
-            .iter()
-            .filter(|draft| same_meeting(draft) && speaker_count(draft) > 1)
-            .flat_map(|draft| draft.tracks.iter().map(|&index| jobs[index].input.clone()))
-            .collect::<Vec<_>>();
-        if !tracks.is_empty() {
-            for &index in &parts {
-                skips.push(Skip {
-                    job: jobs[index].clone(),
-                    reason: "Zoom's mixed recording; the meeting's speaker tracks are merged \
-                             instead"
-                        .to_owned(),
-                    instead: tracks.clone(),
-                });
-            }
-            continue;
+    let mut joined = HashMap::new();
+    for ((folder, id, copy), segments) in recordings {
+        let mut parts = Vec::with_capacity(segments.len());
+        let mut redundant = Vec::new();
+        for mut candidates in segments.into_values() {
+            candidates.sort_unstable_by_key(|&index| {
+                (
+                    media[index].as_ref().unwrap().kind,
+                    input_key(&jobs[index].input),
+                )
+            });
+            let (chosen, copies) = candidates
+                .split_first()
+                .expect("each segment has an export");
+            parts.push(*chosen);
+            redundant.extend_from_slice(copies);
         }
-        let (first, rest) = parts.split_first().expect("a recording has a part");
-        for &index in rest {
-            skips.push(Skip {
-                job: jobs[index].clone(),
-                reason: format!(
+        let (first, rest) = parts.split_first().expect("each recording has a segment");
+        let primary = &jobs[*first];
+        for (indices, reason) in [
+            (
+                rest,
+                format!(
                     "the recording continues {}; both are transcribed together",
-                    jobs[*first]
+                    primary
                         .input
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                 ),
-                instead: vec![jobs[*first].input.clone()],
+            ),
+            (
+                redundant.as_slice(),
+                "another Zoom export covers the same recording segment".to_owned(),
+            ),
+        ] {
+            for &index in indices {
+                skips.push(Skip {
+                    job: jobs[index].clone(),
+                    reason: reason.clone(),
+                    instead: vec![primary.input.clone()],
+                });
+            }
+        }
+        let output =
+            (primary.zoom_recording && primary.output.is_none() && copy.is_none()).then(|| {
+                let stable = fallback_output_path(cli, primary, folder, id.as_deref());
+                if stable.exists() {
+                    return stable;
+                }
+                if id.is_some()
+                    && parts.iter().chain(&redundant).any(|&index| {
+                        media[index]
+                            .as_ref()
+                            .is_some_and(|item| item.meeting.is_none())
+                    })
+                {
+                    let legacy = fallback_output_path(cli, primary, folder, None);
+                    if legacy.is_file() {
+                        return legacy;
+                    }
+                }
+                // Previous versions joined audio-only segments, or wrote each video separately.
+                // Reuse their output where it represents the same planned recording.
+                let old_paths = if parts.len() == 1 {
+                    redundant.as_slice()
+                } else {
+                    &[]
+                };
+                if parts.len() == 1
+                    || parts.iter().all(|&index| {
+                        media[index]
+                            .as_ref()
+                            .is_some_and(|item| item.kind == ZoomMediaKind::Audio)
+                    })
+                {
+                    return std::iter::once(first)
+                        .chain(old_paths)
+                        .map(|&index| &jobs[index])
+                        .filter(|job| job.output.is_none())
+                        .map(|job| output_path(cli, job))
+                        .find(|path| path.is_file())
+                        .unwrap_or(stable);
+                }
+                stable
             });
-        }
-        if let Some(draft) = drafts
-            .iter_mut()
-            .find(|draft| same_meeting(draft) && draft.mixed.is_empty())
-        {
-            draft.mixed = parts;
-            continue;
-        }
         singles.push(*first);
-        joined.insert(*first, rest.to_vec());
+        joined.insert(*first, (rest.to_vec(), output));
     }
     for (index, taken) in taken.iter().enumerate() {
         if !taken {
@@ -1463,49 +1712,30 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>) -> Result<Plan> {
     let mut slots: Vec<Option<Job>> = jobs.into_iter().map(Some).collect();
     let mut take = |index: usize| slots[index].take().expect("each job is planned once");
     let mut planned: Vec<(usize, Unit)> = Vec::new();
-    for draft in drafts {
-        let first = draft.tracks[0].min(draft.mixed.first().copied().unwrap_or(usize::MAX));
-        let mixed = draft.mixed.split_first().map(|(&first, rest)| {
-            let mut job = take(first);
-            job.parts = rest.iter().map(|&index| take(index).input).collect();
-            if job.diarize {
-                eprintln!(
-                    "note: not diarizing {}: its words are given to the speakers without a track",
-                    job.input.display()
-                );
-                job.diarize = false;
-                job.speakers = None;
-            }
-            job
-        });
-        let tracks = draft.tracks.into_iter().map(&mut take).collect::<Vec<_>>();
-        if tracks.len() == 1 && mixed.is_none() {
-            eprintln!(
-                "note: {} is the only track of its session; transcribing it on its own",
-                tracks[0].input.display()
-            );
-        }
-        let unit = match (tracks, mixed) {
-            (mut tracks, None) if tracks.len() == 1 => Unit::Single(tracks.remove(0)),
-            (tracks, mixed) => Unit::Session(IsoSession {
+    for (meeting, tracks) in drafts {
+        let first = tracks[0];
+        let mut tracks = tracks.into_iter().map(&mut take).collect::<Vec<_>>();
+        let unit = if meeting.is_none() && tracks.len() == 1 {
+            Unit::Single(tracks.remove(0))
+        } else {
+            Unit::Session(IsoSession {
                 label: String::new(),
-                zoom: draft.meeting,
+                zoom: meeting,
                 jobs: tracks,
-                mixed,
                 speakers: Vec::new(),
                 output: PathBuf::new(),
-            }),
+            })
         };
         planned.push((first, unit));
     }
     for index in singles {
         let mut job = take(index);
-        job.parts = joined
-            .remove(&index)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|index| take(index).input)
-            .collect();
+        if let Some((parts, output)) = joined.remove(&index) {
+            job.parts = parts.into_iter().map(|index| take(index).input).collect();
+            if let Some(output) = output {
+                job.output = Some(output);
+            }
+        }
         planned.push((index, Unit::Single(job)));
     }
     planned.sort_by_key(|(first, _)| *first);
@@ -1523,12 +1753,9 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>) -> Result<Plan> {
     Ok((units, skips, rejected))
 }
 
-/// Name each session after its meeting folder, and place its merged transcript. Sessions
-/// whose merged transcripts would share a folder and a name get their Zoom meeting ID (or a
-/// number) added. Only those count, so a session keeps its name whatever else is queued, and
-/// a rerun finds its transcript.
-/// Returns the sessions whose merged transcript would replace another output, by index, with
-/// the reason.
+/// Name each session after its source folder. Zoom uses a fixed destination so later runs
+/// find the same transcript. Manual sessions keep their numbered collision handling.
+/// Returns the overlapping merged destinations by session index.
 fn name_sessions(cli: &Cli, units: &mut [Unit]) -> Vec<(usize, String)> {
     let base = |session: &IsoSession| {
         session_folder(&session.jobs[0].input)
@@ -1536,8 +1763,7 @@ fn name_sessions(cli: &Cli, units: &mut [Unit]) -> Vec<(usize, String)> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "session".to_owned())
     };
-    // Beside the tracks' outputs, or beside the meeting's mixed recording when those mirror
-    // Zoom's `Audio Record` folder.
+    // Manual sessions put their merge beside the track transcripts.
     let folder = |session: &IsoSession| {
         meeting_folder(
             output_path(cli, &session.jobs[0])
@@ -1546,20 +1772,13 @@ fn name_sessions(cli: &Cli, units: &mut [Unit]) -> Vec<(usize, String)> {
                 .unwrap_or_default(),
         )
     };
-    let key = |folder: &Path, name: &str| folder.join(name).to_string_lossy().to_lowercase();
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for unit in units.iter() {
-        if let Unit::Session(session) = unit {
-            *counts
-                .entry(key(&folder(session), &base(session)))
-                .or_default() += 1;
-        }
-    }
+    let key = |folder: &Path, name: &str| folded_path(&folder.join(name).to_string_lossy());
     let mut taken = std::collections::HashSet::new();
     let mut outputs = units
         .iter()
+        .filter(|unit| unit.writes_job_outputs())
         .flat_map(Unit::jobs)
-        .map(|job| output_path(cli, job).to_string_lossy().to_lowercase())
+        .map(|job| folded_path(&output_key(&output_path(cli, job))))
         .collect::<std::collections::HashSet<_>>();
     let mut clashes = Vec::new();
     for (index, unit) in units.iter_mut().enumerate() {
@@ -1567,20 +1786,33 @@ fn name_sessions(cli: &Cli, units: &mut [Unit]) -> Vec<(usize, String)> {
             continue;
         };
         let base = base(session);
-        let folder = folder(session);
-        let mut label = match &session.zoom {
-            Some(id) if counts[&key(&folder, &base)] > 1 => format!("{base} {id}"),
-            _ => base.clone(),
-        };
-        let output =
-            |label: &str| folder.join(format!("{label}.merged.{}", format_extension(cli.format)));
-        let mut number = 2;
-        while !taken.insert(key(&folder, &label)) || merged_elsewhere(&output(&label), session) {
-            label = format!("{base} {number}");
-            number += 1;
+        let extension = format_extension(cli.format);
+        let label;
+        if let Some(id) = &session.zoom {
+            let job = &session.jobs[0];
+            let source = session_folder(&job.input);
+            let stem = &base[..base.floor_char_boundary(200)];
+            let (folder, filename) = match job.output_location {
+                OutputLocation::Folder => (zoom_destination(job, Some(id)), stem.to_owned()),
+                OutputLocation::NextToSource => (source, format!("{stem} [{id}]")),
+            };
+            session.output = folder.join(format!("{filename}.merged.{extension}"));
+            label = base;
+        } else {
+            let folder = folder(session);
+            let output = |label: &str| folder.join(format!("{label}.merged.{extension}"));
+            let mut candidate = base.clone();
+            let mut number = 2;
+            while !taken.insert(key(&folder, &candidate))
+                || merged_elsewhere(&output(&candidate), session)
+            {
+                candidate = format!("{base} {number}");
+                number += 1;
+            }
+            session.output = output(&candidate);
+            label = candidate;
         }
-        session.output = output(&label);
-        if !outputs.insert(session.output.to_string_lossy().to_lowercase()) {
+        if !cli.inventory_only && !outputs.insert(folded_path(&output_key(&session.output))) {
             clashes.push((
                 index,
                 format!(
@@ -1611,7 +1843,6 @@ fn merged_elsewhere(path: &Path, session: &IsoSession) -> bool {
     let inputs = session
         .jobs
         .iter()
-        .chain(&session.mixed)
         .map(|job| input_key(&job.input))
         .collect::<std::collections::HashSet<_>>();
     !doc.metadata.merged_from.is_empty()
@@ -1625,11 +1856,15 @@ fn merged_elsewhere(path: &Path, session: &IsoSession) -> bool {
 /// Whether a unit can be skipped: finished in an earlier run (`--resume`), or with its
 /// transcript already there (`--skip-existing`).
 fn unit_done(cli: &Cli, progress: &ProgressLog, unit: &Unit) -> bool {
-    let exists = match unit {
-        Unit::Single(job) => output_path(cli, job).exists(),
-        Unit::Session(session) => session.output.exists(),
+    let (exists, zoom) = match unit {
+        Unit::Single(job) => (output_path(cli, job).is_file(), job.zoom_recording),
+        Unit::Session(session) => (session.output.is_file(), session.zoom.is_some()),
     };
-    (cli.resume && unit_completed(cli, progress, unit)) || (cli.skip_existing && exists)
+    if zoom {
+        !cli.overwrite && exists
+    } else {
+        (cli.resume && unit_completed(cli, progress, unit)) || (cli.skip_existing && exists)
+    }
 }
 
 fn unit_completed(cli: &Cli, progress: &ProgressLog, unit: &Unit) -> bool {
@@ -1652,26 +1887,71 @@ fn record_skipped(cli: &Cli, progress: &mut ProgressLog, unit: &Unit) -> Result<
     };
     match unit {
         Unit::Single(job) => {
-            progress.record(skipped(input_key(&job.input), &output_path(cli, job)))
-        }
-        Unit::Session(session) => {
-            let speakers = session
-                .speakers
-                .iter()
-                .map(String::as_str)
-                .chain(session.mixed.iter().map(|_| merge::OTHER_SPEAKERS));
-            for (job, speaker) in session.jobs.iter().chain(&session.mixed).zip(speakers) {
-                progress.record(ProgressEvent {
-                    group: Some(session.label.clone()),
-                    speaker: Some(speaker.to_owned()),
-                    ..skipped(input_key(&job.input), &output_path(cli, job))
-                })?;
+            let output = output_path(cli, job);
+            if job.zoom_recording {
+                eprintln!(
+                    "note: skipping {}: transcript already exists",
+                    output.display()
+                );
             }
-            progress.record(ProgressEvent {
-                group: Some(session.label.clone()),
-                kind: Some("merge".to_owned()),
-                ..skipped(output_key(&session.output), &session.output)
-            })
+            progress.record(skipped(input_key(&job.input), &output))
+        }
+        Unit::Session(session) => record_skipped_session(cli, progress, session),
+    }
+}
+
+fn record_skipped_session(
+    cli: &Cli,
+    progress: &mut ProgressLog,
+    session: &IsoSession,
+) -> Result<()> {
+    eprintln!(
+        "note: skipping {}: transcript already exists",
+        session.output.display()
+    );
+    for (job, speaker) in session.jobs.iter().zip(&session.speakers) {
+        progress.record(ProgressEvent {
+            output: session
+                .zoom
+                .is_none()
+                .then(|| output_path(cli, job).display().to_string()),
+            group: Some(session.label.clone()),
+            speaker: Some(speaker.to_owned()),
+            progress: Some(1.0),
+            phase: Some("Merged transcript already exists".to_owned()),
+            ..ProgressEvent::new(input_key(&job.input), "skipped")
+        })?;
+    }
+    progress.record(ProgressEvent {
+        output: Some(session.output.display().to_string()),
+        progress: Some(1.0),
+        phase: Some("Transcript already exists".to_owned()),
+        group: Some(session.label.clone()),
+        kind: Some("merge".to_owned()),
+        ..ProgressEvent::new(output_key(&session.output), "skipped")
+    })
+}
+
+/// Serialize Zoom runs targeting the same directory without leaving lock files behind.
+/// Recheck for the transcript after the lock, since another run may have just written it.
+fn lock_zoom_output(output: &Path) -> Result<File> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let directory = File::open(parent).with_context(|| format!("opening {}", parent.display()))?;
+    loop {
+        check_cancelled()?;
+        match directory.try_lock() {
+            Ok(()) => return Ok(directory),
+            Err(fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(100))
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("locking output directory {}", parent.display()));
+            }
         }
     }
 }
@@ -1688,9 +1968,10 @@ fn run_job(
     let key = input_key(&job.input);
     // Before this run's own events.
     let logged = progress.latest.contains_key(&key);
-    let predicted_output = output_path(cli, job).display().to_string();
+    let predicted_output = (!member.is_some_and(|member| member.merged_only))
+        .then(|| output_path(cli, job).display().to_string());
     let event = |status: &str| ProgressEvent {
-        output: Some(predicted_output.clone()),
+        output: predicted_output.clone(),
         group: member.map(|member| member.group.to_owned()),
         speaker: member.map(|member| member.speaker.to_owned()),
         ..ProgressEvent::new(key.clone(), status)
@@ -1710,19 +1991,27 @@ fn run_job(
             ..event("running")
         })
     };
-    let result = process_one(
-        cli,
-        job,
-        models,
-        member.map(|member| member.gate),
-        logged,
-        &mut report,
-    );
+    let result = (|| {
+        let _lock = if job.zoom_recording {
+            let destination = output_path(cli, job);
+            let lock = lock_zoom_output(&destination)?;
+            if destination.is_file() && !cli.overwrite {
+                return Ok(None);
+            }
+            Some(lock)
+        } else {
+            None
+        };
+        process_one(cli, job, models, member, logged, &mut report).map(Some)
+    })();
     let elapsed_seconds = Some(started.elapsed().as_secs_f32());
     match result {
-        Ok(processed) => {
+        Ok(Some(processed)) => {
             progress.record(ProgressEvent {
-                output: Some(processed.output.display().to_string()),
+                output: processed
+                    .output
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 elapsed_seconds,
                 progress: Some(1.0),
                 phase: Some("Complete".to_owned()),
@@ -1730,6 +2019,14 @@ fn run_job(
                 ..event("completed")
             })?;
             Ok(Some(processed))
+        }
+        Ok(None) => {
+            progress.record(ProgressEvent {
+                progress: Some(1.0),
+                phase: Some("Transcript already exists".to_owned()),
+                ..event("skipped")
+            })?;
+            Ok(None)
         }
         // Not a failure of this input: record it so the app shows the row as canceled
         // rather than failed; the caller stops.
@@ -1795,19 +2092,20 @@ fn run_session(
             })?;
             if cli.fail_fast { Err(error) } else { Ok(()) }
         };
-    if let Some(parent) = session
-        .output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        && let Err(error) = fs::create_dir_all(parent)
-    {
-        let error = anyhow::Error::new(error)
-            .context(format!("creating output directory {}", parent.display()));
-        return fail(progress, failures, error);
+    let merged_only = session.zoom.is_some();
+    let _lock = if merged_only {
+        match lock_zoom_output(&session.output) {
+            Ok(lock) => Some(lock),
+            Err(error) => return fail(progress, failures, error),
+        }
+    } else {
+        None
+    };
+    let overwrite = cli.overwrite || (!merged_only && cli.resume);
+    if session.output.is_file() && merged_only && !overwrite {
+        return record_skipped_session(cli, progress, session);
     }
-    // Fail before minutes of transcription, not at the end.
-    // `--resume` reruns a session whose merge was not recorded as finished.
-    if session.output.exists() && !(cli.overwrite || cli.resume) {
+    if session.output.exists() && !overwrite {
         return fail(
             progress,
             failures,
@@ -1829,7 +2127,7 @@ fn run_session(
         let measured = check_cancelled()
             .and_then(|()| {
                 progress.record(ProgressEvent {
-                    output: Some(output_path(cli, first).display().to_string()),
+                    output: (!merged_only).then(|| output_path(cli, first).display().to_string()),
                     group: Some(session.label.clone()),
                     speaker: Some(session.speakers[0].clone()),
                     progress: Some(0.01),
@@ -1841,7 +2139,13 @@ fn run_session(
                     ..ProgressEvent::new(input_key(&first.input), "running")
                 })
             })
-            .and_then(|()| decode_job(job));
+            .and_then(|()| {
+                let audio = decode_job(job)?;
+                if merged_only && let Some(warning) = &audio.warning {
+                    bail!("incomplete Zoom track {}: {warning}", job.input.display());
+                }
+                Ok(audio)
+            });
         match measured {
             Ok(audio) => {
                 durations.push(audio.duration_seconds);
@@ -1854,10 +2158,10 @@ fn run_session(
                 // No track can be judged without all of them; fail the session's files. They
                 // are what failed, so the merge is not counted again.
                 eprintln!("error merging {}: {error:#}", session.label);
-                for job in session.jobs.iter().chain(&session.mixed) {
+                for job in &session.jobs {
                     *failures += 1;
                     progress.record(ProgressEvent {
-                        output: Some(output_path(cli, job).display().to_string()),
+                        output: (!merged_only).then(|| output_path(cli, job).display().to_string()),
                         error: Some(format!("{error:#}")),
                         phase: Some("Failed".to_owned()),
                         group: Some(session.label.clone()),
@@ -1875,6 +2179,7 @@ fn run_session(
     }
     let masks = bleed::masks(&levels, &track_starts(&session.jobs, &durations));
     let mut docs = Vec::with_capacity(session.jobs.len());
+    let previous_failures = *failures;
     for ((job, speaker), mask) in session.jobs.iter().zip(&session.speakers).zip(&masks) {
         if cancel_requested() {
             break;
@@ -1889,6 +2194,7 @@ fn run_session(
             group: &session.label,
             speaker,
             gate: mask,
+            merged_only,
         };
         if let Some(processed) = run_job(
             cli,
@@ -1901,79 +2207,37 @@ fn run_session(
             docs.push(processed.words.context("speaker tracks keep their words")?);
         }
     }
-    if let Some(job) = &session.mixed
-        && !cancel_requested()
-        && docs.len() == session.jobs.len()
-    {
-        let member = Member {
-            group: &session.label,
-            speaker: merge::OTHER_SPEAKERS,
-            gate: &bleed::Mask::default(),
-        };
-        if let Some(processed) = run_job(
-            cli,
-            job,
-            models.reborrow(),
-            progress,
-            Some(member),
-            failures,
-        )? {
-            docs.push(
-                processed
-                    .words
-                    .context("the mixed recording keeps its words")?,
-            );
-        }
-    } else if let Some(job) = &session.mixed
-        && !cancel_requested()
-    {
-        // Its words would go to waste without the track's.
-        *failures += 1;
-        progress.record(ProgressEvent {
-            output: Some(output_path(cli, job).display().to_string()),
-            error: Some("not transcribed: the speaker track failed".to_owned()),
-            phase: Some("Failed".to_owned()),
-            group: Some(session.label.clone()),
-            speaker: Some(merge::OTHER_SPEAKERS.to_owned()),
-            ..ProgressEvent::new(input_key(&job.input), "failed")
-        })?;
-    }
     if cancel_requested() {
         return progress.record(event("canceled"));
     }
-    let expected = session.jobs.len() + usize::from(session.mixed.is_some());
-    if docs.len() < expected {
-        // The failed tracks were counted already.
+    let expected = session.jobs.len();
+    if docs.len() != expected {
+        let error = format!("{} of {expected} tracks failed", expected - docs.len());
+        if *failures == previous_failures {
+            return fail(progress, failures, anyhow::anyhow!(error));
+        }
         return progress.record(ProgressEvent {
-            error: Some(format!(
-                "{} of {expected} recordings failed; not merged",
-                expected - docs.len(),
-            )),
+            error: Some(error),
             ..event("failed")
         });
     }
     let inputs = docs
         .into_iter()
-        .zip(session.jobs.iter().chain(&session.mixed))
-        .enumerate()
-        .map(|(index, (doc, job))| {
-            let mixed = index == session.jobs.len();
-            merge::TrackInput {
-                doc,
-                path: job.input.display().to_string(),
-                name: mixed.then(|| merge::OTHER_SPEAKERS.to_owned()),
-                mixed,
-            }
+        .zip(&session.jobs)
+        .map(|(doc, job)| merge::TrackInput {
+            doc,
+            path: job.input.display().to_string(),
+            name: None,
+            mixed: false,
         })
         .collect();
-    let merged = merge::merge_tracks(inputs).and_then(|(mut doc, warnings)| {
-        apply_timestamps(&mut doc, cli.timestamps)?;
-        write_output(
-            &doc,
-            &session.output,
-            render_options(cli),
-            cli.overwrite || cli.resume,
-        )?;
+    let merged = merge::merge_tracks(inputs).and_then(|(doc, mut warnings)| {
+        if merged_only && doc.speaker_names.len() == 1 {
+            warnings.push(
+                "Zoom exported tracks for one participant; only their audio is included".to_owned(),
+            );
+        }
+        write_job_output(cli, doc, &session.output, overwrite)?;
         Ok(warnings)
     });
     match merged {
@@ -2159,20 +2423,26 @@ fn process_one(
     cli: &Cli,
     job: &Job,
     models: InferenceModels<'_>,
-    gate: Option<&bleed::Mask>,
+    member: Option<Member<'_>>,
     logged: bool,
     report: &mut dyn FnMut(f32, &str) -> Result<()>,
 ) -> Result<Processed> {
+    let gate = member.map(|member| member.gate);
+    let output = (!member.is_some_and(|member| member.merged_only)).then(|| output_path(cli, job));
+    let overwrite = if job.zoom_recording {
+        cli.overwrite
+    } else {
+        may_replace(cli, gate, logged)
+    };
+    if let Some(destination) = &output
+        && destination.exists()
+        && !overwrite
+    {
+        bail!("output exists (use --overwrite): {}", destination.display());
+    }
     if matches!(cli.engine, EngineKind::AppleNative) {
         report(0.1, "Starting Apple SpeechTranscriber")?;
-        // No progress report after this: the transcript is already written, and a cancel
-        // caught there would record a finished job as canceled.
-        return process_apple_native(cli, job, gate, logged);
-    }
-    // Fail before decoding and inference, not after minutes of work.
-    let destination = output_path(cli, job);
-    if destination.exists() && !may_replace(cli, gate, logged) {
-        bail!("output exists (use --overwrite): {}", destination.display());
+        return process_apple_native(cli, job, gate, output, overwrite);
     }
     let started = Instant::now();
     report(0.05, "Decoding audio")?;
@@ -2300,7 +2570,7 @@ fn process_one(
         build_segments(words)
     };
     let model = models.model_label.to_owned();
-    let mut doc = TranscriptDocument {
+    let doc = TranscriptDocument {
         source: job.input.display().to_string(),
         model: model.clone(),
         device: match cli.device {
@@ -2329,32 +2599,16 @@ fn process_one(
         },
     };
     let words = gate.is_some().then(|| doc.clone());
-    if cli.timestamps != TimestampGranularity::Words {
-        // Sentence timestamps retain segment boundaries but do not expose word items. This keeps
-        // the JSON shape stable while honoring the requested granularity.
-        doc.collapse_words();
+    if let Some(destination) = &output {
+        report(0.95, "Writing output")?;
+        write_job_output(cli, doc, destination, overwrite)?;
+        eprintln!(
+            "{} -> {} ({:.2}s)",
+            job.input.display(),
+            destination.display(),
+            started.elapsed().as_secs_f32()
+        );
     }
-    let output_path = output_path(cli, job);
-    report(0.95, "Writing output")?;
-    if let Some(parent) = output_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating output directory {}", parent.display()))?;
-    }
-    write_output(
-        &doc,
-        &output_path,
-        render_options(cli),
-        may_replace(cli, gate, logged),
-    )?;
-    eprintln!(
-        "{} -> {} ({:.2}s)",
-        job.input.display(),
-        output_path.display(),
-        started.elapsed().as_secs_f32()
-    );
     // The app shows this on the finished row; otherwise an empty transcript looks like success.
     let warning = [
         (!spoke).then(|| "No speech detected; the transcript is empty".to_owned()),
@@ -2364,7 +2618,7 @@ fn process_one(
     .flatten()
     .reduce(|first, second| format!("{first}; {second}"));
     Ok(Processed {
-        output: output_path,
+        output,
         warning,
         words,
     })
@@ -2374,7 +2628,8 @@ fn process_apple_native(
     cli: &Cli,
     job: &Job,
     gate: Option<&bleed::Mask>,
-    logged: bool,
+    output: Option<PathBuf>,
+    overwrite: bool,
 ) -> Result<Processed> {
     if job.diarize || job.speakers.is_some() {
         bail!(
@@ -2384,17 +2639,6 @@ fn process_apple_native(
     let helper = apple_native_helper().context(
         "Apple SpeechTranscriber helper is not bundled; set TRANSCRIBERRR_NATIVE or build the macOS app",
     )?;
-    let output_path = output_path(cli, job);
-    if let Some(parent) = output_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating output directory {}", parent.display()))?;
-    }
-    if output_path.exists() && !may_replace(cli, gate, logged) {
-        bail!("output exists (use --overwrite): {}", output_path.display());
-    }
     // AVFoundation cannot open Matroska/WebM, and the helper hangs forever on FLAC in Ogg;
     // decode those here and hand the helper a WAV. A speaker track goes as a WAV with the
     // other speakers' bleed muted, and a recording in parts as one WAV of them all.
@@ -2488,25 +2732,38 @@ fn process_apple_native(
             .collect();
         doc.segments = build_segments(words);
     }
-    let words = gate.is_some().then(|| doc.clone());
-    if cli.timestamps != TimestampGranularity::Words {
-        doc.collapse_words();
-    }
-    write_output(
-        &doc,
-        &output_path,
-        render_options(cli),
-        may_replace(cli, gate, logged),
-    )?;
     let warning = doc
         .segments
         .is_empty()
         .then(|| "No speech detected; the transcript is empty".to_owned());
+    let words = gate.is_some().then(|| doc.clone());
+    if let Some(destination) = &output {
+        write_job_output(cli, doc, destination, overwrite)?;
+    }
     Ok(Processed {
-        output: output_path,
+        output,
         warning,
         words,
     })
+}
+
+fn write_job_output(
+    cli: &Cli,
+    mut doc: TranscriptDocument,
+    destination: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    if cli.timestamps != TimestampGranularity::Words {
+        doc.collapse_words();
+    }
+    if let Some(parent) = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating output directory {}", parent.display()))?;
+    }
+    write_output(&doc, destination, render_options(cli), overwrite)
 }
 
 fn apple_native_helper() -> Option<PathBuf> {
@@ -2527,144 +2784,407 @@ fn apple_native_helper() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// Manifest items whose input is missing or unsupported are returned in `rejected` rather than
-/// failing the run: a queue item deleted (or on an unmounted drive) since it was queued should
-/// fail alone, not take the other thousands of tracks with it.
-fn collect_jobs(cli: &Cli, rejected: &mut Vec<(PathBuf, String)>) -> Result<Vec<Job>> {
+fn is_video(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        VIDEO_EXTENSIONS
+            .iter()
+            .any(|video| extension.eq_ignore_ascii_case(video))
+    })
+}
+
+fn zoom_id(name: &merge::TrackName) -> Option<&str> {
+    match name {
+        merge::TrackName::Zoom { meeting, .. } => Some(meeting),
+        merge::TrackName::ZoomMixed { meeting, .. } => meeting.as_deref(),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum ZoomMediaKind {
+    Audio,
+    Video,
+    AlternateVideo,
+}
+
+struct ZoomMedia {
+    meeting: Option<String>,
+    segment: u32,
+    kind: ZoomMediaKind,
+    /// Legacy `audio_only01`-style exports remain separate recordings.
+    legacy_copy: bool,
+}
+
+fn zoom_media(path: &Path, name: &merge::TrackName) -> Option<ZoomMedia> {
+    let video = is_video(path);
+    let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+    if let merge::TrackName::ZoomMixed { segment, meeting } = name {
+        return Some(ZoomMedia {
+            meeting: meeting.clone(),
+            segment: *segment,
+            kind: if video {
+                ZoomMediaKind::Video
+            } else {
+                ZoomMediaKind::Audio
+            },
+            legacy_copy: !video && meeting.is_none() && stem != "audio_only",
+        });
+    }
+    if !video {
+        return None;
+    }
+    let prefix = stem.trim_end_matches(|c: char| c.is_ascii_digit());
+    let tail = &stem[prefix.len()..];
+    if prefix == "zoom_" {
+        return Some(ZoomMedia {
+            meeting: None,
+            segment: tail.parse().ok()?,
+            kind: ZoomMediaKind::Video,
+            legacy_copy: false,
+        });
+    }
+    let kind = if matches!(prefix, "video" | "video_") {
+        ZoomMediaKind::Video
+    } else if ["shared_screen", "speaker_view", "gallery_view"]
+        .iter()
+        .any(|view| prefix.starts_with(view))
+    {
+        ZoomMediaKind::AlternateVideo
+    } else {
+        return None;
+    };
+    let segment = match tail.len() {
+        9 => 0,
+        10 => u32::from(tail.as_bytes()[0] - b'0'),
+        _ => return None,
+    };
+    Some(ZoomMedia {
+        meeting: Some(tail[tail.len() - 9..].to_owned()),
+        segment,
+        kind,
+        legacy_copy: false,
+    })
+}
+
+/// The Zoom meeting ID, with an outer option to distinguish a legacy export from other media.
+fn zoom_candidate(path: &Path) -> Option<Option<String>> {
+    let name = merge::parse_path(path);
+    if !is_video(path)
+        && let merge::TrackName::Zoom { meeting, .. } = name
+    {
+        return Some(Some(meeting));
+    }
+    zoom_media(path, &name).map(|media| media.meeting)
+}
+
+fn zoom_recording_id(path: &Path) -> Option<String> {
+    zoom_media(path, &merge::parse_path(path)).and_then(|media| media.meeting)
+}
+
+fn input_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let walker = WalkDir::new(dir).max_depth(if recursive { usize::MAX } else { 1 });
+    for entry in walker.into_iter().filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        entry.depth() == 0
+            || !(name.starts_with('.')
+                || (entry.file_type().is_dir()
+                    && (name.starts_with('#')
+                        || [".app", ".photoslibrary", ".imovielibrary", ".logicx"]
+                            .iter()
+                            .any(|suffix| name.to_ascii_lowercase().ends_with(suffix)))))
+    }) {
+        match entry {
+            Ok(entry) if entry.path().is_file() && is_audio_path(entry.path()) => {
+                paths.push(entry.into_path())
+            }
+            Ok(entry)
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zoom")) =>
+            {
+                eprintln!(
+                    "warning: skipping {}: Zoom has not converted this recording yet",
+                    entry.path().display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("warning: skipping {error}"),
+        }
+    }
+    paths.sort();
+    paths
+}
+
+struct ZoomInventory {
+    exports: Vec<(PathBuf, Option<String>)>,
+    multiple_ids: bool,
+}
+
+fn zoom_inventory(folder: &Path) -> Result<ZoomInventory> {
+    let read = |path: &Path| {
+        fs::read_dir(path)
+            .and_then(|entries| {
+                entries
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<std::io::Result<Vec<_>>>()
+            })
+            .with_context(|| format!("reading {}", path.display()))
+    };
+    let mut files = read(folder)?;
+    for directory in files.clone() {
+        if directory
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("Audio Record"))
+        {
+            files.extend(read(&directory)?);
+        }
+    }
+    if files.iter().any(|path| {
+        path.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zoom"))
+            && path
+                .file_name()
+                .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
+            && path.is_file()
+    }) {
+        bail!(
+            "Zoom is still converting the recording in {}",
+            folder.display()
+        );
+    }
+    files.sort_unstable();
+    let exports = files
+        .into_iter()
+        .filter_map(|path| {
+            let id = zoom_candidate(&path)?;
+            (path.is_file() && is_audio_path(&path)).then_some((path, id))
+        })
+        .collect::<Vec<_>>();
+    let multiple_ids = exports
+        .iter()
+        .filter_map(|(_, id)| id.as_ref())
+        .collect::<HashSet<_>>()
+        .len()
+        > 1;
+    Ok(ZoomInventory {
+        exports,
+        multiple_ids,
+    })
+}
+
+/// A file selection expands only to recognized exports from the same Zoom recording.
+/// Keep explicit jobs first so their settings win over those inherited by discovered files.
+fn add_zoom_companions(
+    jobs: &mut Vec<Job>,
+    known: &mut HashSet<String>,
+    opt_out: &HashSet<String>,
+    discover: bool,
+    rejected: &mut Vec<(PathBuf, String)>,
+) {
+    let mut inventories = HashMap::new();
+    let mut expanded = HashSet::new();
+    let mut companions = Vec::new();
+    let mut unavailable = HashMap::new();
+    for job in jobs.iter() {
+        let Some(id) = zoom_candidate(&job.input) else {
+            continue;
+        };
+        if opt_out.contains(&input_key(&job.input))
+            || (job.iso
+                && !is_iso_track(IsoMode::Auto, &job.input)
+                && !matches!(
+                    merge::parse_path(&job.input),
+                    merge::TrackName::ZoomMixed { .. }
+                ))
+        {
+            continue;
+        }
+        let folder = session_folder(&job.input);
+        let inventory = match inventories
+            .entry(folder.clone())
+            .or_insert_with(|| zoom_inventory(&folder))
+        {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                unavailable.insert(job.input.clone(), format!("{error:#}"));
+                continue;
+            }
+        };
+        if id.is_none() && inventory.multiple_ids {
+            unavailable.insert(
+                job.input.clone(),
+                "the Zoom export has no meeting ID and this folder contains several meetings"
+                    .to_owned(),
+            );
+            continue;
+        }
+        if !discover || !expanded.insert((folder, id.clone())) {
+            continue;
+        }
+        for (path, candidate) in &inventory.exports {
+            let matches = match (&id, candidate) {
+                (Some(id), Some(candidate)) => id == candidate,
+                _ => !inventory.multiple_ids,
+            };
+            if !matches || !known.insert(input_key(path)) {
+                continue;
+            }
+            let iso = is_iso_track(IsoMode::Auto, path);
+            companions.push(Job {
+                input: path.clone(),
+                iso,
+                zoom_recording: !iso,
+                output: None,
+                ..job.clone()
+            });
+        }
+    }
+    jobs.retain(|job| {
+        if let Some(reason) = unavailable.get(&job.input) {
+            rejected.push((job.input.clone(), reason.clone()));
+            false
+        } else {
+            true
+        }
+    });
+    jobs.extend(companions);
+}
+
+/// Missing inputs are rejected one at a time, so a stale queue row doesn't stop the library.
+fn collect_jobs(
+    cli: &Cli,
+    rejected: &mut Vec<(PathBuf, String)>,
+    missing: &mut Vec<PathBuf>,
+) -> Result<Vec<Job>> {
+    let mut jobs = Vec::new();
+    let mut known = HashSet::new();
+    let mut opt_out = HashSet::new();
+    let mut discover = true;
+    let mut excluded = Vec::new();
+    let mut add = |input: PathBuf, item: &ManifestItem, valid: bool| {
+        let key = input_key(&input);
+        if !known.insert(key.clone()) {
+            return;
+        }
+        let auto_iso = is_audio_path(&input) && is_iso_track(IsoMode::Auto, &input);
+        let iso = item
+            .iso_track
+            .unwrap_or_else(|| is_iso_track(cli.iso_tracks, &input));
+        if auto_iso && !iso {
+            opt_out.insert(key);
+        }
+        let zoom_recording = matches!(cli.iso_tracks, IsoMode::Auto)
+            && !iso
+            && !auto_iso
+            && is_audio_path(&input)
+            && zoom_candidate(&input).is_some();
+        if !valid && let Err(error) = validate_input(&input) {
+            if (auto_iso && iso) || zoom_recording {
+                missing.push(input.clone());
+            }
+            rejected.push((input, format!("{error:#}")));
+            return;
+        }
+        // An explicit diarize:false also overrides the global speaker count.
+        let speakers = if item.diarize == Some(false) {
+            None
+        } else {
+            item.speakers.or(cli.speakers)
+        };
+        if let Some(count) = speakers
+            && let Err(error) = speaker_count(&count.to_string())
+        {
+            if (auto_iso && iso) || zoom_recording {
+                missing.push(input.clone());
+            }
+            rejected.push((input, format!("invalid speakers {count}: {error}")));
+            return;
+        }
+        jobs.push(Job {
+            iso,
+            zoom_recording,
+            parts: Vec::new(),
+            input,
+            diarize: item.diarize.unwrap_or(cli.diarize) || speakers.is_some(),
+            speakers,
+            output: item.output.clone(),
+            output_dir: item
+                .output_dir
+                .clone()
+                .unwrap_or_else(|| cli.output_dir.clone()),
+            output_location: item.output_location.unwrap_or(cli.output_location),
+        });
+    };
     if let Some(manifest) = &cli.manifest {
         let manifest_path = expand_home(manifest);
         let content = fs::read_to_string(&manifest_path)
             .with_context(|| format!("reading job manifest {}", manifest_path.display()))?;
-        let manifest_data: JobManifest = serde_json::from_str(&content)
+        let manifest: JobManifest = serde_json::from_str(&content)
             .with_context(|| format!("parsing job manifest {}", manifest_path.display()))?;
         let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-        let mut jobs = Vec::with_capacity(manifest_data.items.len());
-        for item in manifest_data.items {
+        discover = manifest.discover_zoom.unwrap_or(true);
+        excluded = manifest
+            .excluded_inputs
+            .iter()
+            .map(|path| input_key(&resolve_manifest_path(base, path)))
+            .collect();
+        for mut item in manifest.items {
             let input = resolve_manifest_path(base, &item.input);
-            if let Err(error) = validate_input(&input) {
-                rejected.push((input, format!("{error:#}")));
-                continue;
-            }
-            // An explicit per-item `"diarize": false` wins over the global --speakers, which
-            // would otherwise be inherited and switch diarization back on.
-            let speakers = if item.diarize == Some(false) {
-                None
+            item.output = item.output.map(|path| resolve_manifest_path(base, &path));
+            item.output_dir = item
+                .output_dir
+                .map(|path| resolve_manifest_path(base, &path));
+            if input.is_dir() && item.output.is_none() {
+                for path in input_files(&input, true) {
+                    add(path, &item, true);
+                }
             } else {
-                item.speakers.or(cli.speakers)
-            };
-            let diarize = item.diarize.unwrap_or(cli.diarize) || speakers.is_some();
-            if let Some(count) = speakers
-                && let Err(error) = speaker_count(&count.to_string())
-            {
-                rejected.push((input, format!("invalid speakers {count}: {error}")));
-                continue;
+                add(input, &item, false);
             }
-            jobs.push(Job {
-                iso: item
-                    .iso_track
-                    .unwrap_or_else(|| is_iso_track(cli.iso_tracks, &input)),
-                parts: Vec::new(),
-                input,
-                diarize,
-                speakers,
-                output: item.output.map(|path| resolve_manifest_path(base, &path)),
-                output_dir: item
-                    .output_dir
-                    .map(|path| resolve_manifest_path(base, &path))
-                    .unwrap_or_else(|| cli.output_dir.clone()),
-                output_location: item.output_location.unwrap_or(cli.output_location),
-            });
         }
-        return Ok(jobs);
-    }
-    if let Some(dir) = &cli.input_dir {
-        let dir = expand_home(dir);
-        let mut paths = Vec::new();
-        if cli.recursive {
-            // Skip hidden entries (.Trashes, .Spotlight-V100, .fseventsd on volume roots hold
-            // deleted or system files) and `#recycle`-style folders, and keep going past
-            // unreadable folders: an error on any entry used to abort the whole run before a
-            // single file was transcribed.
-            let walker = WalkDir::new(&dir).into_iter().filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                // `#` only for folders: `#42 Standup.m4a` is a recording.
-                entry.depth() == 0
-                    || !(name.starts_with('.')
-                        || (entry.file_type().is_dir() && name.starts_with('#')))
-            });
-            for entry in walker {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        eprintln!("warning: skipping {error}");
-                        continue;
-                    }
-                };
-                // `path().is_file()` follows symlinks, matching the non-recursive branch.
-                if entry.path().is_file() && is_audio_path(entry.path()) {
-                    paths.push(entry.into_path());
-                } else if entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zoom"))
+    } else {
+        let settings = ManifestItem::default();
+        if let Some(dir) = &cli.input_dir {
+            let dir = expand_home(dir);
+            // Keep ordinary --input-dir non-recursive. Zoom libraries can contain
+            // meetings at any depth, including the nested Audio Record directory.
+            let auto = matches!(cli.iso_tracks, IsoMode::Auto);
+            fs::read_dir(&dir)
+                .with_context(|| format!("reading input directory {}", dir.display()))?;
+            for path in input_files(&dir, cli.recursive || auto) {
+                if cli.recursive
+                    || path.parent() == Some(dir.as_path())
+                    || (auto && zoom_candidate(&path).is_some())
                 {
-                    eprintln!(
-                        "warning: skipping {}: Zoom has not converted this recording yet; open \
-                         it in Zoom to convert it",
-                        entry.path().display()
-                    );
+                    add(path, &settings, true);
                 }
             }
         } else {
-            for entry in fs::read_dir(&dir)
-                .with_context(|| format!("reading input directory {}", dir.display()))?
-            {
-                let path = entry?.path();
-                if path.is_file() && is_audio_path(&path) {
-                    paths.push(path);
+            for path in cli.inputs.iter().map(|path| expand_home(path)) {
+                if path.is_dir() {
+                    for file in input_files(&path, true) {
+                        add(file, &settings, true);
+                    }
+                } else {
+                    add(path, &settings, false);
                 }
             }
         }
-        paths.sort();
-        Ok(paths
-            .into_iter()
-            .map(|input| Job {
-                iso: is_iso_track(cli.iso_tracks, &input),
-                parts: Vec::new(),
-                input,
-                diarize: cli.diarize || cli.speakers.is_some(),
-                speakers: cli.speakers,
-                output: None,
-                output_dir: cli.output_dir.clone(),
-                output_location: cli.output_location,
-            })
-            .collect())
-    } else {
-        let mut jobs = Vec::with_capacity(cli.inputs.len());
-        for path in &cli.inputs {
-            let path = expand_home(path);
-            if let Err(error) = validate_input(&path) {
-                rejected.push((path, format!("{error:#}")));
-                continue;
-            }
-            jobs.push(Job {
-                iso: is_iso_track(cli.iso_tracks, &path),
-                parts: Vec::new(),
-                input: path,
-                diarize: cli.diarize || cli.speakers.is_some(),
-                speakers: cli.speakers,
-                output: None,
-                output_dir: cli.output_dir.clone(),
-                output_location: cli.output_location,
-            });
-        }
-        Ok(jobs)
     }
+    if matches!(cli.iso_tracks, IsoMode::Auto) {
+        known.extend(excluded);
+        add_zoom_companions(&mut jobs, &mut known, &opt_out, discover, rejected);
+    }
+    Ok(jobs)
 }
 
 fn is_iso_track(mode: IsoMode, path: &Path) -> bool {
     match mode {
-        IsoMode::Auto => matches!(merge::parse_path(path), merge::TrackName::Zoom { .. }),
+        IsoMode::Auto => {
+            !is_video(path) && matches!(merge::parse_path(path), merge::TrackName::Zoom { .. })
+        }
         IsoMode::All => true,
         IsoMode::Off => false,
     }
@@ -3090,13 +3610,44 @@ fn model_display_name(value: &str) -> String {
         .to_owned()
 }
 
+/// Use the canonical source folder plus the meeting ID so equal folder names in
+/// different libraries get stable destinations even when processed in separate batches.
+fn zoom_destination(job: &Job, meeting: Option<&str>) -> PathBuf {
+    let source = session_folder(&job.input);
+    let identity = source
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .copied()
+        .chain([0])
+        .chain(meeting.unwrap_or_default().bytes());
+    // FNV-1a is stable across runs and Rust versions.
+    let hash = identity.fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    let name = source.file_name().unwrap_or_default().to_string_lossy();
+    let name = name.trim();
+    let name = &name[..name.floor_char_boundary(200)];
+    job.output_dir.join(format!("{name} [{hash:016x}]"))
+}
+
+fn fallback_output_path(cli: &Cli, job: &Job, folder: &Path, meeting: Option<&str>) -> PathBuf {
+    let name = folder.file_name().unwrap_or_default().to_string_lossy();
+    let name = &name[..name.floor_char_boundary(200)];
+    let extension = format_extension(cli.format);
+    match job.output_location {
+        OutputLocation::Folder => {
+            zoom_destination(job, meeting).join(format!("{name}.zoom.{extension}"))
+        }
+        OutputLocation::NextToSource => {
+            let name = meeting.map_or_else(|| name.to_owned(), |id| format!("{name} [{id}]"));
+            folder.join(format!("{name}.zoom.{extension}"))
+        }
+    }
+}
+
 fn output_path(cli: &Cli, job: &Job) -> PathBuf {
-    let extension = match cli.format {
-        OutputFormat::Txt => "txt",
-        OutputFormat::Json => "json",
-        OutputFormat::Srt => "srt",
-        OutputFormat::Vtt => "vtt",
-    };
+    let extension = format_extension(cli.format);
     if let Some(path) = &job.output {
         // Replace a transcript extension the caller supplied; otherwise append, so a dotted
         // name such as `out/meeting.2024` keeps its last component.
@@ -3114,6 +3665,12 @@ fn output_path(cli: &Cli, job: &Job) -> PathBuf {
         return PathBuf::from(name);
     }
     let parent = match job.output_location {
+        OutputLocation::Folder if job.zoom_recording => {
+            let id = zoom_recording_id(&job.input);
+            return zoom_destination(job, id.as_deref())
+                .join(job.input.file_name().unwrap_or_default())
+                .with_extension(extension);
+        }
         OutputLocation::Folder => job.output_dir.clone(),
         OutputLocation::NextToSource => job
             .input
@@ -3146,7 +3703,7 @@ fn output_clashes(cli: &Cli, jobs: &[&Job]) -> Vec<(PathBuf, String)> {
     for job in jobs {
         // APFS is case-insensitive by default, so compare case-folded paths; canonical ones,
         // so `a/talk.json` and `./a/talk.json` meet.
-        let key = output_key(&output_path(cli, job)).to_lowercase();
+        let key = folded_path(&output_key(&output_path(cli, job)));
         if let Some(previous) = seen.insert(key, &job.input) {
             let error = format!(
                 "{} and {} would both write {}; use a manifest with explicit outputs",
@@ -3165,10 +3722,69 @@ fn output_clashes(cli: &Cli, jobs: &[&Job]) -> Vec<(PathBuf, String)> {
 }
 
 fn input_key(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
+    fs::canonicalize(path).map_or_else(|_| output_key(path), |path| path.display().to_string())
+}
+
+fn folded_path(path: &str) -> String {
+    path.chars().flat_map(char::to_lowercase).nfc().collect()
+}
+
+/// A progress log is appended to before transcription starts. It must be a different
+/// file from every source and destination, including through symlinks or hard links.
+fn protect_progress_file(
+    cli: &Cli,
+    units: &[Unit],
+    skips: &[Skip],
+    rejected: &[(PathBuf, String)],
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(progress) = &cli.progress_file else {
+        return Ok(());
+    };
+    if fs::symlink_metadata(progress).is_ok_and(|info| info.is_symlink()) {
+        fs::canonicalize(progress)
+            .with_context(|| format!("resolving progress file {}", progress.display()))?;
+    }
+    let progress_key = folded_path(&input_key(progress));
+    let progress_metadata = fs::metadata(progress).ok();
+    let check = |candidate: &Path| -> Result<()> {
+        let same_inode = progress_metadata.as_ref().is_some_and(|log| {
+            fs::metadata(candidate)
+                .is_ok_and(|file| file.dev() == log.dev() && file.ino() == log.ino())
+        });
+        if same_inode || folded_path(&input_key(candidate)) == progress_key {
+            bail!(
+                "the progress file overlaps an input or transcript: {}",
+                candidate.display()
+            );
+        }
+        Ok(())
+    };
+    for unit in units {
+        for job in unit.jobs() {
+            check(&job.input)?;
+            for part in &job.parts {
+                check(part)?;
+            }
+            if unit.writes_job_outputs() {
+                check(&output_path(cli, job))?;
+            }
+        }
+        if let Unit::Session(session) = unit {
+            check(&session.output)?;
+        }
+    }
+    for skip in skips {
+        check(&skip.job.input)?;
+    }
+    for (input, _) in rejected {
+        check(input)?;
+    }
+    if let Some(manifest) = &cli.manifest {
+        check(&expand_home(manifest))?;
+    }
+    Ok(())
 }
 
 fn speaker_count(value: &str) -> std::result::Result<usize, String> {
@@ -3392,7 +4008,7 @@ mod tests {
             "--speakers".as_ref(),
             "2".as_ref(),
         ]);
-        let jobs = collect_jobs(&cli, &mut Vec::new()).unwrap();
+        let jobs = collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap();
         assert!(!jobs[0].diarize && jobs[0].speakers.is_none());
         assert!(jobs[1].diarize && jobs[1].speakers == Some(2));
         fs::remove_dir_all(directory.path()).unwrap();
@@ -3440,8 +4056,12 @@ mod tests {
             "--output-dir".as_ref(),
             out.as_os_str(),
         ]);
-        let (units, skips, _) =
-            plan_units(&cli, collect_jobs(&cli, &mut Vec::new()).unwrap()).unwrap();
+        let (units, skips, _) = plan_units(
+            &cli,
+            collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap(),
+            &[],
+        )
+        .unwrap();
         let summary = units
             .iter()
             .map(|unit| match unit {
@@ -3455,19 +4075,27 @@ mod tests {
                     "{} [{}] -> {}",
                     session.label,
                     session.speakers.join(", "),
-                    session.output.strip_prefix(&out).unwrap().display()
+                    session.output.file_name().unwrap().to_string_lossy()
                 ),
             })
             .collect::<Vec<_>>();
         assert_eq!(
             summary,
             [
-                "Meeting A 067067067 [Alice Smith, Alice Smith, Bob] -> Meeting A 067067067.merged.json",
-                "Meeting A 062062062 [Cara, Dan] -> Meeting A 062062062.merged.json",
+                "Meeting A [Alice Smith, Alice Smith, Bob] -> Meeting A.merged.json",
+                "Meeting A [Cara, Dan] -> Meeting A.merged.json",
                 "solo.wav",
                 "Podcast [Host, Guest] -> Podcast.merged.json",
             ]
         );
+        let Unit::Session(second_meeting) = &units[1] else {
+            panic!("not a session")
+        };
+        // The same folder can hold two Zoom meeting IDs.
+        let Unit::Session(first_meeting) = &units[0] else {
+            panic!("not a session")
+        };
+        assert_ne!(first_meeting.output, second_meeting.output);
         // The mixed recording belongs to no speaker, and the tracks cover it.
         assert_eq!(skips.len(), 1);
         assert!(skips[0].job.input.ends_with("audio1067067067.wav"));
@@ -3497,7 +4125,7 @@ mod tests {
             // Stopped and started again, without participant files.
             "B/audio1656027999.m4a",
             "B/audio2656027999.m4a",
-            // Only the host's track: the mixed recording has the client.
+            // Only the host has a participant track.
             "C/audio1878787878.m4a",
             "C/audio2878787878.m4a",
             "C/Audio Record/audioCarlGrey21878787878.m4a",
@@ -3539,8 +4167,12 @@ mod tests {
             "--output-dir".as_ref(),
             out.as_os_str(),
         ]);
-        let (units, skips, _) =
-            plan_units(&cli, collect_jobs(&cli, &mut Vec::new()).unwrap()).unwrap();
+        let (units, skips, _) = plan_units(
+            &cli,
+            collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap(),
+            &[],
+        )
+        .unwrap();
         let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
         let summary = units
             .iter()
@@ -3551,15 +4183,10 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(" + "),
                 Unit::Session(session) => format!(
-                    "{} [{}]{} -> {}",
+                    "{} [{}] -> {}",
                     session.label,
                     session.speakers.join(", "),
-                    session
-                        .mixed
-                        .as_ref()
-                        .map(|job| format!(" + {}", name(&job.input)))
-                        .unwrap_or_default(),
-                    session.output.strip_prefix(&out).unwrap().display()
+                    name(&session.output)
                 ),
             })
             .collect::<Vec<_>>();
@@ -3567,14 +4194,14 @@ mod tests {
             summary,
             [
                 "audio1656027999.m4a + audio2656027999.m4a",
-                "C [Carl Grey] + audio1878787878.m4a -> C/C.merged.json",
-                "D [Dana Reyes, Hana] -> D/D.merged.json",
+                "C [Carl Grey] -> C.merged.json",
+                "D [Dana Reyes, Hana] -> D.merged.json",
                 "talk.m4a",
-                "F [Alice, Alice, Bob, Bob] -> F/F.merged.json",
+                "F [Alice, Alice, Bob, Bob] -> F.merged.json",
                 "audio_only.m4a",
                 "audio_only01.m4a",
-                "H [Guest1, Guest2] -> H/H.merged.json",
-                "Meeting A [Alice Smith, Alice Smith, Bob] -> Meeting A/Meeting A.merged.json",
+                "H [Guest1, Guest2] -> H.merged.json",
+                "Meeting A [Alice Smith, Alice Smith, Bob] -> Meeting A.merged.json",
                 "#42 Standup.m4a",
                 "memo.m4a",
             ]
@@ -3582,15 +4209,7 @@ mod tests {
         let Unit::Session(one_track) = &units[1] else {
             panic!("not a session")
         };
-        let mixed = one_track.mixed.as_ref().unwrap();
-        assert_eq!(
-            mixed
-                .parts
-                .iter()
-                .map(|path| name(path))
-                .collect::<Vec<_>>(),
-            ["audio2878787878.m4a"]
-        );
+        assert_eq!(one_track.jobs.len(), 1);
         let mut skipped = skips
             .iter()
             .map(|skip| name(&skip.job.input))
@@ -3601,6 +4220,7 @@ mod tests {
             [
                 "TALK.webm",
                 "audio1067067067.wav",
+                "audio1878787878.m4a",
                 "audio2656027999.m4a",
                 "audio2878787878.m4a",
                 "audio_only.m4a",
@@ -3654,7 +4274,7 @@ mod tests {
         for file in [
             "M/audio1067067067.m4a",
             "M/video1067067067.mp4",
-            // Both write audioAlice11067067067.json.
+            // Two encodings of the same participant export.
             "M/Audio Record/audioAlice11067067067.m4a",
             "M/Audio Record/audioAlice11067067067.wav",
             "M/Audio Record/audioBob11067067067.m4a",
@@ -3672,8 +4292,12 @@ mod tests {
             "--output-dir".as_ref(),
             out.as_os_str(),
         ]);
-        let (mut units, mut skips, mut rejected) =
-            plan_units(&cli, collect_jobs(&cli, &mut Vec::new()).unwrap()).unwrap();
+        let (mut units, mut skips, mut rejected) = plan_units(
+            &cli,
+            collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(skips.len(), 2, "the mixed recording and the video");
         drop_clashes(&cli, &mut units, &mut rejected);
         reject_uncovered(&mut skips, &mut rejected);
@@ -3711,8 +4335,12 @@ mod tests {
                 "--output-location".as_ref(),
                 "next-to-source".as_ref(),
             ]);
-            let (units, _, _) =
-                plan_units(&cli, collect_jobs(&cli, &mut Vec::new()).unwrap()).unwrap();
+            let (units, _, _) = plan_units(
+                &cli,
+                collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap(),
+                &[],
+            )
+            .unwrap();
             units
                 .iter()
                 .map(|unit| match unit {
@@ -3784,7 +4412,7 @@ mod tests {
             "--input-dir".as_ref(),
             root.as_os_str(),
         ]);
-        let jobs = collect_jobs(&cli, &mut Vec::new());
+        let jobs = collect_jobs(&cli, &mut Vec::new(), &mut Vec::new());
         fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
         let inputs = jobs
             .unwrap()
@@ -3812,6 +4440,7 @@ mod tests {
             input: PathBuf::from(input),
             parts: Vec::new(),
             iso: false,
+            zoom_recording: false,
             diarize: false,
             speakers: None,
             output: None,
@@ -3975,7 +4604,7 @@ mod tests {
             missing.as_os_str(),
         ]);
         let mut rejected = Vec::new();
-        let jobs = collect_jobs(&cli, &mut rejected).unwrap();
+        let jobs = collect_jobs(&cli, &mut rejected, &mut Vec::new()).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].0, missing);
@@ -3984,7 +4613,7 @@ mod tests {
             "--input-dir".as_ref(),
             directory.path().as_os_str(),
         ]);
-        let jobs = collect_jobs(&cli, &mut Vec::new()).unwrap();
+        let jobs = collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap();
         assert_eq!(
             jobs.iter().map(|job| job.input.clone()).collect::<Vec<_>>(),
             vec![real]
@@ -3999,6 +4628,7 @@ mod tests {
             input: PathBuf::from("x.wav"),
             parts: Vec::new(),
             iso: false,
+            zoom_recording: false,
             diarize: false,
             speakers: None,
             output: Some(PathBuf::from(output)),

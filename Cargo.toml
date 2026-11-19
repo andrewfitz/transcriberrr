@@ -21,6 +21,7 @@ hf-hub = "0.4"
 libc = "0.2"
 ## Same letter/number test as the Qwen aligner (already in the dependency tree).
 unicode-general-category = "1.1"
+unicode-normalization = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 qwen3_asr = { git = "https://github.com/lumosimmo/qwen3-asr-rs.git", package = "qwen3_asr", features = ["metal", "forced-aligner", "audio-loading"] }
 candle-core = { version = "0.9", features = ["metal"] }

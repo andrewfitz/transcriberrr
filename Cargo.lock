@@ -9078,6 +9078,7 @@ dependencies = [
  "serde_json",
  "symphonia",
  "unicode-general-category",
+ "unicode-normalization",
  "walkdir",
 ]
 

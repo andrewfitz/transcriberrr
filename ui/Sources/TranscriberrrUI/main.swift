@@ -14,8 +14,9 @@ struct TranscriberrrUIApp: App {
     var body: some Scene {
         WindowGroup("Transcriberrr") {
             ContentView(state: state)
-                .frame(minWidth: 780, minHeight: 560)
+                .frame(minWidth: 780, minHeight: 640)
         }
+        .defaultSize(width: 900, height: 720)
         .windowResizability(.contentSize)
         .commands {
             // A second window would only mirror the same queue. The group must not be empty
@@ -43,10 +44,15 @@ final class AudioItem: ObservableObject, Identifiable {
     /// One speaker's track of a multi-track recording (a Zoom participant file, say): its
     /// session's tracks are transcribed together with bleed muted, then merged.
     @Published var isoTrack = false
+    var isoOverride: Bool?
     /// The speaker the CLI named this track after.
     @Published var speakerName: String?
     /// The session the CLI grouped this track into.
     @Published var sessionLabel: String?
+    var zoomMeeting: String?
+    var zoomRecording = false
+    var skipReason: String?
+    var coveredBy: [String]?
     @Published var outputURL: URL?
     @Published var resultSummary = ""
     @Published var elapsedSeconds: TimeInterval = 0
@@ -117,8 +123,13 @@ private struct SavedItem: Codable {
     var resultSummary: String
     /// Optional so queue files from older versions still decode.
     var isoTrack: Bool?
+    var isoOverride: Bool?
     var speakerName: String?
     var sessionLabel: String?
+    var zoomMeeting: String?
+    var zoomRecording: Bool?
+    var skipReason: String?
+    var coveredBy: [String]?
 }
 
 /// A session's merged transcript, reported by the CLI.
@@ -144,6 +155,8 @@ private struct SavedQueue: Codable {
     /// Optional so queue files from older versions still decode.
     var speakerTurns: Bool?
     var mergedSessions: [MergedSession]?
+    var zoomMeetings: [ZoomMeeting]?
+    var removedZoomInputs: Set<String>?
 }
 
 /// The Rust CLI manifest is intentionally small and stable.  Keeping a typed
@@ -156,7 +169,7 @@ private struct ManifestItem: Codable {
     var output: String?
     var outputDir: String
     var outputLocation: String
-    var isoTrack: Bool
+    var isoTrack: Bool?
 
     enum CodingKeys: String, CodingKey {
         case input
@@ -171,6 +184,46 @@ private struct ManifestItem: Codable {
 
 private struct JobManifest: Codable {
     var items: [ManifestItem]
+    var discoverZoom: Bool? = nil
+    var excludedInputs: [String]? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case items
+        case discoverZoom = "discover_zoom"
+        case excludedInputs = "excluded_inputs"
+    }
+}
+
+struct ZoomMeeting: Codable, Identifiable {
+    var id: String
+    var label: String
+    var output: String
+    var done: Bool
+    var participants: Int
+}
+
+private struct QueuePlan: Decodable {
+    struct File: Decodable {
+        var path: String
+        var meeting: String?
+        var speaker: String?
+        var output: String?
+        var iso: Bool?
+        var diarize: Bool?
+        var done: Bool?
+        var zoomRecording: Bool?
+        var skip: String?
+        var coveredBy: [String]?
+        var error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case path, meeting, speaker, output, iso, diarize, done, skip, error
+            case zoomRecording = "zoom_recording"
+            case coveredBy = "covered_by"
+        }
+    }
+    var files: [File]
+    var meetings: [ZoomMeeting]
 }
 
 private struct ProgressEvent: Decodable {
@@ -251,11 +304,12 @@ private final class URLCollector: @unchecked Sendable {
 private final class PipeCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
-    private let limit = 256 * 1024
+    private let limit: Int?
     private let onData: (@Sendable (Data) -> Void)?
     let pipe = Pipe()
 
-    init(onData: (@Sendable (Data) -> Void)? = nil) {
+    init(limit: Int? = 256 * 1024, onData: (@Sendable (Data) -> Void)? = nil) {
+        self.limit = limit
         self.onData = onData
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             // Read under the lock, so `finish`'s read cannot overtake a chunk read here and
@@ -277,7 +331,7 @@ private final class PipeCollector: @unchecked Sendable {
     /// With the lock held.
     private func append(_ chunk: Data) {
         data.append(chunk)
-        if data.count > limit { data.removeFirst(data.count - limit) }
+        if let limit, data.count > limit { data.removeFirst(data.count - limit) }
     }
 
     /// Call from the termination handler (or after a failed launch): stops the reader and
@@ -337,10 +391,13 @@ final class AppState: ObservableObject {
     @Published var modelActivityCanDismiss = false
     @Published var modelActivitySucceeded = false
     @Published var isCancelling = false
-    @Published var mergedSessions: [MergedSession] = []
+    @Published private var mergeResults: [String: MergedSession] = [:]
+    var mergedSessions: [MergedSession] { mergeResults.values.sorted { $0.id < $1.id } }
+    @Published var zoomMeetings: [ZoomMeeting] = []
+    private var removedZoomInputs: Set<String> = []
+    @Published var planningError: String?
+    @Published private(set) var addOperations = 0
 
-    // Keep in sync with AUDIO_EXTENSIONS in src/main.rs.
-    private let supportedExtensions: Set<String> = ["aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "m4v", "mov", "mp3", "mp4", "ogg", "opus", "wav", "webm"]
     private var pendingSave: Task<Void, Never>?
     @Published private(set) var modelStatus = "Checking the local model cache…"
     private var modelStatusTask: Task<Void, Never>?
@@ -372,10 +429,19 @@ final class AppState: ObservableObject {
     }
 
     var selectedItems: [AudioItem] { items.filter(\.selected) }
-    var selectedCount: Int { selectedItems.count }
-    var completedItemCount: Int { items.filter { if case .done = $0.state { return true }; return false }.count }
+    var selectedCount: Int {
+        let selected = selectedItems
+        return selected.filter { $0.zoomMeeting == nil }.count + Set(selected.compactMap(\.zoomMeeting)).count
+    }
+    var completedItemCount: Int {
+        let finished = Set(zoomMeetings.filter { meetingResult($0)?.state == "done" }.map(\.id))
+        return items.filter { $0.zoomMeeting.map(finished.contains) ?? ($0.state == .done) }.count
+    }
     var completedCount: Int {
-        selectedItems.filter { if case .done = $0.state { return true }; return false }.count
+        let selected = selectedItems
+        let groups = Set(selected.compactMap(\.zoomMeeting))
+        return selected.filter { $0.zoomMeeting == nil && $0.state == .done }.count
+            + zoomMeetings.filter { groups.contains($0.id) && meetingResult($0)?.state == "done" }.count
     }
     var totalDuration: TimeInterval { selectedItems.reduce(0) { $0 + $1.duration } }
     var activeStatus: String {
@@ -463,59 +529,234 @@ final class AppState: ObservableObject {
     }
 
     func add(urls: [URL]) {
-        // Walking a large or network folder takes a while; keep the window responsive.
-        let extensions = supportedExtensions
-        Task.detached(priority: .userInitiated) {
-            let discovered = Self.audioFiles(in: urls, extensions: extensions)
-            await MainActor.run { self.add(discovered: discovered) }
-        }
-    }
-
-    /// The audio files among `urls` and in the folders among them. Not inside packages: a
-    /// Photos, iMovie or Logic library dropped with ~/Pictures or ~/Movies holds media too.
-    nonisolated private static func audioFiles(in urls: [URL], extensions: Set<String>) -> [URL] {
-        let isSupported = { (url: URL) in extensions.contains(url.pathExtension.lowercased()) }
-        var discovered: [URL] = []
-        for url in urls {
-            let isDirectory = url.hasDirectoryPath
-                || (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-            if isDirectory {
-                if let enumerator = FileManager.default.enumerator(
-                    at: url, includingPropertiesForKeys: [.isRegularFileKey],
-                    options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
-                    for case let child as URL in enumerator where isSupported(child) {
-                        discovered.append(child)
+        guard !urls.isEmpty else { return }
+        let addFormat = format
+        let manifest = JobManifest(items: urls.map {
+            ManifestItem(input: $0.standardizedFileURL.path, diarize: diarize, outputDir: outputFolder.path,
+                         outputLocation: cliOutputLocation)
+        })
+        addOperations += 1
+        Task { @MainActor in
+            defer { addOperations -= 1 }
+            do {
+                var plan = try await preview(manifest, format: addFormat, inventoryOnly: true)
+                let overrides = itemsByPath(items.filter { $0.isoOverride != nil })
+                if plan.files.contains(where: { overrides[$0.path] != nil }), let defaults = manifest.items.first {
+                    let files = plan.files.map { file in
+                        var settings = defaults
+                        settings.input = file.path
+                        if let item = overrides[file.path] {
+                            settings.diarize = item.diarize
+                            settings.speakers = item.speakerCount
+                            settings.isoTrack = item.isoOverride
+                        }
+                        return settings
                     }
+                    plan = try await preview(JobManifest(items: files, discoverZoom: false),
+                                             format: addFormat, inventoryOnly: true)
                 }
-            } else if isSupported(url) {
-                discovered.append(url)
+                removedZoomInputs.subtract(plan.files.map(\.path))
+                applyPlan(plan)
+            } catch {
+                planningError = error.localizedDescription
             }
         }
-        return discovered
     }
 
-    private func add(discovered: [URL]) {
-        // Keep one queue entry per path, including when a dropped folder contains
-        // the same file as another dropped folder or an existing queue item.
-        var known = Set(items.map { $0.url.standardizedFileURL })
-        let newURLs = discovered
-            .filter { known.insert($0.standardizedFileURL).inserted }
-            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-        items.append(contentsOf: newURLs.map {
-            AudioItem(url: $0, diarize: diarize, isoTrack: isZoomParticipantTrack($0))
-        })
+    /// Read the full plan even for large libraries. stderr remains bounded.
+    private func preview(_ manifest: JobManifest, format: String, inventoryOnly: Bool = false) async throws -> QueuePlan {
+        guard let executableURL = cliURL else {
+            throw PlanningFailure(message: "The transcriberrr executable is unavailable. Rebuild the app bundle.")
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try JSONEncoder().encode(manifest).write(to: url, options: .atomic)
+        let process = Process()
+        let stdout = PipeCollector(limit: nil)
+        let stderr = PipeCollector()
+        process.executableURL = executableURL
+        process.arguments = ["--manifest", url.path, "--format", format, "--plan"]
+        if inventoryOnly { process.arguments?.append("--inventory-only") }
+        process.standardOutput = stdout.pipe
+        process.standardError = stderr.pipe
+        let result: (Int32, String, String) = try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { process in
+                if !inventoryOnly {
+                    Task { @MainActor in
+                        if self.activeProcess === process { self.activeProcess = nil }
+                    }
+                }
+                continuation.resume(returning: (process.terminationStatus, stdout.finish(), stderr.finish()))
+            }
+            let failedToLaunch: (Error) -> Void = { error in
+                _ = stdout.finish()
+                _ = stderr.finish()
+                continuation.resume(throwing: error)
+            }
+            if inventoryOnly {
+                do { try process.run() }
+                catch { failedToLaunch(error) }
+            } else {
+                launch(process, onFailure: failedToLaunch)
+            }
+        }
+        guard result.0 == 0 else {
+            throw PlanningFailure(message: result.2.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return try JSONDecoder().decode(QueuePlan.self, from: Data(result.1.utf8))
+    }
+
+    private struct PlanningFailure: LocalizedError {
+        var message: String
+        var errorDescription: String? { message }
+    }
+
+    @discardableResult
+    private func applyPlan(_ plan: QueuePlan, selectingMeetings: Bool = false) -> [AudioItem] {
+        var known = itemsByPath(items)
+        let unchecked = Set(items.filter { !$0.selected }.compactMap(\.zoomMeeting))
+        let updates = Dictionary(uniqueKeysWithValues: plan.meetings.map { ($0.id, $0) })
+        let completed = Set(plan.files.filter { $0.done == true }.map(\.path))
+        let affected = Set(plan.files.compactMap { known[$0.path]?.zoomMeeting })
+        for index in zoomMeetings.indices {
+            let meeting = zoomMeetings[index]
+            if updates[meeting.id] == nil, affected.contains(meeting.id), !outputExists(meeting.output) {
+                zoomMeetings[index].done = false
+                mergeResults.removeValue(forKey: meeting.output)
+            }
+        }
+        for old in zoomMeetings {
+            if let update = updates[old.id], update.output != old.output {
+                mergeResults.removeValue(forKey: old.output)
+            }
+        }
+        for meeting in plan.meetings {
+            if let result = mergeResults[meeting.output], result.state != "done" || !meeting.done {
+                mergeResults.removeValue(forKey: meeting.output)
+            }
+        }
+        zoomMeetings.removeAll { updates[$0.id] != nil }
+        zoomMeetings.append(contentsOf: plan.meetings)
+
+        var added: [URL] = []
+        let planned = plan.files.map { file in
+            let item: AudioItem
+            if let previous = known[file.path] {
+                item = previous
+            } else {
+                let url = URL(fileURLWithPath: file.path)
+                item = AudioItem(url: url, diarize: file.diarize ?? diarize, isoTrack: file.iso ?? false)
+                items.append(item)
+                known[file.path] = item
+            }
+            if file.error == nil {
+                if item.duration == 0 && file.skip == nil { added.append(item.url) }
+                item.zoomMeeting = file.meeting
+                if let meeting = file.meeting { item.selected = selectingMeetings || !unchecked.contains(meeting) }
+            }
+            if let zoomRecording = file.zoomRecording { item.zoomRecording = zoomRecording }
+            item.skipReason = file.skip
+            item.coveredBy = file.coveredBy
+            if let speaker = file.speaker {
+                item.isoTrack = true
+                item.diarize = false
+                item.speakerCount = nil
+                item.speakerName = speaker
+                item.sessionLabel = file.meeting.flatMap { updates[$0]?.label }
+                item.outputURL = nil
+            } else if file.error == nil && file.skip == nil {
+                if let iso = file.iso, selectingMeetings || item.isoOverride == nil { item.isoTrack = iso }
+                if selectingMeetings, let diarize = file.diarize { item.diarize = diarize }
+            }
+            if let error = file.error {
+                item.state = .failed(error)
+                item.progress = 0
+                item.resultSummary = error
+            } else if let skip = file.skip {
+                let covered = file.coveredBy?.contains(where: completed.contains) == true
+                    || hasSelectedCover(item, in: known)
+                item.state = covered ? .done : .queued
+                item.progress = covered ? 1 : 0
+                item.outputURL = nil
+                item.resultSummary = skip
+            } else if file.done == true {
+                item.state = .done
+                item.progress = 1
+                item.outputURL = file.output.map(URL.init(fileURLWithPath:))
+                item.resultSummary = "Transcript already exists"
+            } else if file.meeting != nil || file.zoomRecording == true {
+                item.state = .queued
+                item.progress = 0
+                item.outputURL = nil
+                item.resultSummary = ""
+            }
+            return item
+        }
+        let represented = Set(items.compactMap(\.zoomMeeting))
+        zoomMeetings.removeAll { !represented.contains($0.id) }
+        objectWillChange.send()
         saveQueue()
-        loadDurations(for: newURLs)
+        loadDurations(for: added)
+        return planned
+    }
+
+    private func itemsByPath(_ items: [AudioItem]) -> [String: AudioItem] {
+        Dictionary(items.map { (canonicalPath($0.url.path), $0) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    private func hasSelectedCover(_ item: AudioItem, in known: [String: AudioItem]) -> Bool {
+        var paths = item.coveredBy ?? []
+        var visited: Set<String> = []
+        while let path = paths.popLast() {
+            guard visited.insert(path).inserted, let cover = known[path], cover.selected else { continue }
+            if cover.state == .done, let output = cover.outputURL, outputExists(output.path) { return true }
+            paths.append(contentsOf: cover.coveredBy ?? [])
+        }
+        return false
+    }
+
+    private func outputExists(_ path: String) -> Bool {
+        var directory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &directory) && !directory.boolValue
+    }
+
+    private func reconcileSkippedRows(_ tracked: [AudioItem]) {
+        let known = itemsByPath(items)
+        for item in tracked where item.state == .done && item.zoomMeeting == nil {
+            if let reason = item.skipReason, item.outputURL == nil, !hasSelectedCover(item, in: known) {
+                item.state = .queued
+                item.progress = 0
+                item.resultSummary = reason
+            }
+        }
     }
 
     func remove(_ item: AudioItem) {
+        if item.zoomRecording { removedZoomInputs.insert(canonicalPath(item.url.path)) }
         items.removeAll { $0.id == item.id }
         saveQueue()
     }
 
+    func removeMeeting(_ meeting: ZoomMeeting) {
+        items.removeAll { $0.zoomMeeting == meeting.id }
+        zoomMeetings.removeAll { $0.id == meeting.id }
+        mergeResults.removeValue(forKey: meeting.output)
+        saveQueue()
+    }
+
+    func meetingResult(_ meeting: ZoomMeeting) -> MergedSession? {
+        mergeResults[meeting.output]
+            ?? (meeting.done ? MergedSession(id: meeting.output, label: meeting.label, state: "done",
+                                              message: "Transcript already exists") : nil)
+    }
+
     func clearCompleted() {
-        items.removeAll { if case .done = $0.state { return true }; return false }
-        mergedSessions.removeAll { $0.state == "done" }
+        let completed = Set(zoomMeetings.filter { meetingResult($0)?.state == "done" }.map(\.id))
+        items.removeAll { item in
+            item.zoomMeeting.map(completed.contains) ?? (item.state == .done)
+        }
+        zoomMeetings.removeAll { completed.contains($0.id) }
+        mergeResults = mergeResults.filter { $0.value.state != "done" }
         saveQueue()
     }
 
@@ -527,7 +768,10 @@ final class AppState: ObservableObject {
 
     func setDiarization(for item: AudioItem, enabled: Bool) {
         item.diarize = enabled
-        if enabled { item.isoTrack = false }
+        if enabled {
+            item.isoTrack = false
+            item.isoOverride = false
+        }
         if !enabled { item.speakerCount = nil }
         objectWillChange.send()
         saveQueue()
@@ -536,6 +780,7 @@ final class AppState: ObservableObject {
     /// A speaker track holds one speaker, so it is never diarized.
     func setIsoTrack(for item: AudioItem, enabled: Bool) {
         item.isoTrack = enabled
+        item.isoOverride = enabled
         if enabled {
             item.diarize = false
             item.speakerCount = nil
@@ -546,9 +791,11 @@ final class AppState: ObservableObject {
 
     /// Marks the visible rows as speaker tracks, or unmarks them if all already are.
     func toggleIsoTracks(_ visibleItems: [AudioItem]) {
-        let enable = !visibleItems.allSatisfy(\.isoTrack)
-        for item in visibleItems {
+        let editable = visibleItems.filter { $0.zoomMeeting == nil }
+        let enable = !editable.allSatisfy(\.isoTrack)
+        for item in editable {
             item.isoTrack = enable
+            item.isoOverride = enable
             if enable {
                 item.diarize = false
                 item.speakerCount = nil
@@ -562,31 +809,10 @@ final class AppState: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: session.id)])
     }
 
-    /// Zoom's "separate audio file for each participant" names, e.g.
-    /// `audioAndrewDaniel21067067067.m4a`. Keep in sync with parse_track_name in src/merge.rs.
-    /// The speaker-track session a row belongs to, as the CLI groups them: the meeting folder
-    /// (Zoom's `Audio Record` folder stands for its parent) and Zoom's 9-digit meeting ID. Also
-    /// for Zoom's mixed recording, which a meeting with one participant's track merges.
+    /// Non-Zoom speaker tracks are grouped by source folder.
     private func sessionKey(_ item: AudioItem) -> String? {
-        let stem = item.url.deletingPathExtension().lastPathComponent
-        let mixed = [#"^audio\d{9,10}$"#, #"^audio_only\d*$"#]
-            .contains { stem.range(of: $0, options: .regularExpression) != nil }
-        guard item.isoTrack || mixed else { return nil }
-        var folder = item.url.deletingLastPathComponent()
-        if folder.lastPathComponent.caseInsensitiveCompare("Audio Record") == .orderedSame {
-            folder = folder.deletingLastPathComponent()
-        }
-        let meeting = stem.range(of: #"\d{9}$"#, options: .regularExpression).map { String(stem[$0]) }
-        return canonicalPath(folder.path) + "|" + (meeting ?? "")
-    }
-
-    private func isZoomParticipantTrack(_ url: URL) -> Bool {
-        let stem = url.deletingPathExtension().lastPathComponent
-        // Name, then a 1–2 digit part number, the segment digit and the 9-digit meeting ID.
-        // As the CLI's parse_track_name: letters, accents and `'’-` (`_.` too after `audio_`).
-        return [#"^audio\p{L}[\p{L}\p{M}'’-]*\d{10,12}$"#, #"^audio_\p{L}[\p{L}\p{M}_.'’-]*\d{10,12}$"#,
-                #"^audio_only_\d+_.+$"#]
-            .contains { stem.range(of: $0, options: .regularExpression) != nil }
+        guard item.isoTrack && item.zoomMeeting == nil else { return nil }
+        return canonicalPath(item.url.deletingLastPathComponent().path)
     }
 
     func setSpeakerCount(for item: AudioItem, _ value: Int?) {
@@ -628,7 +854,9 @@ final class AppState: ObservableObject {
     }
 
     func selectAll(_ visibleItems: [AudioItem], selected: Bool) {
+        let meetings = Set(visibleItems.compactMap(\.zoomMeeting))
         visibleItems.forEach { $0.selected = selected }
+        items.filter { $0.zoomMeeting.map(meetings.contains) == true }.forEach { $0.selected = selected }
         objectWillChange.send()
         saveQueue()
     }
@@ -696,43 +924,82 @@ final class AppState: ObservableObject {
     }
 
     func transcribe() {
-        // Nothing selected or everything done: do not start a run (or model downloads).
-        guard !isRunning, items.contains(where: { $0.selected && $0.state != .done }) else { return }
+        guard !isRunning, addOperations == 0 else { return }
+        let known = itemsByPath(items)
+        let selectedMeetings = Set(selectedItems.compactMap(\.zoomMeeting))
+        let selected = items.filter { $0.selected || $0.zoomMeeting.map(selectedMeetings.contains) == true }
+        let coveredSkips = selected.filter {
+            $0.zoomMeeting == nil && !$0.zoomRecording && $0.skipReason != nil && hasSelectedCover($0, in: known)
+        }
+        let coveredIDs = Set(coveredSkips.map(\.id))
+        let newlyCovered = coveredSkips.filter { $0.state != .done }
+        for item in newlyCovered {
+            item.state = .done
+            item.progress = 1
+        }
+        if !newlyCovered.isEmpty {
+            objectWillChange.send()
+            saveQueue()
+        }
+        // Check Zoom destinations on every run, even if the queue previously marked them done.
+        var requested = selected.filter {
+            !coveredIDs.contains($0.id)
+                && ($0.state != .done || $0.zoomMeeting != nil || $0.zoomRecording || $0.skipReason != nil)
+        }
+        guard !requested.isEmpty else { return }
+        let sessions = Set(requested.compactMap(sessionKey))
+        let requestedIDs = Set(requested.map(\.id))
+        requested += selected.filter {
+            !requestedIDs.contains($0.id) && $0.skipReason == nil && sessionKey($0).map(sessions.contains) == true
+        }
+        let selectedIDs = Set(selected.map(\.id))
+        let excluded = Set(known.compactMap { path, item in selectedIDs.contains(item.id) ? nil : path })
+            .union(removedZoomInputs)
+        let manifest = makeRunManifest(requested, excluding: excluded.sorted())
         isRunning = true
         isCancelling = false
         startQueueClock()
         Task { @MainActor in
-            if outputDestination == .folder {
-                try? FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
-            }
-            // A file deleted or on an unmounted drive since it was queued would make the CLI
-            // reject the whole manifest; fail just that row instead.
-            // Checked on every run, so a row works again once its file is back.
-            var missing = Set<UUID>()
-            for item in items where item.selected && item.state != .done
-                && !FileManager.default.fileExists(atPath: item.url.path) {
-                missing.insert(item.id)
-                item.state = .failed("File not found")
-                item.resultSummary = "File not found: \(item.url.path)"
-            }
-            var pending = items.filter { $0.selected && $0.state != .done && !missing.contains($0.id) }
-            // The CLI merges only tracks transcribed in the same run, so a session with a track
-            // still to do runs whole again, with its mixed recording; otherwise its merge would
-            // lack the finished speakers, or with one track left not happen at all.
-            let sessions = Set(pending.filter(\.isoTrack).compactMap(sessionKey))
-            if !sessions.isEmpty {
-                let ids = Set(pending.map(\.id))
-                pending += items.filter {
-                    $0.selected && !ids.contains($0.id) && !missing.contains($0.id)
-                        && sessionKey($0).map(sessions.contains) == true
+            let pending: [AudioItem]
+            let tracked: [AudioItem]
+            let outputs: [UUID: URL]
+            let frozen: JobManifest
+            do {
+                let plan = try await preview(manifest, format: format)
+                if isCancelling { throw CancellationError() }
+                let planned = applyPlan(plan, selectingMeetings: true)
+                let accepted = zip(planned, plan.files).filter { $0.1.error == nil }
+                tracked = accepted.map(\.0)
+                pending = accepted.compactMap { item, file in
+                    file.done == true || file.skip != nil ? nil : item
                 }
-                let order = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($1.id, $0) })
-                pending.sort { order[$0.id, default: 0] < order[$1.id, default: 0] }
-            }
-            runItemIDs = Set(pending.map(\.id))
-            guard !pending.isEmpty else {
+                outputs = Dictionary(accepted.compactMap { item, file in
+                    file.output.map { (item.id, URL(fileURLWithPath: $0)) }
+                }, uniquingKeysWith: { first, _ in first })
+                let original = Dictionary(manifest.items.enumerated().map { index, item in
+                    (canonicalPath(item.input), (index, item.output))
+                }, uniquingKeysWith: { first, _ in first })
+                // Include discovered tracks and skipped continuations explicitly. If a
+                // track disappears during model setup, the CLI can reject the whole meeting.
+                let inputs = accepted.enumerated().map { index, entry in
+                    let (item, file) = entry
+                    let (order, output) = original[file.path] ?? (manifest.items.count + index, nil)
+                    return (order, manifestItem(for: item, input: file.path, output: file.output ?? output))
+                }.sorted { $0.0 < $1.0 }.map(\.1)
+                frozen = JobManifest(items: inputs, discoverZoom: false)
+            } catch {
+                if !isCancelling { planningError = error.localizedDescription }
                 finishQueueClock()
                 isRunning = false
+                isCancelling = false
+                return
+            }
+            runItemIDs = Set(pending.map(\.id))
+            guard !pending.isEmpty, !isCancelling else {
+                if isCancelling { markCanceled(pending) }
+                finishQueueClock()
+                isRunning = false
+                isCancelling = false
                 saveQueue()
                 return
             }
@@ -790,13 +1057,15 @@ final class AppState: ObservableObject {
             // Apple engine goes through the CLI too, which converts formats
             // AVFoundation cannot open (WebM) and validates the transcript.
             if !pending.isEmpty, !isCancelling {
-                let result = await runBulkCLI(for: pending)
+                let result = await runBulkCLI(frozen, for: tracked, outputs: outputs)
                 if isCancelling {
-                    applyFinished(result, to: pending)
+                    applyFinished(result, to: tracked)
                     markCanceled(pending)
                 } else {
-                    applyBulk(result, to: pending)
+                    applyBulk(result, to: tracked)
                 }
+                reconcileSkippedRows(tracked)
+                objectWillChange.send()
                 saveQueue()
             }
             if isCancelling { markCanceled(pending) }
@@ -998,7 +1267,7 @@ final class AppState: ObservableObject {
             item.estimatedRemainingSeconds = nil
             item.state = .done
             item.outputURL = output
-            item.resultSummary = output.map { "Saved to \($0.path)" } ?? "Transcription complete"
+            item.resultSummary = output.map { "Saved to \($0.path)" } ?? (event.phase ?? "Transcription complete")
             if let warning = event.warning {
                 // A file the CLI planned out (a meeting's video, say) has no output of its own.
                 item.resultSummary = output == nil ? warning : "\(warning). \(item.resultSummary)"
@@ -1023,7 +1292,7 @@ final class AppState: ObservableObject {
 
     /// Shows a session's merged transcript from its CLI event.
     private func applyMerge(_ event: ProgressEvent) {
-        let path = event.output ?? event.input
+        let path = event.input
         let state = switch event.status {
         case "completed", "skipped": "done"
         case "failed": "failed"
@@ -1031,18 +1300,14 @@ final class AppState: ObservableObject {
         default: "running"
         }
         let message = switch state {
-        case "done": event.warning.map { "Merged with warnings: \($0)" } ?? "Merged"
+        case "done": event.warning ?? (event.status == "skipped" ? "Transcript already exists" : "Merged")
         case "failed": event.error ?? "Merge failed"
         case "canceled": "Canceled"
         default: event.phase ?? "Waiting for its tracks…"
         }
         let session = MergedSession(id: path, label: event.group ?? URL(fileURLWithPath: path).lastPathComponent,
                                     state: state, message: message)
-        if let index = mergedSessions.firstIndex(where: { $0.id == path }) {
-            if mergedSessions[index] != session { mergedSessions[index] = session }
-        } else {
-            mergedSessions.append(session)
-        }
+        if mergeResults[path] != session { mergeResults[path] = session }
     }
 
     private func applyMerges(_ events: [String: ProgressEvent]) {
@@ -1051,9 +1316,10 @@ final class AppState: ObservableObject {
 
     /// A canceled or interrupted run leaves no session merging.
     private func stopRunningMerges() {
-        for index in mergedSessions.indices where mergedSessions[index].state == "running" {
-            mergedSessions[index].state = "canceled"
-            mergedSessions[index].message = "Canceled"
+        for (path, var result) in mergeResults where result.state == "running" {
+            result.state = "canceled"
+            result.message = "Canceled"
+            mergeResults[path] = result
         }
     }
 
@@ -1089,10 +1355,7 @@ final class AppState: ObservableObject {
                 item.state = .canceled
                 item.progress = 0
                 item.resultSummary = "Canceled"
-            } else if result.status == 0 {
-                // Use the path the manifest actually requested; `expectedOutput` ignores
-                // the `-2` suffix added for duplicate basenames.
-                let output = result.outputs[item.id] ?? expectedOutput(for: item)
+            } else if result.status == 0, let output = result.outputs[item.id] {
                 item.progress = 1
                 item.estimatedRemainingSeconds = nil
                 item.state = .done
@@ -1116,15 +1379,12 @@ final class AppState: ObservableObject {
     }
 
     /// Picks an output path that no other row uses and that does not replace an existing
-    /// file, unless that file is this row's own earlier transcript. The CLI runs with
-    /// --overwrite, so this is the only guard against clobbering, e.g., `notes.txt` beside
-    /// `notes.m4a`.
-    private func uniqueOutput(_ candidate: URL, for item: AudioItem, reserved: inout Set<String>) -> URL {
-        let own = item.outputURL?.standardizedFileURL.path.lowercased()
+    /// file such as notes.txt beside notes.m4a.
+    private func uniqueOutput(_ candidate: URL, reserved: inout Set<String>) -> URL {
         func available(_ url: URL) -> Bool {
             let key = url.standardizedFileURL.path.lowercased()
             guard !reserved.contains(key) else { return false }
-            guard key == own || !FileManager.default.fileExists(atPath: url.path) else { return false }
+            guard !FileManager.default.fileExists(atPath: url.path) else { return false }
             reserved.insert(key)
             return true
         }
@@ -1148,7 +1408,25 @@ final class AppState: ObservableObject {
         var outputs: [UUID: URL] = [:]
     }
 
-    private func runBulkCLI(for items: [AudioItem]) async -> BulkResult {
+    private var cliOutputLocation: String {
+        outputDestination == .folder ? "folder" : "next-to-source"
+    }
+
+    private func manifestItem(for item: AudioItem, input: String, output: String?) -> ManifestItem {
+        ManifestItem(input: input, diarize: item.diarize, speakers: item.speakerCount, output: output,
+                     outputDir: outputFolder.path, outputLocation: cliOutputLocation, isoTrack: item.isoOverride)
+    }
+
+    private func makeRunManifest(_ requested: [AudioItem], excluding: [String]) -> JobManifest {
+        var reserved = Set(items.compactMap { $0.outputURL?.standardizedFileURL.path.lowercased() })
+        return JobManifest(items: requested.map { item in
+            let output = item.zoomMeeting == nil && !item.zoomRecording
+                ? uniqueOutput(expectedOutput(for: item), reserved: &reserved).path : nil
+            return manifestItem(for: item, input: item.url.standardizedFileURL.path, output: output)
+        }, excludedInputs: excluding.isEmpty ? nil : excluding)
+    }
+
+    private func runBulkCLI(_ manifest: JobManifest, for items: [AudioItem], outputs: [UUID: URL]) async -> BulkResult {
         guard let executableURL = cliURL else {
             return BulkResult(status: 1, message: "The transcriberrr executable is not bundled. Rebuild the app with scripts/build-macos-app.sh.", progress: [:])
         }
@@ -1159,31 +1437,12 @@ final class AppState: ObservableObject {
         let progressURL = temporaryRoot.appendingPathComponent("progress.jsonl")
         do {
             try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
-            let destination = outputDestination == .folder ? outputFolder : items[0].url.deletingLastPathComponent()
-            let location = outputDestination == .folder ? "folder" : "next-to-source"
-            // Explicit output paths keep duplicate basenames from different source folders from
-            // overwriting each other when a large queue is written to one destination folder.
-            // Reserve transcripts that other rows already point at, so a same-named file
-            // from another folder in a later run cannot replace them.
-            let runIDs = Set(items.map(\.id))
-            var reserved = Set(self.items.filter { !runIDs.contains($0.id) }
-                .compactMap { $0.outputURL?.standardizedFileURL.path.lowercased() })
-            var outputs: [UUID: URL] = [:]
-            let manifestItems = items.map { item -> ManifestItem in
-                let output = uniqueOutput(expectedOutput(for: item), for: item, reserved: &reserved)
-                outputs[item.id] = output
-                return ManifestItem(input: item.url.standardizedFileURL.path, diarize: item.diarize,
-                                    speakers: item.speakerCount, output: output.path,
-                                    outputDir: destination.path, outputLocation: location,
-                                    isoTrack: item.isoTrack)
-            }
-            let manifest = JobManifest(items: manifestItems)
             let data = try JSONEncoder().encode(manifest)
             try data.write(to: manifestURL, options: .atomic)
-            var arguments = ["--manifest", manifestURL.path, "--output-dir", destination.path,
+            var arguments = ["--manifest", manifestURL.path, "--output-dir", outputFolder.path,
                              "--engine", cliEngine,
                              "--model", modelID, "--device", device, "--format", format,
-                             "--timestamps", timestamps, "--progress-file", progressURL.path, "--overwrite"]
+                             "--timestamps", timestamps, "--progress-file", progressURL.path, "--resume"]
             if format == "txt" && speakerTurns {
                 arguments.append("--speaker-turns")
             }
@@ -1277,11 +1536,12 @@ final class AppState: ObservableObject {
         modelID = saved.modelID
         engine = saved.engine ?? "qwen"
         speakerTurns = saved.speakerTurns ?? false
-        mergedSessions = (saved.mergedSessions ?? []).map { session in
-            var session = session
+        zoomMeetings = saved.zoomMeetings ?? []
+        removedZoomInputs = saved.removedZoomInputs ?? []
+        for var session in saved.mergedSessions ?? [] {
             // The app quit mid-merge.
             if session.state == "running" { session.state = "canceled"; session.message = "Canceled" }
-            return session
+            mergeResults[session.id] = session
         }
         let savedDiarizationPath = saved.diarizationModel
         let isLegacySortformerAlias = savedDiarizationPath == "sortformer"
@@ -1313,6 +1573,11 @@ final class AppState: ObservableObject {
             let item = AudioItem(url: url, id: value.id, duration: value.duration, diarize: value.diarize,
                                  speakerCount: value.diarize ? value.speakerCount : nil,
                                  isoTrack: value.isoTrack ?? false)
+            item.zoomMeeting = value.zoomMeeting
+            item.isoOverride = value.isoOverride ?? (saved.zoomMeetings == nil ? value.isoTrack : nil)
+            item.zoomRecording = value.zoomRecording ?? false
+            item.skipReason = value.skipReason
+            item.coveredBy = value.coveredBy
             item.speakerName = value.speakerName
             item.sessionLabel = value.sessionLabel
             item.state = value.state == "done" ? .done : value.state == "processing" ? .queued : value.state == "canceled" ? .canceled : value.state == "failed" ? .failed(value.error ?? "Transcription failed") : .queued
@@ -1346,7 +1611,7 @@ final class AppState: ObservableObject {
         let saved = SavedQueue(
             items: items.map { item in
                 let error: String? = if case .failed(let message) = item.state { message } else { nil }
-                return SavedItem(id: item.id, path: item.url.path, duration: item.duration, state: item.state.stateName, error: error, progress: item.progress, selected: item.selected, diarize: item.diarize, speakerCount: item.speakerCount, outputPath: item.outputURL?.path, resultSummary: item.resultSummary, isoTrack: item.isoTrack, speakerName: item.speakerName, sessionLabel: item.sessionLabel)
+                return SavedItem(id: item.id, path: item.url.path, duration: item.duration, state: item.state.stateName, error: error, progress: item.progress, selected: item.selected, diarize: item.diarize, speakerCount: item.speakerCount, outputPath: item.outputURL?.path, resultSummary: item.resultSummary, isoTrack: item.isoTrack, isoOverride: item.isoOverride, speakerName: item.speakerName, sessionLabel: item.sessionLabel, zoomMeeting: item.zoomMeeting, zoomRecording: item.zoomRecording, skipReason: item.skipReason, coveredBy: item.coveredBy)
             },
             outputFolder: outputFolder.path,
             outputDestination: outputDestination.rawValue,
@@ -1358,7 +1623,9 @@ final class AppState: ObservableObject {
             diarizeByDefault: diarize,
             engine: engine,
             speakerTurns: speakerTurns,
-            mergedSessions: mergedSessions
+            mergedSessions: mergedSessions,
+            zoomMeetings: zoomMeetings,
+            removedZoomInputs: removedZoomInputs
         )
         guard let data = try? JSONEncoder().encode(saved) else { return }
         try? FileManager.default.createDirectory(at: queueFile.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1395,18 +1662,11 @@ final class AppState: ObservableObject {
             .first { fileManager.isExecutableFile(atPath: $0.path) }
     }
 
-    private func isSupported(_ url: URL) -> Bool {
-        supportedExtensions.contains(url.pathExtension.lowercased())
-    }
-
     private func isLocalModelPath(_ value: String) -> Bool {
         value == "~" || value.hasPrefix("~/") || value.hasPrefix("/")
     }
 
-    private func isDirectory(_ url: URL) -> Bool {
-        if url.hasDirectoryPath { return true }
-        return (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-    }
+
 }
 
 private struct ModelActivitySheet: View {
@@ -1477,6 +1737,7 @@ struct ContentView: View {
     @State private var queueFilter = ""
     @State private var compiledFilter: NSRegularExpression?
     @State private var filterErrorMessage: String?
+    @State private var expandedMeetings: Set<String> = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1488,6 +1749,14 @@ struct ContentView: View {
             footer
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .alert("Couldn’t plan the queue", isPresented: Binding(
+            get: { state.planningError != nil },
+            set: { if !$0 { state.planningError = nil } }
+        )) {
+            Button("OK") { state.planningError = nil }
+        } message: {
+            Text(state.planningError ?? "")
+        }
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
             // Refuse (so Finder animates the files back) rather than silently drop them.
             guard !state.isRunning else { return false }
@@ -1537,18 +1806,27 @@ struct ContentView: View {
     }
 
     private var dropZone: some View {
-        VStack(spacing: 8) {
-            Image(systemName: dropTargeted ? "arrow.down.circle.fill" : "arrow.down.doc")
-                .font(.system(size: 32))
-                .foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary)
-            Text(dropTargeted ? "Release to add audio" : "Drop audio files or folders here")
-                .font(.headline)
-            Text("WAV, AIFF, CAF, M4A, M4B, MP3, MP4, FLAC, AAC, OGG, Opus, or WebM")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        Group {
+            if state.items.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: dropTargeted ? "arrow.down.circle.fill" : "arrow.down.doc")
+                        .font(.system(size: 32))
+                        .foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary)
+                    Text(dropTargeted ? "Release to add audio" : "Drop audio files or folders here")
+                        .font(.headline)
+                    Text("WAV, AIFF, CAF, M4A, M4B, MP3, MP4, FLAC, AAC, OGG, Opus, or WebM")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Label(dropTargeted ? "Release to add audio" : "Drop more files or folders",
+                      systemImage: dropTargeted ? "arrow.down.circle.fill" : "arrow.down.doc")
+                    .font(.callout)
+                    .foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary)
+            }
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 116)
+        .frame(height: state.items.isEmpty ? 116 : 44)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(dropTargeted ? Color.accentColor : .secondary.opacity(0.25), style: StrokeStyle(lineWidth: 2, dash: [8])))
         .padding(.horizontal, 20)
@@ -1564,11 +1842,21 @@ struct ContentView: View {
     }
 
     private var queue: some View {
-        VStack(spacing: 0) {
+        let visible = visibleItems
+        let visibleMeetings = Set(visible.compactMap(\.zoomMeeting))
+        let children = Dictionary(grouping: state.items.filter { $0.zoomMeeting != nil }, by: { $0.zoomMeeting ?? "" })
+        let meetingOutputs = Set(state.zoomMeetings.map(\.output))
+        let otherMerges = state.mergedSessions.filter { !meetingOutputs.contains($0.id) }
+        return VStack(spacing: 0) {
             HStack {
                 Text("Queue").font(.headline)
-                Text("\(state.items.count) file\(state.items.count == 1 ? "" : "s")").foregroundStyle(.secondary)
-                Text("• \(visibleItems.count) visible").foregroundStyle(.secondary)
+                let count = state.zoomMeetings.count
+                if count > 0 {
+                    Text("\(count) \(count == 1 ? "meeting" : "meetings")").foregroundStyle(.secondary)
+                }
+                if count == 0 || !queueFilter.isEmpty {
+                    Text("\(visible.count) \(visible.count == 1 ? "file" : "files")").foregroundStyle(.secondary)
+                }
                 Spacer()
                 TextField("Regex filter", text: $queueFilter)
                     .textFieldStyle(.roundedBorder)
@@ -1582,7 +1870,7 @@ struct ContentView: View {
                     .disabled(state.isRunning)
                 Button("Speaker tracks") { state.toggleIsoTracks(visibleItems) }
                     .buttonStyle(.borderless)
-                    .disabled(state.isRunning || visibleItems.isEmpty)
+                    .disabled(state.isRunning || !visible.contains { $0.zoomMeeting == nil })
                     .help("Mark the visible files as one speaker's track each (or unmark them). Tracks of one session are merged.")
                 Button("Clear completed") { state.clearCompleted() }
                     .buttonStyle(.borderless)
@@ -1595,16 +1883,104 @@ struct ContentView: View {
             }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(visibleItems) { item in queueRow(item) }
-                    if !state.mergedSessions.isEmpty {
+                    ForEach(state.zoomMeetings.filter { visibleMeetings.contains($0.id) }) { meeting in
+                        meetingRow(meeting, files: children[meeting.id] ?? [])
+                    }
+                    ForEach(visible.filter { $0.zoomMeeting == nil }) { item in queueRow(item) }
+                    if !otherMerges.isEmpty {
                         Text("Merged transcripts").font(.headline).padding(.top, 14).padding(.bottom, 4)
-                        ForEach(state.mergedSessions) { session in mergedRow(session) }
+                        ForEach(otherMerges) { session in mergedRow(session) }
                     }
                 }
                 .padding(.horizontal, 20)
             }
         }
         .frame(maxHeight: .infinity)
+    }
+
+    private func meetingRow(_ meeting: ZoomMeeting, files: [AudioItem]) -> some View {
+        let tracks = files.filter { $0.skipReason == nil }
+        let result = state.meetingResult(meeting)
+        let running = result?.state == "running" || tracks.contains { $0.state == .processing }
+        let failed = tracks.first { if case .failed = $0.state { return true }; return false }
+        let canceled = tracks.contains { $0.state == .canceled }
+        let included = files.contains(where: \.selected)
+        let progress = tracks.reduce(0.0) { $0 + $1.progress } / Double(max(1, tracks.count))
+        let status = result?.state == "done" ? "Merged"
+            : result?.state == "failed" || failed != nil ? "Failed"
+            : result?.state == "canceled" || canceled ? "Canceled"
+            : running ? "Transcribing" : "Queued"
+        let participants = meeting.participants == 1 ? "1 participant’s audio"
+            : "\(meeting.participants) participants"
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 10) {
+                Button {
+                    state.selectAll(files, selected: !included)
+                } label: {
+                    Image(systemName: included ? "checkmark.square.fill" : "square")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Include \(meeting.label) in transcription")
+                .accessibilityValue(included ? "On" : "Off")
+                .disabled(state.isRunning)
+                DisclosureGroup(isExpanded: Binding(
+                    get: { expandedMeetings.contains(meeting.id) },
+                    set: { expanded in
+                        if expanded { expandedMeetings.insert(meeting.id) }
+                        else { expandedMeetings.remove(meeting.id) }
+                    }
+                )) {
+                    ForEach(files) { item in
+                        HStack(alignment: .firstTextBaseline) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.speakerName ?? item.url.lastPathComponent)
+                                if item.speakerName != nil {
+                                    Text(item.url.lastPathComponent).font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Text(item.skipReason ?? (item.resultSummary.isEmpty ? item.state.label : item.resultSummary))
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
+                        .padding(.vertical, 3)
+                    }
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label(meeting.label, systemImage: "video")
+                            .font(.headline).lineLimit(1)
+                        Text("\(participants) • \(tracks.count) \(tracks.count == 1 ? "track" : "tracks")")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if running {
+                    ProgressView(value: min(progress, 0.99)).frame(width: 72)
+                        .accessibilityLabel("Progress for \(meeting.label)")
+                }
+                Text(status).font(.caption).foregroundStyle(status == "Merged" ? .green : status == "Failed" ? .red : .secondary)
+                    .frame(minWidth: 82, alignment: .trailing)
+                Button { state.removeMeeting(meeting) } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Remove \(meeting.label) from queue")
+                .disabled(state.isRunning)
+            }
+            if let result, result.state == "done" {
+                Button { state.revealMerged(result) } label: {
+                    Text(URL(fileURLWithPath: result.id).lastPathComponent).lineLimit(1)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.tint)
+                .accessibilityLabel("Show merged transcript in Finder")
+                .help(result.id)
+            }
+            if let message = result?.message ?? failed?.resultSummary {
+                Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Divider()
+        }
+        .padding(.vertical, 7)
     }
 
     private var visibleItems: [AudioItem] {
@@ -1904,12 +2280,7 @@ struct ContentView: View {
                 // confirming a field started the queue and Esc in the filter canceled a run.
                 .keyboardShortcut(state.isRunning ? "." : .return, modifiers: .command)
                     .buttonStyle(.borderedProminent)
-                    .disabled(state.items.isEmpty || state.isCancelling)
-            }
-            if state.selectedItems.contains(where: \.isoTrack) {
-                Text("Speaker tracks from one Zoom session or folder are transcribed together with the other speakers' bleed muted, then merged into one transcript per session, named after its folder.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .disabled(state.items.isEmpty || state.isCancelling || state.addOperations > 0)
             }
             if state.timestamps != "none" {
                 Text(state.timestamps == "words"
