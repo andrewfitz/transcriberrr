@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -18,6 +19,69 @@ enum QueueStatusFilter: String, CaseIterable, Identifiable {
     case skipped = "Skipped"
 
     var id: Self { self }
+
+    /// Status symbol shared by the queue and the inspector. `nil` keeps calm states text-only.
+    var symbol: String? {
+        switch self {
+        case .all, .ready: nil
+        case .waiting: "clock"
+        case .running: "waveform"
+        case .complete: "checkmark.circle.fill"
+        case .failed: "exclamationmark.triangle.fill"
+        case .canceled: "stop.circle"
+        case .skipped: "minus.circle"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .complete: .green
+        case .failed: .red
+        case .canceled: .orange
+        case .running: .accentColor
+        default: .secondary
+        }
+    }
+}
+
+/// A status label with a symbol, or a compact progress bar while transcribing.
+struct QueueStatusBadge: View {
+    let status: QueueStatusFilter
+    let label: String
+    var progress: Double? = nil
+    var indeterminate = false
+
+    var body: some View {
+        if status == .running {
+            HStack(spacing: 6) {
+                Group {
+                    if indeterminate || progress == nil {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        ProgressView(value: min(max(progress ?? 0, 0), 1))
+                            .frame(width: 54)
+                    }
+                }
+                Text(progress.map { "\(Int(($0 * 100).rounded()))%" } ?? label)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(label)
+            .accessibilityValue(progress.map { "\(Int(($0 * 100).rounded())) percent" } ?? "")
+        } else {
+            HStack(spacing: 4) {
+                if let symbol = status.symbol {
+                    Image(systemName: symbol)
+                        .foregroundStyle(status.tint)
+                        .imageScale(.small)
+                        .accessibilityHidden(true)
+                }
+                Text(label)
+                    .foregroundStyle(status == .failed ? Color.red : Color.secondary)
+            }
+        }
+    }
 }
 
 struct QueueScope: Equatable {
@@ -96,6 +160,13 @@ private struct QueueRow: Identifiable {
     let duration: TimeInterval
     let items: [AudioItem]
     let children: [QueueRow]
+    var detailIsError = false
+    var isChild = false
+    var progress: Double?
+    /// A finished transcript to open on double-click.
+    var transcript: URL?
+    /// The source file or folder to reveal in Finder.
+    var source: URL?
 
     var searchTerms: [String] {
         [title, detail] + items.flatMap { item in
@@ -105,18 +176,24 @@ private struct QueueRow: Identifiable {
 
     init(recording item: AudioItem, state: AppState, isChild: Bool = false) {
         id = .recording(item.id)
+        self.isChild = isChild
         title = isChild ? item.speakerName ?? item.url.lastPathComponent : item.url.lastPathComponent
         if isChild, item.speakerName != nil {
             detail = item.url.lastPathComponent
         } else if let skipped = item.skipReason {
             detail = skipped
-        } else if item.isoTrack {
-            detail = "Speaker track"
+        } else if case .failed(let error) = item.state, !isChild {
+            detail = error.split(whereSeparator: \.isNewline).first.map(String.init) ?? error
+            detailIsError = true
         } else {
-            let extensionLabel = item.url.pathExtension.uppercased()
-            detail = extensionLabel.isEmpty ? "Recording" : extensionLabel
+            var parts = [item.isoTrack ? "Speaker track" : item.url.pathExtension.uppercased()]
+            if item.diarize, !item.isoTrack { parts.append("Diarized") }
+            let folder = item.url.deletingLastPathComponent().lastPathComponent
+            if !folder.isEmpty, folder != "/" { parts.append(folder) }
+            detail = parts.filter { !$0.isEmpty }.joined(separator: " · ")
         }
         icon = item.isoTrack ? "person" : item.skipReason != nil ? "minus" : "waveform"
+        source = item.url
         let fallback: QueueStatusFilter
         switch item.state {
         case .failed: fallback = .failed
@@ -128,11 +205,21 @@ private struct QueueRow: Identifiable {
         let target: AppState.RunTarget = .recording(item.id)
         let current = !isChild && fallback != .skipped ? Self.passStatus(for: target, state: state) : nil
         status = current?.filter ?? fallback
-        statusLabel = current?.label ?? fallback.rawValue
+        if isChild, status == .ready || status == .waiting {
+            statusLabel = item.isoTrack ? "Speaker track" : status.rawValue
+        } else {
+            statusLabel = current?.label ?? fallback.rawValue
+        }
         statusDetail = item.skipReason ?? (item.resultSummary.isEmpty ? nil : item.resultSummary)
         duration = item.duration
         items = isChild ? [] : [item]
         children = []
+        progress = item.state == .processing && !state.activePassUsesApple ? item.progress : nil
+        if !isChild {
+            let saved = [item.outputURL].compactMap { $0 }
+                + state.modelOutputs(for: item).reversed().map { URL(fileURLWithPath: $0.path) }
+            transcript = saved.first { FileManager.default.fileExists(atPath: $0.path) }
+        }
     }
 
     init(meeting: ZoomMeeting, tracks: [AudioItem], state: AppState) {
@@ -161,6 +248,16 @@ private struct QueueRow: Identifiable {
         duration = speakers.map(\.duration).max() ?? 0
         items = tracks
         children = tracks.map { QueueRow(recording: $0, state: state, isChild: true) }
+        if status == .running, !state.activePassUsesApple, !speakers.isEmpty {
+            progress = speakers.reduce(0) { $0 + ($1.state == .done ? 1 : $1.progress) } / Double(speakers.count)
+        }
+        if result?.state == "done", let path = result?.id, FileManager.default.fileExists(atPath: path) {
+            transcript = URL(fileURLWithPath: path)
+        }
+        if let folder = tracks.first?.url.deletingLastPathComponent() {
+            source = folder.lastPathComponent.caseInsensitiveCompare("Audio Record") == .orderedSame
+                ? folder.deletingLastPathComponent() : folder
+        }
     }
 
     init(session: MergedSession) {
@@ -179,7 +276,20 @@ private struct QueueRow: Identifiable {
         duration = 0
         items = []
         children = []
+        if session.state == "done", FileManager.default.fileExists(atPath: session.id) {
+            transcript = URL(fileURLWithPath: session.id)
+        }
     }
+
+    var runTarget: AppState.RunTarget? {
+        switch id {
+        case .recording(let id) where !isChild: .recording(id)
+        case .meeting(let id): .meeting(id)
+        default: nil
+        }
+    }
+
+    var canRetry: Bool { runTarget != nil && (status == .failed || status == .canceled) }
 
     private static func passStatus(for target: AppState.RunTarget, state: AppState) -> (filter: QueueStatusFilter, label: String)? {
         guard state.isInCurrentRun(target) else { return nil }
@@ -200,6 +310,7 @@ struct QueueView: View {
     @ObservedObject var state: AppState
     @Binding var selection: QueueSelection?
     @Binding var scope: QueueScope
+    var retry: (QueueSelection) -> Void
     @State private var expandedMeetings: [String: Bool] = [:]
     @State private var dropTargeted = false
     @FocusState private var searchFocused: Bool
@@ -207,14 +318,14 @@ struct QueueView: View {
     var body: some View {
         let rows = scope.allRows(in: state)
         let visible = scope.filter(rows)
-        return VStack(alignment: .leading, spacing: 12) {
-            heading(rows)
+        return VStack(alignment: .leading, spacing: 10) {
             if rows.isEmpty {
                 emptyState
             } else {
                 filterBar(visible)
+                    .padding(.top, 10)
                 if let filterError = scope.filterError {
-                    Text("Invalid regular expression")
+                    Label("Invalid regular expression", systemImage: "exclamationmark.triangle.fill")
                         .font(.callout)
                         .foregroundStyle(.red)
                         .help(filterError)
@@ -237,49 +348,69 @@ struct QueueView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onDrop(of: [.fileURL], isTargeted: $dropTargeted, perform: dropFiles)
-    }
-
-    private func heading(_ rows: [QueueRow]) -> some View {
-        let meetings = rows.filter { if case .meeting = $0.id { return true }; return false }.count
-        let recordings = rows.filter { if case .recording = $0.id { return true }; return false }.count
-        let merges = rows.count - recordings - meetings
-        let counts = [
-            meetings > 0 ? "\(meetings) \(meetings == 1 ? "meeting" : "meetings")" : nil,
-            recordings > 0 ? "\(recordings) \(recordings == 1 ? "recording" : "recordings")" : nil,
-            merges > 0 ? "\(merges) \(merges == 1 ? "merged transcript" : "merged transcripts")" : nil,
-        ].compactMap { $0 }
-        return HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Queue").font(.title2.weight(.semibold)).accessibilityAddTraits(.isHeader)
-                if !counts.isEmpty {
-                    Text(counts.joined(separator: " · ")).foregroundStyle(.secondary)
-                }
-            }
-            Spacer()
-            if state.addOperations > 0 {
-                HStack(spacing: 7) {
-                    ProgressView().controlSize(.small)
-                    Text("Finding recordings…").foregroundStyle(.secondary)
-                }
-                .accessibilityElement(children: .combine)
+        .overlay {
+            if dropTargeted && !state.isRunning && !rows.isEmpty {
+                dropHighlight
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 12)
+        .animation(.easeOut(duration: 0.15), value: dropTargeted)
+        .onDrop(of: [.fileURL], isTargeted: $dropTargeted, perform: dropFiles)
+        .background {
+            // ⌘F focuses the queue filter.
+            Button("Find") { searchFocused = true }
+                .keyboardShortcut("f")
+                .opacity(0)
+                .frame(width: 0, height: 0)
+                .accessibilityHidden(true)
+                .disabled(rows.isEmpty)
+        }
+    }
+
+    private var dropHighlight: some View {
+        RoundedRectangle(cornerRadius: 10)
+            .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [7, 5]))
+            .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(alignment: .bottom) {
+                Label("Drop to Add Recordings", systemImage: "plus.circle.fill")
+                    .font(.callout.weight(.medium))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.bottom, 18)
+            }
+            .padding(6)
+            .allowsHitTesting(false)
+            .transition(.opacity)
     }
 
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label(dropTargeted && !state.isRunning ? "Release to Add Recordings" : "No Recordings",
-                  systemImage: "waveform")
+        let targeted = dropTargeted && !state.isRunning
+        return ContentUnavailableView {
+            Label(targeted ? "Release to Add Recordings" : "No Recordings",
+                  systemImage: targeted ? "plus.circle" : "waveform")
         } description: {
-            Text("Drop recordings, folders, or a Zoom library here.")
+            if state.addOperations > 0 {
+                Text("Finding recordings…")
+            } else {
+                Text("Drop audio or video files, folders, or a Zoom library here.")
+            }
         } actions: {
-            Button("Add Recordings…", action: state.chooseFiles)
-                .disabled(state.isRunning)
+            if state.addOperations > 0 {
+                ProgressView().controlSize(.small)
+            } else {
+                Button("Add Recordings…", action: state.chooseFiles)
+                    .disabled(state.isRunning)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(targeted ? Color.accentColor : Color.secondary.opacity(0.35),
+                              style: StrokeStyle(lineWidth: targeted ? 2 : 1, dash: [7, 5]))
+                .background(targeted ? Color.accentColor.opacity(0.06) : .clear,
+                            in: RoundedRectangle(cornerRadius: 12))
+                .padding(16)
+        }
     }
 
     private func filterBar(_ visible: [QueueRow]) -> some View {
@@ -287,11 +418,32 @@ struct QueueView: View {
         let ordinary = visibleItems.filter { $0.zoomMeeting == nil }
         let allSpeakerTracks = !ordinary.isEmpty && ordinary.allSatisfy(\.isoTrack)
         return HStack(spacing: 8) {
-            TextField("Find a recording", text: $scope.query)
-                .textFieldStyle(.roundedBorder)
-                .focused($searchFocused)
-                .frame(idealWidth: 188, maxWidth: 245)
-                .accessibilityLabel("Find a recording")
+            HStack(spacing: 4) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                TextField("Find a recording", text: $scope.query)
+                    .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                    .onExitCommand { scope.query = ""; searchFocused = false }
+                    .accessibilityLabel("Find a recording")
+                if !scope.query.isEmpty {
+                    Button {
+                        scope.query = ""
+                        searchFocused = true
+                    } label: {
+                        Label("Clear Search", systemImage: "xmark.circle.fill")
+                            .labelStyle(.iconOnly)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.background, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.separator))
+            .frame(idealWidth: 210, maxWidth: 260)
             Toggle(isOn: $scope.usesRegex) {
                 Text(".*").monospaced()
             }
@@ -307,6 +459,13 @@ struct QueueView: View {
             .fixedSize()
             .accessibilityLabel("Filter by status")
             Spacer(minLength: 4)
+            if state.addOperations > 0 {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Finding recordings…").foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+            }
             Menu {
                 Button("Include Visible") { state.selectAll(visibleItems, selected: true) }
                     .disabled(visibleItems.isEmpty)
@@ -325,6 +484,7 @@ struct QueueView: View {
             }
             .menuIndicator(.hidden)
             .fixedSize()
+            .help("Queue actions")
             .disabled(state.isRunning)
         }
         .controlSize(.small)
@@ -341,16 +501,18 @@ struct QueueView: View {
                 if row.duration.isFinite, row.duration > 0 {
                     Text(Duration.seconds(row.duration).formatted(.time(pattern: row.duration >= 3600 ? .hourMinuteSecond : .minuteSecond)))
                         .monospacedDigit()
+                        .foregroundStyle(row.isChild ? .secondary : .primary)
                 }
             }
             .width(min: 60, ideal: 72, max: 100)
             .alignment(.trailing)
             TableColumn("Status") { row in
-                Text(row.statusLabel)
-                    .foregroundStyle(row.status == .failed ? Color.red : Color.secondary)
+                QueueStatusBadge(status: row.status, label: row.statusLabel, progress: row.progress,
+                                 indeterminate: state.activePassUsesApple)
+                    .font(row.isChild ? .callout : nil)
                     .help(row.statusDetail ?? row.statusLabel)
             }
-            .width(min: 88, ideal: 96, max: 130)
+            .width(min: 96, ideal: 118, max: 150)
             .alignment(.trailing)
         } rows: {
             ForEach(rows) { row in
@@ -373,6 +535,24 @@ struct QueueView: View {
             if let row = rows.first(where: { ids.contains($0.id) }) {
                 rowActions(row)
             }
+        } primaryAction: { ids in
+            guard let row = rows.first(where: { ids.contains($0.id) }) else { return }
+            if let transcript = row.transcript {
+                NSWorkspace.shared.open(transcript)
+            } else if let source = row.source {
+                NSWorkspace.shared.activateFileViewerSelecting([source])
+            }
+        }
+        .onDeleteCommand {
+            guard !state.isRunning, let selected = selection,
+                  let row = rows.first(where: { $0.id == selected }) else { return }
+            remove(row)
+        }
+        .onKeyPress(.space) {
+            guard !state.isRunning, let selected = selection,
+                  let row = rows.first(where: { $0.id == selected }), !row.items.isEmpty else { return .ignored }
+            state.selectAll(row.items, selected: !row.items.contains(where: \.selected))
+            return .handled
         }
     }
 
@@ -388,50 +568,66 @@ struct QueueView: View {
                 .labelsHidden()
                 .toggleStyle(.checkbox)
                 .disabled(state.isRunning)
+                .help("Include in the next run")
             }
             Image(systemName: row.icon)
                 .foregroundStyle(.secondary)
+                .frame(width: 16)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                Text(row.title).lineLimit(1)
+                Text(row.title)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(row.status == .skipped ? .secondary : .primary)
                 if !row.detail.isEmpty {
                     Text(row.detail)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(row.detailIsError ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
                         .lineLimit(1)
+                        .truncationMode(.tail)
                 }
             }
-            .help(row.detail.isEmpty ? row.title : "\(row.title)\n\(row.detail)")
+            .help(row.detail.isEmpty ? row.title : "\(row.title)\n\(row.statusDetail ?? row.detail)")
         }
         .padding(.vertical, 3)
     }
 
     @ViewBuilder
     private func rowActions(_ row: QueueRow) -> some View {
-        switch row.id {
-        case .recording:
-            if let item = row.items.first {
-                Button(item.selected ? "Exclude from Run" : "Include in Run") {
-                    state.setSelection(for: item, !item.selected)
-                }
-                .disabled(state.isRunning)
-                Button("Remove from Queue", role: .destructive) { state.remove(item) }
-                    .disabled(state.isRunning)
+        if let transcript = row.transcript {
+            Button("Open Transcript") { NSWorkspace.shared.open(transcript) }
+            Button("Show Transcript in Finder") { NSWorkspace.shared.activateFileViewerSelecting([transcript]) }
+        }
+        if let source = row.source {
+            Button(row.items.count > 1 ? "Show Meeting Folder in Finder" : "Show Recording in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([source])
             }
-        case .meeting(let id):
+        }
+        if row.canRetry {
+            Divider()
+            Button("Retry") { retry(row.id) }
+                .disabled(state.isRunning || state.addOperations > 0 || state.downloadingLibraryModel != nil)
+        }
+        if !row.items.isEmpty {
+            Divider()
             let included = row.items.contains(where: \.selected)
             Button(included ? "Exclude from Run" : "Include in Run") {
                 state.selectAll(row.items, selected: !included)
             }
             .disabled(state.isRunning)
-            if let meeting = state.zoomMeetings.first(where: { $0.id == id }) {
-                Button("Remove from Queue", role: .destructive) { state.removeMeeting(meeting) }
-                    .disabled(state.isRunning)
-            }
-        case .merge(let id):
-            if let session = state.mergedSessions.first(where: { $0.id == id && $0.state == "done" }) {
-                Button("Show in Finder") { state.revealMerged(session) }
-            }
+            Button("Remove from Queue", role: .destructive) { remove(row) }
+                .disabled(state.isRunning)
+        }
+    }
+
+    private func remove(_ row: QueueRow) {
+        switch row.id {
+        case .recording(let id):
+            if let item = state.items.first(where: { $0.id == id }) { state.remove(item) }
+        case .meeting(let id):
+            if let meeting = state.zoomMeetings.first(where: { $0.id == id }) { state.removeMeeting(meeting) }
+        case .merge:
+            break
         }
     }
 
