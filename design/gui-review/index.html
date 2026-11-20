@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Transcriberrr · Queue review</title>
+    <link rel="stylesheet" href="mockup.css">
+    <script src="mockup.js" defer></script>
+</head>
+<body>
+    <div class="window">
+        <header class="toolbar">
+            <span class="lights" aria-hidden="true"><i></i><i></i><i></i></span>
+            <strong class="window-title">Transcriberrr</strong>
+            <div class="toolbar-actions push" role="group" aria-label="Window actions">
+                <button id="models">Model Library</button>
+                <button id="add">＋ Add Recordings</button>
+            </div>
+        </header>
+        <div class="layout">
+            <main class="queue">
+                <div class="queue-heading">
+                    <h1>Queue</h1>
+                    <p id="count"></p>
+                </div>
+                <div id="filterBar" class="filter-bar">
+                    <div class="search-group">
+                        <input id="query" type="search" placeholder="Find a recording" aria-label="Find a recording" aria-describedby="searchError">
+                        <button id="regex" class="regex" type="button" title="Use a regular expression" aria-label="Use a regular expression" aria-pressed="false">.*</button>
+                    </div>
+                    <select id="filter" aria-label="Filter by status">
+                        <option value="">All statuses</option>
+                        <option>Ready</option>
+                        <option>Waiting</option>
+                        <option>Running</option>
+                        <option>Complete</option>
+                        <option>Failed</option>
+                        <option>Canceled</option>
+                    </select>
+                    <details class="actions push" id="queueActions">
+                        <summary title="Queue actions" aria-label="Queue actions">•••</summary>
+                        <div class="menu">
+                            <button data-action="include">Include visible</button>
+                            <button data-action="exclude">Exclude visible</button>
+                            <button data-action="tracks">Set speaker tracks…</button>
+                            <button data-action="clear">Clear completed</button>
+                        </div>
+                    </details>
+                </div>
+                <p id="searchError" class="search-error" hidden></p>
+                <div class="columns" id="columns" aria-hidden="true"><span></span><span>Recording</span><span>Duration</span><span>Status</span></div>
+                <div id="rows"></div>
+            </main>
+            <aside class="inspector" aria-label="Inspector">
+                <div class="tabs" aria-label="Inspector view">
+                    <button id="rec" type="button" aria-pressed="true">Recording</button>
+                    <button id="run" type="button" aria-pressed="false">Run settings</button>
+                </div>
+                <div id="ins"></div>
+            </aside>
+        </div>
+        <footer class="runbar">
+            <div class="run-summary">
+                <strong id="footTitle" aria-live="polite"></strong>
+                <div id="footDetail">
+                    <button id="setupSummary" class="setup-summary" aria-label="Open run settings"></button>
+                    <span id="footSub" hidden></span>
+                </div>
+                <progress id="runProgress" aria-label="Overall transcription progress" hidden></progress>
+            </div>
+            <button id="start" class="primary push"></button>
+        </footer>
+    </div>
+    <div class="review">
+        <label for="scenario">Prototype state</label>
+        <select id="scenario">
+            <option>Queue</option>
+            <option>Empty</option>
+            <option>Running</option>
+            <option>Failed</option>
+            <option>Complete</option>
+        </select>
+    </div>
+    <dialog id="sheet" aria-labelledby="sheetTitle">
+        <div class="sheet-head">
+            <h2 id="sheetTitle"></h2>
+            <button id="closeSheet" class="quiet" aria-label="Close dialog">×</button>
+        </div>
+        <div id="sheetBody"></div>
+    </dialog>
+</body>
+</html>
