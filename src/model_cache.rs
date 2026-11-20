@@ -55,6 +55,11 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         description: "Parakeet Unified English 0.6B ONNX (latest)",
     },
     ModelSpec {
+        id: PARAKEET_TDT_V3,
+        kind: "asr",
+        description: "Parakeet TDT v3 0.6B ONNX (legacy)",
+    },
+    ModelSpec {
         id: SORTFORMER_4SPK,
         kind: "diarization",
         description: "Sortformer streaming 4-speaker diarization",
@@ -65,6 +70,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
 #[derive(Debug, Clone)]
 pub struct ModelCache {
     root: PathBuf,
+    offline: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,12 +83,12 @@ pub struct ModelStatus {
 }
 
 impl ModelCache {
-    pub fn new(root: Option<PathBuf>) -> Result<Self> {
+    pub fn new(root: Option<PathBuf>, offline: bool) -> Self {
         let root = root.unwrap_or_else(default_cache_dir);
-        let root = expand_home(&root);
-        fs::create_dir_all(&root)
-            .with_context(|| format!("creating model cache {}", root.display()))?;
-        Ok(Self { root })
+        Self {
+            root: expand_home(&root),
+            offline,
+        }
     }
 
     /// Resolve a model ID or local directory.  A remote ID is downloaded into this cache and the
@@ -114,7 +120,7 @@ impl ModelCache {
     pub fn repair(&self, id_or_path: &str) -> Result<Option<PathBuf>> {
         let expanded = expand_home(Path::new(id_or_path));
         let id = canonical_id(&expanded.to_string_lossy());
-        if Path::new(&id).exists() {
+        if self.offline || Path::new(&id).exists() {
             return Ok(None);
         }
         self.fetch(&id).map(Some)
@@ -134,6 +140,13 @@ impl ModelCache {
 
     /// Download `id` into the cache; files already present are not fetched again.
     fn fetch(&self, id_or_path: &str) -> Result<PathBuf> {
+        if self.offline {
+            bail!(
+                "model {id_or_path:?} is not available locally (--offline); prefetch it with --download-model or supply a local model path"
+            );
+        }
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("creating model cache {}", self.root.display()))?;
         let id_or_path = id_or_path.to_owned();
         let api = ApiBuilder::from_cache(Cache::new(self.root.clone()))
             .with_progress(true)
@@ -211,7 +224,28 @@ impl ModelCache {
     /// `ApiRepo::get` with progress the app can show. hf-hub's progress bar draws nothing when
     /// stderr is not a terminal, so the app's download window sat on a spinner for gigabytes;
     /// there, report plain `Downloading FILE: NN%` lines instead.
+    /// hf-hub gives up on a file another process is downloading after about 5 s; wait for that
+    /// download instead (the file is then found in the cache).
     fn get_file(&self, repo: &ApiRepo, id: &str, filename: &str) -> Result<PathBuf, ApiError> {
+        let mut announced = false;
+        loop {
+            match self.get_file_once(repo, id, filename) {
+                Err(ApiError::LockAcquisition(path)) => {
+                    if crate::cancel_requested() {
+                        return Err(ApiError::LockAcquisition(path));
+                    }
+                    if !announced {
+                        eprintln!("Waiting for another download of {id}/{filename}");
+                        announced = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn get_file_once(&self, repo: &ApiRepo, id: &str, filename: &str) -> Result<PathBuf, ApiError> {
         if std::io::stderr().is_terminal() {
             return repo.get(filename);
         }
@@ -445,7 +479,7 @@ mod tests {
         fs::write(root.join("models--Org--Model/refs/main"), "abc").unwrap();
         fs::write(snapshot.join("config.json"), "{}").unwrap();
         fs::write(snapshot.join("model.safetensors"), "").unwrap();
-        let cache = ModelCache::new(Some(root.clone())).unwrap();
+        let cache = ModelCache::new(Some(root.clone()), true);
         assert_eq!(cache.cached_path("Org/Model"), Some(snapshot.clone()));
         fs::write(cache.incomplete_marker("Org/Model"), "").unwrap();
         assert_eq!(cache.cached_path("Org/Model"), None);

@@ -13,10 +13,10 @@ struct TranscriberrrUIApp: App {
 
     var body: some Scene {
         WindowGroup("Transcriberrr") {
-            ContentView(state: state)
-                .frame(minWidth: 780, minHeight: 640)
+            QueueWindow(state: state)
+                .frame(minWidth: 660, minHeight: 460)
         }
-        .defaultSize(width: 900, height: 720)
+        .defaultSize(width: 1050, height: 720)
         .windowResizability(.contentSize)
         .commands {
             // A second window would only mirror the same queue. The group must not be empty
@@ -54,6 +54,7 @@ final class AudioItem: ObservableObject, Identifiable {
     var skipReason: String?
     var coveredBy: [String]?
     @Published var outputURL: URL?
+    var modelOutputs: [ModelOutput] = []
     @Published var resultSummary = ""
     @Published var elapsedSeconds: TimeInterval = 0
     @Published var estimatedRemainingSeconds: TimeInterval?
@@ -130,6 +131,38 @@ private struct SavedItem: Codable {
     var zoomRecording: Bool?
     var skipReason: String?
     var coveredBy: [String]?
+    var modelOutputs: [String: String]?
+    var modelOutputHistory: [ModelOutput]?
+}
+
+struct ModelOutput: Codable, Identifiable, Equatable {
+    var tag: String
+    var path: String
+    var id: String { path }
+}
+
+struct TranscriptionPass: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var engine: String
+    var model = ""
+
+    var usesApple: Bool { engine == "apple-native" }
+    var cliEngine: String { engine == "qwen" ? "qwen3" : engine }
+
+    var defaultModel: String {
+        switch engine {
+        case "parakeet-v3": "eschmidbauer/parakeet-unified-en-0.6b-onnx"
+        case "apple-native": "Apple SpeechTranscriber"
+        default: "Qwen/Qwen3-ASR-1.7B"
+        }
+    }
+
+    var modelArgument: String {
+        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.isEmpty || usesApple ? defaultModel : model
+    }
+
+    var arguments: [String] { ["--engine", cliEngine, "--model", modelArgument] }
 }
 
 /// A session's merged transcript, reported by the CLI.
@@ -139,6 +172,8 @@ struct MergedSession: Codable, Identifiable, Equatable {
     var label: String
     var state: String
     var message: String
+    var meetingID: String?
+    var modelTag: String?
 }
 
 private struct SavedQueue: Codable {
@@ -157,6 +192,9 @@ private struct SavedQueue: Codable {
     var mergedSessions: [MergedSession]?
     var zoomMeetings: [ZoomMeeting]?
     var removedZoomInputs: Set<String>?
+    var additionalPasses: [TranscriptionPass]?
+    var appendModelID: Bool?
+    var passOutcomes: [AppState.RunTarget: [AppState.PassOutcome]]?
 }
 
 /// The Rust CLI manifest is intentionally small and stable.  Keeping a typed
@@ -214,12 +252,15 @@ private struct QueuePlan: Decodable {
         var zoomRecording: Bool?
         var skip: String?
         var coveredBy: [String]?
+        var mergeOutput: String?
+        var group: String?
         var error: String?
 
         enum CodingKeys: String, CodingKey {
-            case path, meeting, speaker, output, iso, diarize, done, skip, error
+            case path, meeting, speaker, output, iso, diarize, done, skip, error, group
             case zoomRecording = "zoom_recording"
             case coveredBy = "covered_by"
+            case mergeOutput = "merge_output"
         }
     }
     var files: [File]
@@ -278,23 +319,6 @@ private final class ProgressReader {
         }
         remainder = Data(combined[lineStart...])
         return events
-    }
-}
-
-private final class URLCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var urls: [URL] = []
-
-    func append(_ url: URL) {
-        lock.lock()
-        urls.append(url)
-        lock.unlock()
-    }
-
-    func values() -> [URL] {
-        lock.lock()
-        defer { lock.unlock() }
-        return urls
     }
 }
 
@@ -362,6 +386,26 @@ private func canonicalPath(_ path: String) -> String {
     return String(cString: resolved)
 }
 
+extension AppState {
+    enum RunTarget: Hashable, Codable {
+        case recording(UUID)
+        case meeting(String)
+    }
+
+    struct PassOutcome: Codable, Equatable, Identifiable {
+        enum Phase: String, Codable {
+            case waiting, running, completed, failed, canceled
+        }
+
+        let id: String
+        let label: String
+        let modelTag: String?
+        var phase: Phase
+        var message: String?
+        var output: URL?
+    }
+}
+
 @MainActor
 final class AppState: ObservableObject {
     @Published var items: [AudioItem] = []
@@ -371,6 +415,10 @@ final class AppState: ObservableObject {
     /// `qwen` uses the Rust Metal pipeline; `apple-native` uses the bundled
     /// SpeechTranscriber helper on macOS 26 and newer.
     @Published var engine = "qwen"
+    @Published var additionalPasses: [TranscriptionPass] = []
+    @Published var appendModelID = false
+    @Published private(set) var activePassLabel: String?
+    @Published private(set) var lastRunSummary: String?
     // Use an absolute sentinel for the CLI alias. URL(fileURLWithPath:) resolves
     // relative paths against the current working directory, which would turn
     // `sortformer` into a nonexistent local model path and skip auto-download.
@@ -384,12 +432,12 @@ final class AppState: ObservableObject {
     @Published var speakerTurns = false
     @Published var isRunning = false
     @Published var showModelActivity = false
+    @Published private(set) var downloadingLibraryModel: String?
     @Published var modelActivityTitle = "Preparing models"
     @Published var modelActivityMessage = "Checking the local model cache…"
     @Published var modelActivityLog: [String] = []
     @Published var modelActivityProgress: Double?
     @Published var modelActivityCanDismiss = false
-    @Published var modelActivitySucceeded = false
     @Published var isCancelling = false
     @Published private var mergeResults: [String: MergedSession] = [:]
     var mergedSessions: [MergedSession] { mergeResults.values.sorted { $0.id < $1.id } }
@@ -399,8 +447,6 @@ final class AppState: ObservableObject {
     @Published private(set) var addOperations = 0
 
     private var pendingSave: Task<Void, Never>?
-    @Published private(set) var modelStatus = "Checking the local model cache…"
-    private var modelStatusTask: Task<Void, Never>?
     private var activeProcess: Process?
     private var queueStartedAt: Date?
     private var storedQueueElapsedSeconds: TimeInterval = 0
@@ -415,7 +461,6 @@ final class AppState: ObservableObject {
 
     init() {
         loadQueue()
-        invalidateModelStatus()
         // saveQueue() is debounced, so flush on quit. Child processes also outlive the
         // app; stop the CLI rather than leave it holding the GPU with nobody watching.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
@@ -429,38 +474,88 @@ final class AppState: ObservableObject {
     }
 
     var selectedItems: [AudioItem] { items.filter(\.selected) }
+    var supportsDiarization: Bool { engine != "apple-native" || additionalPasses.contains { !$0.usesApple } }
     var selectedCount: Int {
         let selected = selectedItems
         return selected.filter { $0.zoomMeeting == nil }.count + Set(selected.compactMap(\.zoomMeeting)).count
     }
+    private var completedMeetingIDs: Set<String> {
+        let incomplete = Set(items.compactMap { item in
+            switch item.state {
+            case .failed, .canceled: item.zoomMeeting
+            default: nil
+            }
+        })
+        return Set(zoomMeetings.filter { !incomplete.contains($0.id) && meetingResult($0)?.state == "done" }.map(\.id))
+    }
     var completedItemCount: Int {
-        let finished = Set(zoomMeetings.filter { meetingResult($0)?.state == "done" }.map(\.id))
+        let finished = completedMeetingIDs
         return items.filter { $0.zoomMeeting.map(finished.contains) ?? ($0.state == .done) }.count
     }
     var completedCount: Int {
         let selected = selectedItems
         let groups = Set(selected.compactMap(\.zoomMeeting))
         return selected.filter { $0.zoomMeeting == nil && $0.state == .done }.count
-            + zoomMeetings.filter { groups.contains($0.id) && meetingResult($0)?.state == "done" }.count
+            + groups.intersection(completedMeetingIDs).count
     }
-    var totalDuration: TimeInterval { selectedItems.reduce(0) { $0 + $1.duration } }
     var activeStatus: String {
         if isCancelling { return "Stopping safely…" }
-        return items.first(where: { $0.state == .processing })?.resultSummary ?? "Preparing…"
+        return activeRunItem?.resultSummary ?? activeMerge?.message ?? "Preparing…"
     }
     /// Items in the current run. Progress and ETA cover only these: counting tracks finished
     /// in earlier runs as done made the estimate start near zero.
     private var runItemIDs: Set<UUID> = []
+    private var runScopeIDs: Set<UUID> = []
+    private var runTargets: Set<RunTarget> = []
+    private var passIndex = 0
+    private var passCount = 1
+    private var activeModelTag: String?
+    private var passMeetingIDsByOutput: [String: String] = [:]
+    @Published private var outcomes: [RunTarget: [PassOutcome]] = [:]
+    @Published private(set) var activePassUsesApple = false
+
+    private struct PassWork {
+        var items: [AudioItem]
+        var output: URL?
+        var mergePath: String?
+    }
+    private var currentPassWork: [RunTarget: PassWork] = [:]
+
+    func isInCurrentRun(_ target: RunTarget) -> Bool {
+        isRunning && runTargets.contains(target)
+    }
+
+    func passOutcomes(for target: RunTarget) -> [PassOutcome] {
+        outcomes[target] ?? []
+    }
+
+    var activeRecordingLabel: String? {
+        guard isRunning else { return nil }
+        if let item = activeRunItem {
+            return item.sessionLabel ?? item.url.lastPathComponent
+        }
+        return activeMerge?.label
+    }
+
+    private var activeRunItem: AudioItem? {
+        items.first { runItemIDs.contains($0.id) && $0.state == .processing }
+    }
+
+    private var activeMerge: MergedSession? {
+        currentPassWork.values.lazy.compactMap(\.mergePath)
+            .compactMap { self.mergeResults[$0] }.first { $0.state == "running" }
+    }
 
     var queueProgress: Double {
-        let tracked = isRunning && !runItemIDs.isEmpty
+        let tracked = isRunning
             ? items.filter { runItemIDs.contains($0.id) }
             : selectedItems
-        guard !tracked.isEmpty else { return 0 }
-        return tracked.reduce(0) { total, item in
+        let current = tracked.reduce(0.0) { total, item in
             if item.state == .done { return total + 1 }
             return total + min(max(item.progress, 0), 1)
-        } / Double(tracked.count)
+        } / Double(max(1, tracked.count))
+        let value = activeMerge != nil ? min(current, 0.99) : current
+        return isRunning ? (Double(passIndex) + value) / Double(passCount) : current
     }
 
     var queueElapsedSeconds: TimeInterval {
@@ -482,51 +577,6 @@ final class AppState: ObservableObject {
         id.hasPrefix("Qwen/Qwen3-ASR") || ["qwen3-asr-1.7b", "qwen-1.7b", "qwen3-asr-0.6b", "qwen-0.6b"].contains(id)
     }
     private func isParakeetModel(_ id: String) -> Bool { !isLocalModelPath(id) && id.lowercased().contains("parakeet") }
-
-    func selectEngine(_ value: String) {
-        if value == "parakeet-v3" && isQwenModel(modelID) {
-            modelID = "eschmidbauer/parakeet-unified-en-0.6b-onnx"
-        } else if value == "qwen" && isParakeetModel(modelID) {
-            modelID = "Qwen/Qwen3-ASR-1.7B"
-        }
-        if value == "apple-native" {
-            // SpeechTranscriber has no speaker labels. Clear stale per-item
-            // diarization flags when switching engines so a queued job cannot
-            // fail later with an option the current engine cannot honor.
-            diarize = false
-            for item in items {
-                item.diarize = false
-                item.speakerCount = nil
-            }
-        }
-        engine = value
-        invalidateModelStatus()
-    }
-
-    /// Re-query the CLI for the selected model's cache state. Called on launch
-    /// and whenever the engine or model changes.
-    func invalidateModelStatus() {
-        modelStatusTask?.cancel()
-        guard engine != "apple-native" else {
-            modelStatus = "Apple SpeechTranscriber (system model; macOS 26+)"
-            return
-        }
-        let model = effectiveModelID
-        modelStatus = "Checking the local model cache…"
-        modelStatusTask = Task { @MainActor [weak self] in
-            // Debounce typing in the model field: one CLI query after a pause, not per key.
-            try? await Task.sleep(for: .milliseconds(400))
-            guard let self, !Task.isCancelled else { return }
-            let cached = await self.cachedModels([model])?[model]
-            guard !Task.isCancelled else { return }
-            let local = self.isLocalModelPath(model)
-            self.modelStatus = switch cached {
-            case true?: local ? "Local model ready" : "Downloaded"
-            case false?: local ? "Local model not found" : "Downloads on first use"
-            case nil: "Model status unavailable"
-            }
-        }
-    }
 
     func add(urls: [URL]) {
         guard !urls.isEmpty else { return }
@@ -564,7 +614,8 @@ final class AppState: ObservableObject {
     }
 
     /// Read the full plan even for large libraries. stderr remains bounded.
-    private func preview(_ manifest: JobManifest, format: String, inventoryOnly: Bool = false) async throws -> QueuePlan {
+    private func preview(_ manifest: JobManifest, format: String, inventoryOnly: Bool = false,
+                         pass: TranscriptionPass? = nil, tag: String? = nil, trackProcess: Bool = true) async throws -> QueuePlan {
         guard let executableURL = cliURL else {
             throw PlanningFailure(message: "The transcriberrr executable is unavailable. Rebuild the app bundle.")
         }
@@ -575,13 +626,17 @@ final class AppState: ObservableObject {
         let stdout = PipeCollector(limit: nil)
         let stderr = PipeCollector()
         process.executableURL = executableURL
-        process.arguments = ["--manifest", url.path, "--format", format, "--plan"]
-        if inventoryOnly { process.arguments?.append("--inventory-only") }
+        var arguments = ["--manifest", url.path, "--format", format, "--plan"]
+        if inventoryOnly { arguments.append("--inventory-only") }
+        if let pass { arguments += pass.arguments }
+        if tag != nil { arguments += ["--model-suffix", "--skip-existing"] }
+        process.arguments = arguments
         process.standardOutput = stdout.pipe
         process.standardError = stderr.pipe
+        let tracked = trackProcess && !inventoryOnly
         let result: (Int32, String, String) = try await withCheckedThrowingContinuation { continuation in
             process.terminationHandler = { process in
-                if !inventoryOnly {
+                if tracked {
                     Task { @MainActor in
                         if self.activeProcess === process { self.activeProcess = nil }
                     }
@@ -593,7 +648,7 @@ final class AppState: ObservableObject {
                 _ = stderr.finish()
                 continuation.resume(throwing: error)
             }
-            if inventoryOnly {
+            if !tracked {
                 do { try process.run() }
                 catch { failedToLaunch(error) }
             } else {
@@ -612,10 +667,25 @@ final class AppState: ObservableObject {
     }
 
     @discardableResult
-    private func applyPlan(_ plan: QueuePlan, selectingMeetings: Bool = false) -> [AudioItem] {
+    private func applyPlan(_ plan: QueuePlan, selectingMeetings: Bool = false, tag: String? = nil,
+                           preserveDiarization: Bool = false, preserveInclusion: Bool = false) -> [AudioItem] {
         var known = itemsByPath(items)
         let unchecked = Set(items.filter { !$0.selected }.compactMap(\.zoomMeeting))
-        let updates = Dictionary(uniqueKeysWithValues: plan.meetings.map { ($0.id, $0) })
+        let includedMeetings = Set(plan.files.compactMap { file in
+            known[file.path]?.selected == true ? file.meeting : nil
+        })
+        var updates = Dictionary(uniqueKeysWithValues: plan.meetings.map { ($0.id, $0) })
+        if !selectingMeetings {
+            for previous in zoomMeetings where mergeResults[previous.output] != nil || outputExists(previous.output) {
+                guard var meeting = updates[previous.id] else { continue }
+                meeting.output = previous.output
+                meeting.done = previous.done
+                updates[meeting.id] = meeting
+            }
+        }
+        if selectingMeetings {
+            passMeetingIDsByOutput = Dictionary(plan.meetings.map { ($0.output, $0.id) }, uniquingKeysWith: { first, _ in first })
+        }
         let completed = Set(plan.files.filter { $0.done == true }.map(\.path))
         let affected = Set(plan.files.compactMap { known[$0.path]?.zoomMeeting })
         for index in zoomMeetings.indices {
@@ -626,22 +696,29 @@ final class AppState: ObservableObject {
             }
         }
         for old in zoomMeetings {
-            if let update = updates[old.id], update.output != old.output {
+            if tag == nil, let update = updates[old.id], update.output != old.output,
+               mergeResults[old.output]?.modelTag == nil {
                 mergeResults.removeValue(forKey: old.output)
             }
         }
-        for meeting in plan.meetings {
+        for meeting in plan.meetings where selectingMeetings {
             if let result = mergeResults[meeting.output], result.state != "done" || !meeting.done {
                 mergeResults.removeValue(forKey: meeting.output)
             }
+            if meeting.done, mergeResults[meeting.output] == nil {
+                mergeResults[meeting.output] = MergedSession(
+                    id: meeting.output, label: meeting.label, state: "done", message: "Transcript already exists",
+                    meetingID: meeting.id, modelTag: tag)
+            }
         }
         zoomMeetings.removeAll { updates[$0.id] != nil }
-        zoomMeetings.append(contentsOf: plan.meetings)
+        zoomMeetings.append(contentsOf: plan.meetings.compactMap { updates[$0.id] })
 
         var added: [URL] = []
         let planned = plan.files.map { file in
             let item: AudioItem
-            if let previous = known[file.path] {
+            let previous = known[file.path]
+            if let previous {
                 item = previous
             } else {
                 let url = URL(fileURLWithPath: file.path)
@@ -649,10 +726,17 @@ final class AppState: ObservableObject {
                 items.append(item)
                 known[file.path] = item
             }
+            let preserveState = !selectingMeetings && file.meeting != nil && item.zoomMeeting == file.meeting
             if file.error == nil {
                 if item.duration == 0 && file.skip == nil { added.append(item.url) }
                 item.zoomMeeting = file.meeting
-                if let meeting = file.meeting { item.selected = selectingMeetings || !unchecked.contains(meeting) }
+                if preserveInclusion {
+                    if previous == nil {
+                        item.selected = file.meeting.map(includedMeetings.contains) ?? false
+                    }
+                } else if let meeting = file.meeting {
+                    item.selected = selectingMeetings || !unchecked.contains(meeting)
+                }
             }
             if let zoomRecording = file.zoomRecording { item.zoomRecording = zoomRecording }
             item.skipReason = file.skip
@@ -666,25 +750,35 @@ final class AppState: ObservableObject {
                 item.outputURL = nil
             } else if file.error == nil && file.skip == nil {
                 if let iso = file.iso, selectingMeetings || item.isoOverride == nil { item.isoTrack = iso }
-                if selectingMeetings, let diarize = file.diarize { item.diarize = diarize }
+                if selectingMeetings && !preserveDiarization, let diarize = file.diarize { item.diarize = diarize }
+            }
+            if let tag, let output = file.output, file.error == nil && file.skip == nil {
+                let history = ModelOutput(tag: tag, path: output)
+                if !item.modelOutputs.contains(history) { item.modelOutputs.append(history) }
+            }
+            if selectingMeetings, file.done == true, let merge = file.mergeOutput,
+               mergeResults[merge]?.state != "done" {
+                mergeResults[merge] = MergedSession(
+                    id: merge, label: file.group ?? URL(fileURLWithPath: merge).lastPathComponent,
+                    state: "done", message: "Transcript already exists", modelTag: tag)
             }
             if let error = file.error {
                 item.state = .failed(error)
                 item.progress = 0
                 item.resultSummary = error
-            } else if let skip = file.skip {
+            } else if let skip = file.skip, !preserveState {
                 let covered = file.coveredBy?.contains(where: completed.contains) == true
-                    || hasSelectedCover(item, in: known)
+                    || hasSelectedCover(item, in: known, scope: selectingMeetings ? runScopeIDs : nil)
                 item.state = covered ? .done : .queued
                 item.progress = covered ? 1 : 0
                 item.outputURL = nil
                 item.resultSummary = skip
-            } else if file.done == true {
+            } else if file.done == true, !preserveState {
                 item.state = .done
                 item.progress = 1
                 item.outputURL = file.output.map(URL.init(fileURLWithPath:))
                 item.resultSummary = "Transcript already exists"
-            } else if file.meeting != nil || file.zoomRecording == true {
+            } else if !preserveState && (file.meeting != nil || file.zoomRecording == true) {
                 item.state = .queued
                 item.progress = 0
                 item.outputURL = nil
@@ -694,6 +788,7 @@ final class AppState: ObservableObject {
         }
         let represented = Set(items.compactMap(\.zoomMeeting))
         zoomMeetings.removeAll { !represented.contains($0.id) }
+        pruneOutcomes()
         objectWillChange.send()
         saveQueue()
         loadDurations(for: added)
@@ -704,11 +799,12 @@ final class AppState: ObservableObject {
         Dictionary(items.map { (canonicalPath($0.url.path), $0) }, uniquingKeysWith: { first, _ in first })
     }
 
-    private func hasSelectedCover(_ item: AudioItem, in known: [String: AudioItem]) -> Bool {
+    private func hasSelectedCover(_ item: AudioItem, in known: [String: AudioItem], scope: Set<UUID>? = nil) -> Bool {
         var paths = item.coveredBy ?? []
         var visited: Set<String> = []
         while let path = paths.popLast() {
-            guard visited.insert(path).inserted, let cover = known[path], cover.selected else { continue }
+            guard visited.insert(path).inserted, let cover = known[path],
+                  scope?.contains(cover.id) ?? cover.selected else { continue }
             if cover.state == .done, let output = cover.outputURL, outputExists(output.path) { return true }
             paths.append(contentsOf: cover.coveredBy ?? [])
         }
@@ -720,10 +816,10 @@ final class AppState: ObservableObject {
         return FileManager.default.fileExists(atPath: path, isDirectory: &directory) && !directory.boolValue
     }
 
-    private func reconcileSkippedRows(_ tracked: [AudioItem]) {
+    private func reconcileSkippedRows(_ tracked: [AudioItem], scope: Set<UUID>) {
         let known = itemsByPath(items)
         for item in tracked where item.state == .done && item.zoomMeeting == nil {
-            if let reason = item.skipReason, item.outputURL == nil, !hasSelectedCover(item, in: known) {
+            if let reason = item.skipReason, item.outputURL == nil, !hasSelectedCover(item, in: known, scope: scope) {
                 item.state = .queued
                 item.progress = 0
                 item.resultSummary = reason
@@ -734,29 +830,47 @@ final class AppState: ObservableObject {
     func remove(_ item: AudioItem) {
         if item.zoomRecording { removedZoomInputs.insert(canonicalPath(item.url.path)) }
         items.removeAll { $0.id == item.id }
+        pruneOutcomes()
         saveQueue()
     }
 
     func removeMeeting(_ meeting: ZoomMeeting) {
         items.removeAll { $0.zoomMeeting == meeting.id }
         zoomMeetings.removeAll { $0.id == meeting.id }
-        mergeResults.removeValue(forKey: meeting.output)
+        mergeResults = mergeResults.filter { $0.key != meeting.output && $0.value.meetingID != meeting.id }
+        pruneOutcomes()
         saveQueue()
     }
 
     func meetingResult(_ meeting: ZoomMeeting) -> MergedSession? {
-        mergeResults[meeting.output]
+        let result = mergeResults[meeting.output]
             ?? (meeting.done ? MergedSession(id: meeting.output, label: meeting.label, state: "done",
                                               message: "Transcript already exists") : nil)
+        if result?.state == "done" && !outputExists(meeting.output) { return nil }
+        return result
+    }
+
+    func meetingResults(_ meeting: ZoomMeeting, previous: [MergedSession]) -> [MergedSession] {
+        var results = previous.filter { $0.id != meeting.output }
+        if let current = meetingResult(meeting) { results.append(current) }
+        return results.filter { $0.state != "done" || outputExists($0.id) }
+            .sorted { ($0.modelTag ?? "", $0.id) < ($1.modelTag ?? "", $1.id) }
+    }
+
+    func modelOutputs(for item: AudioItem) -> [ModelOutput] {
+        item.modelOutputs.filter { outputExists($0.path) }.sorted { ($0.tag, $0.path) < ($1.tag, $1.path) }
     }
 
     func clearCompleted() {
-        let completed = Set(zoomMeetings.filter { meetingResult($0)?.state == "done" }.map(\.id))
+        let completed = completedMeetingIDs
         items.removeAll { item in
             item.zoomMeeting.map(completed.contains) ?? (item.state == .done)
         }
         zoomMeetings.removeAll { completed.contains($0.id) }
-        mergeResults = mergeResults.filter { $0.value.state != "done" }
+        mergeResults = mergeResults.filter {
+            $0.value.meetingID.map { !completed.contains($0) } ?? ($0.value.state != "done")
+        }
+        pruneOutcomes()
         saveQueue()
     }
 
@@ -819,11 +933,6 @@ final class AppState: ObservableObject {
         item.speakerCount = value
         objectWillChange.send()
         saveQueue()
-    }
-
-    func revealOutput(for item: AudioItem) {
-        guard let outputURL = item.outputURL else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([outputURL])
     }
 
     /// AVAudioFile can spend noticeable time probing compressed media. Do that
@@ -896,7 +1005,7 @@ final class AppState: ObservableObject {
     }
 
     func cancelTranscription() {
-        guard isRunning else { return }
+        guard isRunning, !isCancelling else { return }
         isCancelling = true
         modelActivityMessage = "Stopping safely and cleaning temporary queue files…"
         guard let process = activeProcess else { return }
@@ -924,12 +1033,95 @@ final class AppState: ObservableObject {
     }
 
     func transcribe() {
-        guard !isRunning, addOperations == 0 else { return }
+        startRun(Set(selectedItems.map(runTarget)), scopedRetry: false)
+    }
+
+    func retry(_ target: RunTarget) {
+        startRun([target], scopedRetry: true)
+    }
+
+    private func runTarget(for item: AudioItem) -> RunTarget {
+        item.zoomMeeting.map(RunTarget.meeting) ?? .recording(item.id)
+    }
+
+    private func startRun(_ targets: Set<RunTarget>, scopedRetry: Bool) {
+        guard !isRunning, downloadingLibraryModel == nil, addOperations == 0, !targets.isEmpty else { return }
+        runScopeIDs = Set(items.filter { targets.contains(runTarget(for: $0)) }.map(\.id))
+        guard !runScopeIDs.isEmpty else { return }
+        runTargets = targets
+        let passes = configuredPasses
+        lastRunSummary = nil
+        isRunning = true
+        isCancelling = false
+        passCount = passes.count
+        passIndex = 0
+        runItemIDs = []
+        startQueueClock()
+        Task { @MainActor in
+            defer {
+                finishQueueClock()
+                activeModelTag = nil
+                activePassLabel = nil
+                activePassUsesApple = false
+                passMeetingIDsByOutput = [:]
+                currentPassWork = [:]
+                runScopeIDs = []
+                runTargets = []
+                activeProcess = nil
+                isRunning = false
+                isCancelling = false
+                saveQueue()
+            }
+            let tags: [String?]
+            do {
+                tags = try await validateModelPasses(passes)
+            } catch {
+                if !isCancelling { planningError = error.localizedDescription }
+                lastRunSummary = isCancelling ? "Run canceled" : "Couldn’t start transcription"
+                return
+            }
+            guard !isCancelling else {
+                lastRunSummary = "Run canceled"
+                return
+            }
+            let pendingOutcomes = zip(passes, tags).enumerated().map { index, entry in
+                let (pass, tag) = entry
+                let model = pass.modelArgument
+                let label = isLocalModelPath(model) ? URL(fileURLWithPath: model).lastPathComponent : model
+                return PassOutcome(id: tag ?? String(index), label: label, modelTag: tag, phase: .waiting)
+            }
+            for target in runTargets { outcomes[target] = pendingOutcomes }
+
+            for (index, pass) in passes.enumerated() {
+                if isCancelling { break }
+                let tag = tags[index]
+                passIndex = index
+                runItemIDs = []
+                activeModelTag = tag
+                activePassUsesApple = pass.usesApple
+                activePassLabel = "Pass \(index + 1) of \(passes.count) · \(pendingOutcomes[index].label)"
+                await transcribePass(pass, tag: tag, scopedRetry: scopedRetry, pendingOutcomes: pendingOutcomes)
+                if runTargets.contains(where: { outcomes[$0]?[index].phase == .canceled }) { break }
+            }
+            finishRunOutcomes()
+        }
+    }
+
+    private func transcribePass(_ pass: TranscriptionPass, tag: String?, scopedRetry: Bool,
+                                pendingOutcomes: [PassOutcome]) async {
         let known = itemsByPath(items)
-        let selectedMeetings = Set(selectedItems.compactMap(\.zoomMeeting))
-        let selected = items.filter { $0.selected || $0.zoomMeeting.map(selectedMeetings.contains) == true }
+        let selected = items.filter { runScopeIDs.contains($0.id) || runTargets.contains(runTarget(for: $0)) }
+        runScopeIDs.formUnion(selected.map(\.id))
+        currentPassWork = Dictionary(grouping: selected, by: runTarget)
+            .mapValues { PassWork(items: $0, output: nil, mergePath: nil) }
+        defer {
+            updatePassOutcomes(ending: true)
+            currentPassWork = [:]
+        }
         let coveredSkips = selected.filter {
-            $0.zoomMeeting == nil && !$0.zoomRecording && $0.skipReason != nil && hasSelectedCover($0, in: known)
+            tag == nil &&
+            $0.zoomMeeting == nil && !$0.zoomRecording && $0.skipReason != nil &&
+            hasSelectedCover($0, in: known, scope: runScopeIDs)
         }
         let coveredIDs = Set(coveredSkips.map(\.id))
         let newlyCovered = coveredSkips.filter { $0.state != .done }
@@ -942,11 +1134,21 @@ final class AppState: ObservableObject {
             saveQueue()
         }
         // Check Zoom destinations on every run, even if the queue previously marked them done.
-        var requested = selected.filter {
-            !coveredIDs.contains($0.id)
-                && ($0.state != .done || $0.zoomMeeting != nil || $0.zoomRecording || $0.skipReason != nil)
+        var requested = selected.filter { item in
+            // A covered export can be renamed while its saved queue row still points at the
+            // old path. The selected participant tracks will rediscover the renamed file.
+            if item.zoomMeeting != nil && !item.isoTrack && item.skipReason != nil
+                && !FileManager.default.fileExists(atPath: item.url.path) { return false }
+            return !coveredIDs.contains(item.id)
+                && (tag != nil || item.state != .done || item.zoomMeeting != nil || item.zoomRecording || item.skipReason != nil
+                    || reusableUntaggedOutput(for: item) == nil)
         }
-        guard !requested.isEmpty else { return }
+        guard !requested.isEmpty else {
+            for (target, work) in currentPassWork {
+                currentPassWork[target]?.output = work.items.first?.outputURL
+            }
+            return
+        }
         let sessions = Set(requested.compactMap(sessionKey))
         let requestedIDs = Set(requested.map(\.id))
         requested += selected.filter {
@@ -955,125 +1157,261 @@ final class AppState: ObservableObject {
         let selectedIDs = Set(selected.map(\.id))
         let excluded = Set(known.compactMap { path, item in selectedIDs.contains(item.id) ? nil : path })
             .union(removedZoomInputs)
-        let manifest = makeRunManifest(requested, excluding: excluded.sorted())
-        isRunning = true
-        isCancelling = false
-        startQueueClock()
-        Task { @MainActor in
-            let pending: [AudioItem]
-            let tracked: [AudioItem]
-            let outputs: [UUID: URL]
-            let frozen: JobManifest
-            do {
-                let plan = try await preview(manifest, format: format)
-                if isCancelling { throw CancellationError() }
-                let planned = applyPlan(plan, selectingMeetings: true)
-                let accepted = zip(planned, plan.files).filter { $0.1.error == nil }
-                tracked = accepted.map(\.0)
-                pending = accepted.compactMap { item, file in
-                    file.done == true || file.skip != nil ? nil : item
+        let manifest = makeRunManifest(requested, excluding: excluded.sorted(), pass: pass, tag: tag)
+        let planned: [AudioItem]
+        let pending: [AudioItem]
+        let tracked: [AudioItem]
+        let outputs: [UUID: URL]
+        let mergeOutputs: [UUID: String]
+        let frozen: JobManifest
+        do {
+            let plan = try await preview(manifest, format: format, pass: pass, tag: tag)
+            if isCancelling { throw CancellationError() }
+            planned = applyPlan(plan, selectingMeetings: true, tag: tag, preserveDiarization: pass.usesApple,
+                                preserveInclusion: scopedRetry)
+            runScopeIDs.formUnion(planned.map(\.id))
+            for item in planned {
+                let target = runTarget(for: item)
+                if runTargets.insert(target).inserted { outcomes[target] = pendingOutcomes }
+            }
+            let accepted = zip(planned, plan.files).filter { $0.1.error == nil }
+            tracked = accepted.map(\.0)
+            pending = accepted.compactMap { item, file in
+                file.done == true || file.skip != nil ? nil : item
+            }
+            outputs = Dictionary(accepted.compactMap { item, file in
+                file.output.map { (item.id, URL(fileURLWithPath: $0)) }
+            }, uniquingKeysWith: { first, _ in first })
+            let meetings = Dictionary(uniqueKeysWithValues: plan.meetings.map { ($0.id, $0.output) })
+            mergeOutputs = Dictionary(accepted.compactMap { item, file in
+                guard file.skip == nil,
+                      let output = file.mergeOutput ?? file.meeting.flatMap({ meetings[$0] }) else { return nil }
+                return (item.id, output)
+            }, uniquingKeysWith: { first, _ in first })
+            let plannedIDs = Set(planned.map(\.id))
+            currentPassWork = Dictionary(grouping: selected + planned, by: runTarget).mapValues { group in
+                let tracks = Dictionary(group.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }).values
+                    .filter { $0.skipReason == nil }
+                let candidates = tracks.isEmpty ? [group[0]] : Array(tracks)
+                let mergePath = candidates.lazy.compactMap { mergeOutputs[$0.id] }.first
+                let output = group[0].zoomMeeting == nil
+                    ? candidates.lazy.compactMap { item in
+                        outputs[item.id] ?? (!plannedIDs.contains(item.id) && item.state == .done ? item.outputURL : nil)
+                    }.first
+                    : mergePath.map(URL.init(fileURLWithPath:))
+                return PassWork(items: candidates, output: output, mergePath: mergePath)
+            }
+            let original = Dictionary(manifest.items.enumerated().map { index, item in
+                (canonicalPath(item.input), (index, item.output))
+            }, uniquingKeysWith: { first, _ in first })
+            // Include discovered tracks and skipped continuations explicitly. If a
+            // track disappears during model setup, the CLI can reject the whole meeting.
+            let inputs = accepted.enumerated().map { index, entry in
+                let (item, file) = entry
+                let (order, output) = original[file.path] ?? (manifest.items.count + index, nil)
+                return (order, manifestItem(for: item, input: file.path, output: file.output.map { outputBase($0, tag: tag) } ?? output, pass: pass))
+            }.sorted { $0.0 < $1.0 }.map(\.1)
+            frozen = JobManifest(items: inputs, discoverZoom: false)
+        } catch {
+            if isCancelling {
+                for target in currentPassWork.keys {
+                    outcomes[target]?[passIndex].phase = .canceled
+                    outcomes[target]?[passIndex].message = "Canceled"
                 }
-                outputs = Dictionary(accepted.compactMap { item, file in
-                    file.output.map { (item.id, URL(fileURLWithPath: $0)) }
-                }, uniquingKeysWith: { first, _ in first })
-                let original = Dictionary(manifest.items.enumerated().map { index, item in
-                    (canonicalPath(item.input), (index, item.output))
-                }, uniquingKeysWith: { first, _ in first })
-                // Include discovered tracks and skipped continuations explicitly. If a
-                // track disappears during model setup, the CLI can reject the whole meeting.
-                let inputs = accepted.enumerated().map { index, entry in
-                    let (item, file) = entry
-                    let (order, output) = original[file.path] ?? (manifest.items.count + index, nil)
-                    return (order, manifestItem(for: item, input: file.path, output: file.output ?? output))
-                }.sorted { $0.0 < $1.0 }.map(\.1)
-                frozen = JobManifest(items: inputs, discoverZoom: false)
-            } catch {
-                if !isCancelling { planningError = error.localizedDescription }
-                finishQueueClock()
-                isRunning = false
-                isCancelling = false
-                return
+            } else {
+                let prefix = tag.map { "\($0) · " } ?? ""
+                planningError = prefix + error.localizedDescription
+                for item in requested {
+                    item.state = .failed(error.localizedDescription)
+                    item.progress = 0
+                    item.resultSummary = error.localizedDescription
+                }
             }
-            runItemIDs = Set(pending.map(\.id))
-            guard !pending.isEmpty, !isCancelling else {
-                if isCancelling { markCanceled(pending) }
-                finishQueueClock()
-                isRunning = false
-                isCancelling = false
-                saveQueue()
-                return
-            }
-            for (index, item) in pending.enumerated() {
-                item.state = .queued
-                item.progress = 0
-                item.elapsedSeconds = 0
-                item.estimatedRemainingSeconds = nil
-                item.resultSummary = index == 0 ? "Waiting for model setup…" : "Waiting…"
-            }
-            objectWillChange.send()
+            return
+        }
+        runItemIDs = Set(pending.map(\.id))
+        guard !pending.isEmpty, !isCancelling else {
+            if isCancelling { markCanceled(pending) }
             saveQueue()
+            return
+        }
+        for (index, item) in pending.enumerated() {
+            item.state = .queued
+            item.progress = 0
+            item.elapsedSeconds = 0
+            item.estimatedRemainingSeconds = nil
+            item.resultSummary = index == 0 ? "Waiting for model setup…" : "Waiting…"
+        }
+        updatePassOutcomes()
+        objectWillChange.send()
+        saveQueue()
 
-            let modelDownloads = await requiredModelDownloads(for: pending)
-            if !modelDownloads.isEmpty, !isCancelling {
-                beginModelActivity(title: "Preparing models", message: "Checking and downloading model files…")
-                modelActivityLog = modelDownloads.map { "Model: \($0)" }
-                let result = await downloadModels(modelDownloads)
-                if result.status != 0 {
-                    if isCancelling {
-                        markCanceled(pending)
-                    } else {
-                        pending.forEach {
-                            $0.state = .failed("Model setup failed")
-                            $0.resultSummary = "Model setup failed; see the model activity window."
-                        }
-                    }
-                    modelActivityMessage = isCancelling
-                        ? "Model download canceled."
-                        : result.message.isEmpty ? "Model setup failed." : result.message
-                    modelActivityCanDismiss = true
-                    modelActivitySucceeded = false
-                    finishQueueClock()
-                    isRunning = false
-                    isCancelling = false
-                    saveQueue()
-                    return
-                }
-                invalidateModelStatus()
-                // Get out of the way of the run's progress once the models are ready.
-                showModelActivity = false
-            }
-
-            if let first = pending.first {
-                first.state = .processing
-                first.progress = 0.05
-                first.resultSummary = "Starting transcription…"
-                objectWillChange.send()
-                saveQueue()
-            }
-
-            // Qwen and Parakeet keep their weights in process memory. Run the
-            // whole queue through one manifest so a 5,000-track queue does not
-            // repeatedly pay model startup and Metal pipeline compilation. The
-            // Apple engine goes through the CLI too, which converts formats
-            // AVFoundation cannot open (WebM) and validates the transcript.
-            if !pending.isEmpty, !isCancelling {
-                let result = await runBulkCLI(frozen, for: tracked, outputs: outputs)
+        let modelDownloads = await requiredModelDownloads(for: pending, pass: pass)
+        if !modelDownloads.isEmpty, !isCancelling {
+            beginModelActivity(title: "Preparing models", message: "Checking and downloading model files…")
+            modelActivityLog = modelDownloads.map { "Model: \($0)" }
+            let result = await downloadModels(modelDownloads)
+            if result.status != 0 {
                 if isCancelling {
-                    applyFinished(result, to: tracked)
                     markCanceled(pending)
                 } else {
-                    applyBulk(result, to: tracked)
+                    let detail = result.message.isEmpty ? "Could not prepare model files." : result.message
+                    pending.forEach {
+                        $0.state = .failed(detail)
+                        $0.resultSummary = detail
+                    }
                 }
-                reconcileSkippedRows(tracked)
-                objectWillChange.send()
+                modelActivityMessage = isCancelling
+                    ? "Model download canceled."
+                    : result.message.isEmpty ? "Model setup failed." : result.message
+                modelActivityCanDismiss = true
                 saveQueue()
+                return
             }
-            if isCancelling { markCanceled(pending) }
-            finishQueueClock()
-            isRunning = false
-            isCancelling = false
-            activeProcess = nil
+            // Get out of the way of the run's progress once the models are ready.
+            showModelActivity = false
+        }
+
+        if let first = pending.first {
+            first.state = .processing
+            first.progress = 0
+            first.resultSummary = "Starting transcription…"
+            updatePassOutcomes()
+            objectWillChange.send()
             saveQueue()
+        }
+
+        // Qwen and Parakeet keep their weights in process memory. Run the
+        // whole queue through one manifest so a 5,000-track queue does not
+        // repeatedly pay model startup and Metal pipeline compilation. The
+        // Apple engine goes through the CLI too, which converts formats
+        // AVFoundation cannot open (WebM) and validates the transcript.
+        if !pending.isEmpty, !isCancelling {
+            let result = await runBulkCLI(frozen, for: tracked, outputs: outputs, pass: pass, tag: tag)
+            if isCancelling {
+                applyFinished(result, to: tracked)
+                markCanceled(pending)
+            } else {
+                applyBulk(result, to: tracked)
+            }
+            for item in tracked {
+                guard let output = mergeOutputs[item.id], let merge = mergeResults[output] else { continue }
+                if case .failed = item.state { continue }
+                if merge.state == "failed" {
+                    item.state = .failed(merge.message)
+                    item.resultSummary = merge.message
+                } else if merge.state == "canceled" {
+                    item.state = .canceled
+                    item.progress = 0
+                    item.resultSummary = "Canceled"
+                }
+            }
+            reconcileSkippedRows(tracked, scope: runScopeIDs)
+            objectWillChange.send()
+            saveQueue()
+        }
+        if isCancelling { markCanceled(pending) }
+    }
+
+    @discardableResult
+    private func updatePassOutcomes(ending: Bool = false) -> Bool {
+        var next = outcomes
+        var finished = false
+        for (target, work) in currentPassWork {
+            guard var outcome = next[target]?[passIndex] else { continue }
+            let prior = outcome
+            let merge = work.mergePath.flatMap { mergeResults[$0] }
+            let failure = work.items.compactMap { item -> String? in
+                guard case .failed(let error) = item.state else { return nil }
+                return error
+            }.first
+            let tracksDone = work.items.allSatisfy { $0.state == .done }
+            if let url = work.output,
+               outcome.output == url || (ending || merge?.state == "done" || tracksDone) && outputExists(url.path) {
+                outcome.output = url
+            }
+            if prior.phase == .canceled {
+                continue
+            } else if let message = merge?.state == "failed" ? merge?.message : failure {
+                outcome.phase = .failed
+                outcome.message = message
+            } else if merge?.state == "canceled" || work.items.contains(where: { $0.state == .canceled }) {
+                outcome.phase = .canceled
+                outcome.message = "Canceled"
+            } else if merge?.state == "done" || tracksDone && work.mergePath == nil {
+                outcome.phase = .completed
+                outcome.message = merge?.message ?? work.items.first?.resultSummary
+            } else if ending {
+                outcome.phase = isCancelling ? .canceled : .failed
+                outcome.message = isCancelling ? "Canceled" : "Transcription did not finish"
+            } else if merge?.state == "running" || work.items.contains(where: { $0.state == .processing }) {
+                outcome.phase = .running
+                outcome.message = merge?.message ?? work.items.first(where: { $0.state == .processing })?.resultSummary
+            } else {
+                outcome.phase = .waiting
+                outcome.message = nil
+            }
+            if outcome != prior {
+                next[target]?[passIndex] = outcome
+                finished = finished || [.completed, .failed, .canceled].contains(outcome.phase)
+            }
+        }
+        if next != outcomes { outcomes = next }
+        return finished
+    }
+
+    private func finishRunOutcomes() {
+        let scoped = items.filter { runScopeIDs.contains($0.id) }
+        let targets = Set(scoped.map(runTarget))
+        let stopped = isCancelling || targets.contains { target in
+            outcomes[target]?.contains { $0.phase == .canceled } == true
+        }
+        var completed = 0
+        var failed = 0
+        var saved = Set<URL>()
+        for target in targets {
+            guard var results = outcomes[target] else { continue }
+            for index in results.indices where results[index].phase == .waiting || results[index].phase == .running {
+                results[index].phase = stopped ? .canceled : .failed
+                results[index].message = stopped ? "Canceled" : "Transcription did not finish"
+            }
+            outcomes[target] = results
+            saved.formUnion(results.compactMap(\.output))
+            if results.allSatisfy({ $0.phase == .completed }) { completed += 1 }
+            if results.contains(where: { $0.phase == .failed }) { failed += 1 }
+        }
+        for item in scoped where item.skipReason == nil {
+            guard let results = outcomes[runTarget(for: item)] else { continue }
+            let failures = results.filter { $0.phase == .failed }
+            if !failures.isEmpty {
+                let message = failures.map { outcome in
+                    let failure = outcome.message ?? "Transcription failed"
+                    return results.count > 1 ? "\(outcome.label) · \(failure)" : failure
+                }.joined(separator: "\n")
+                item.state = .failed(message)
+                item.resultSummary = message
+                item.estimatedRemainingSeconds = nil
+            } else if results.contains(where: { $0.phase == .canceled }) {
+                item.state = .canceled
+                item.progress = 0
+                item.resultSummary = "Canceled"
+                item.estimatedRemainingSeconds = nil
+            }
+        }
+        if stopped {
+            lastRunSummary = saved.isEmpty ? "Run canceled" : "Run canceled · \(saved.count) saved"
+        } else if failed > 0 {
+            lastRunSummary = "Run finished · \(completed) complete · \(failed) failed"
+        } else {
+            lastRunSummary = completed == 1 ? "Run complete · 1 recording" : "Run complete · \(completed) recordings"
+        }
+        pruneOutcomes()
+    }
+
+    private func pruneOutcomes() {
+        let live = Set(items.map(runTarget))
+        if !Set(outcomes.keys).isSubset(of: live) {
+            outcomes = outcomes.filter { live.contains($0.key) }
         }
     }
 
@@ -1099,28 +1437,22 @@ final class AppState: ObservableObject {
         clockTask = nil
     }
 
-    /// The model the CLI will load: with --engine parakeet-v3 it replaces any Qwen
-    /// model with the Parakeet default (main.rs).
-    private var effectiveModelID: String {
-        engine == "parakeet-v3" && isQwenModel(modelID)
-            ? "eschmidbauer/parakeet-unified-en-0.6b-onnx" : modelID
-    }
-
-    private func requiredModelDownloads(for pending: [AudioItem]) async -> [String] {
-        guard engine != "apple-native" else { return [] }
+    private func requiredModelDownloads(for pending: [AudioItem], pass: TranscriptionPass) async -> [String] {
+        guard !pass.usesApple else { return [] }
         var candidates: [String] = []
         func append(_ value: String) {
             // Local paths cannot be downloaded; the CLI reports a missing one itself.
             guard !value.isEmpty, !isLocalModelPath(value), !candidates.contains(value) else { return }
             candidates.append(value)
         }
-        append(effectiveModelID)
+        let model = pass.modelArgument
+        append(pass.engine == "parakeet-v3" && isQwenModel(model) ? pass.defaultModel : model)
         let diarizing = pending.contains(where: { $0.diarize || $0.speakerCount != nil })
         // The CLI loads the aligner for diarization too: speakers attach to word timings.
         // Subtitles always get sentence timing (main.rs), which needs the aligner too, and
         // merging speaker tracks needs every track's word timings.
         let merging = pending.contains(where: \.isoTrack)
-        if engine == "qwen" && (timestamps != "none" || diarizing || merging || format == "srt" || format == "vtt") {
+        if pass.engine == "qwen" && (timestamps != "none" || diarizing || merging || format == "srt" || format == "vtt") {
             append("Qwen/Qwen3-ForcedAligner-0.6B")
         }
         if diarizing {
@@ -1136,10 +1468,24 @@ final class AppState: ObservableObject {
     /// Asks the CLI (`--cached-model`) which models are usable offline, so the
     /// app never re-implements aliases, completeness markers, or snapshot rules.
     private func cachedModels(_ ids: [String]) async -> [String: Bool]? {
+        struct Entry: Decodable { var id: String; var cached: Bool }
+        guard let result = await readCLI(ids.flatMap({ ["--cached-model", $0] })),
+              let entries = try? JSONDecoder().decode([Entry].self, from: Data(result.utf8)) else { return nil }
+        return Dictionary(entries.map { ($0.id, $0.cached) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    private func readModelTag(_ pass: TranscriptionPass) async -> String? {
+        guard let result = await readCLI(["--print-model-tag"] + pass.arguments) else { return nil }
+        let tag = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tag.isEmpty, tag.utf8.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) }) else { return nil }
+        return tag
+    }
+
+    private func readCLI(_ arguments: [String]) async -> String? {
         guard let executableURL = cliURL else { return nil }
         let process = Process()
         process.executableURL = executableURL
-        process.arguments = ids.flatMap { ["--cached-model", $0] }
+        process.arguments = arguments
         let output = PipeCollector()
         process.standardOutput = output.pipe
         process.standardError = FileHandle.nullDevice
@@ -1155,10 +1501,8 @@ final class AppState: ObservableObject {
                 continuation.resume(returning: nil)
             }
         }
-        struct Entry: Decodable { var id: String; var cached: Bool }
-        guard let result, result.0 == 0,
-              let entries = try? JSONDecoder().decode([Entry].self, from: Data(result.1.utf8)) else { return nil }
-        return Dictionary(entries.map { ($0.id, $0.cached) }, uniquingKeysWith: { first, _ in first })
+        guard let result, result.0 == 0 else { return nil }
+        return result.1
     }
 
     var diarizationModelArgument: String {
@@ -1173,7 +1517,6 @@ final class AppState: ObservableObject {
         modelActivityLog = []
         modelActivityProgress = nil
         modelActivityCanDismiss = false
-        modelActivitySucceeded = false
         showModelActivity = true
     }
 
@@ -1252,7 +1595,7 @@ final class AppState: ObservableObject {
         switch event.status {
         case "running":
             item.state = .processing
-            item.progress = event.progress ?? max(item.progress, 0.05)
+            item.progress = event.progress ?? item.progress
             if let elapsed = event.elapsedSeconds {
                 item.elapsedSeconds = elapsed
                 item.estimatedRemainingSeconds = item.progress > 0.01
@@ -1306,7 +1649,9 @@ final class AppState: ObservableObject {
         default: event.phase ?? "Waiting for its tracks…"
         }
         let session = MergedSession(id: path, label: event.group ?? URL(fileURLWithPath: path).lastPathComponent,
-                                    state: state, message: message)
+                                    state: state, message: message,
+                                    meetingID: passMeetingIDsByOutput[path],
+                                    modelTag: activeModelTag)
         if mergeResults[path] != session { mergeResults[path] = session }
     }
 
@@ -1336,7 +1681,6 @@ final class AppState: ObservableObject {
 
     private func applyBulk(_ result: BulkResult, to items: [AudioItem]) {
         applyMerges(result.progress)
-        stopRunningMerges()
         // stderr holds a line per finished track; the last line is the run's error.
         let fallback = result.message.split(whereSeparator: \.isNewline).last
             .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
@@ -1346,16 +1690,29 @@ final class AppState: ObservableObject {
         // with no event written.
         let canceled = result.progress.values.contains { $0.status == "canceled" }
             || result.status == 143 || result.status == 130
+        if canceled {
+            stopRunningMerges()
+        } else {
+            // The CLI died mid-session (crash, out of memory): the merge failed, not canceled.
+            let message = fallback.isEmpty ? "Transcription did not finish" : fallback
+            for (path, var merge) in mergeResults where merge.state == "running" {
+                merge.state = "failed"
+                merge.message = message
+                mergeResults[path] = merge
+            }
+        }
         for item in items {
             let event = result.progress[progressKey(item.url.path)]
             if let event, Self.finalStatuses.contains(event.status) {
                 apply(event, to: item)
+            } else if item.state == .done {
+                continue
             } else if canceled {
                 item.estimatedRemainingSeconds = nil
                 item.state = .canceled
                 item.progress = 0
                 item.resultSummary = "Canceled"
-            } else if result.status == 0, let output = result.outputs[item.id] {
+            } else if result.status == 0, let output = result.outputs[item.id], outputExists(output.path) {
                 item.progress = 1
                 item.estimatedRemainingSeconds = nil
                 item.state = .done
@@ -1378,13 +1735,24 @@ final class AppState: ObservableObject {
             .appendingPathExtension(format)
     }
 
+    private func reusableUntaggedOutput(for item: AudioItem) -> URL? {
+        guard let output = item.outputURL, outputExists(output.path),
+              !item.modelOutputs.contains(where: { canonicalPath($0.path) == canonicalPath(output.path) }) else { return nil }
+        let expected = expectedOutput(for: item)
+        guard output.pathExtension.caseInsensitiveCompare(expected.pathExtension) == .orderedSame,
+              canonicalPath(output.deletingLastPathComponent().path) ==
+                canonicalPath(expected.deletingLastPathComponent().path) else { return nil }
+        return output
+    }
+
     /// Picks an output path that no other row uses and that does not replace an existing
     /// file such as notes.txt beside notes.m4a.
-    private func uniqueOutput(_ candidate: URL, reserved: inout Set<String>) -> URL {
+    private func uniqueOutput(_ candidate: URL, tag: String?, reserved: inout Set<String>) -> URL {
         func available(_ url: URL) -> Bool {
-            let key = url.standardizedFileURL.path.lowercased()
+            let target = tag.map { url.deletingPathExtension().appendingPathExtension($0).appendingPathExtension(url.pathExtension) } ?? url
+            let key = target.standardizedFileURL.path.lowercased()
             guard !reserved.contains(key) else { return false }
-            guard !FileManager.default.fileExists(atPath: url.path) else { return false }
+            guard !FileManager.default.fileExists(atPath: target.path) else { return false }
             reserved.insert(key)
             return true
         }
@@ -1412,21 +1780,46 @@ final class AppState: ObservableObject {
         outputDestination == .folder ? "folder" : "next-to-source"
     }
 
-    private func manifestItem(for item: AudioItem, input: String, output: String?) -> ManifestItem {
-        ManifestItem(input: input, diarize: item.diarize, speakers: item.speakerCount, output: output,
+    private func outputBase(_ path: String, tag: String?) -> String {
+        guard let tag else { return path }
+        let url = URL(fileURLWithPath: path)
+        let stem = url.deletingPathExtension()
+        guard stem.pathExtension == tag else { return path }
+        return stem.deletingPathExtension().appendingPathExtension(url.pathExtension).path
+    }
+
+    private func manifestItem(for item: AudioItem, input: String, output: String?, pass: TranscriptionPass) -> ManifestItem {
+        ManifestItem(input: input, diarize: !pass.usesApple && item.diarize, speakers: pass.usesApple ? nil : item.speakerCount, output: output,
                      outputDir: outputFolder.path, outputLocation: cliOutputLocation, isoTrack: item.isoOverride)
     }
 
-    private func makeRunManifest(_ requested: [AudioItem], excluding: [String]) -> JobManifest {
-        var reserved = Set(items.compactMap { $0.outputURL?.standardizedFileURL.path.lowercased() })
+    private func makeRunManifest(_ requested: [AudioItem], excluding: [String], pass: TranscriptionPass, tag: String?) -> JobManifest {
+        var reserved = Set(items.flatMap { item in
+            (item.modelOutputs.map(\.path) + [item.outputURL?.path].compactMap { $0 }).map {
+                URL(fileURLWithPath: $0).standardizedFileURL.path.lowercased()
+            }
+        })
         return JobManifest(items: requested.map { item in
-            let output = item.zoomMeeting == nil && !item.zoomRecording
-                ? uniqueOutput(expectedOutput(for: item), reserved: &reserved).path : nil
-            return manifestItem(for: item, input: item.url.standardizedFileURL.path, output: output)
+            var output: String?
+            if item.zoomMeeting == nil && !item.zoomRecording {
+                let candidate = expectedOutput(for: item)
+                let destination = canonicalPath(candidate.deletingLastPathComponent().path)
+                if let tag, let recorded = item.modelOutputs.last(where: { entry in
+                    guard entry.tag == tag else { return false }
+                    let prior = URL(fileURLWithPath: entry.path)
+                    return prior.pathExtension == candidate.pathExtension
+                        && canonicalPath(prior.deletingLastPathComponent().path) == destination
+                }) {
+                    output = outputBase(recorded.path, tag: tag)
+                }
+                if output == nil { output = uniqueOutput(candidate, tag: tag, reserved: &reserved).path }
+            }
+            return manifestItem(for: item, input: item.url.standardizedFileURL.path, output: output, pass: pass)
         }, excludedInputs: excluding.isEmpty ? nil : excluding)
     }
 
-    private func runBulkCLI(_ manifest: JobManifest, for items: [AudioItem], outputs: [UUID: URL]) async -> BulkResult {
+    private func runBulkCLI(_ manifest: JobManifest, for items: [AudioItem], outputs: [UUID: URL],
+                            pass: TranscriptionPass, tag: String?) async -> BulkResult {
         guard let executableURL = cliURL else {
             return BulkResult(status: 1, message: "The transcriberrr executable is not bundled. Rebuild the app with scripts/build-macos-app.sh.", progress: [:])
         }
@@ -1440,13 +1833,14 @@ final class AppState: ObservableObject {
             let data = try JSONEncoder().encode(manifest)
             try data.write(to: manifestURL, options: .atomic)
             var arguments = ["--manifest", manifestURL.path, "--output-dir", outputFolder.path,
-                             "--engine", cliEngine,
-                             "--model", modelID, "--device", device, "--format", format,
+                             "--device", device, "--format", format,
                              "--timestamps", timestamps, "--progress-file", progressURL.path, "--resume"]
+            arguments += pass.arguments
+            if tag != nil { arguments += ["--model-suffix", "--skip-existing"] }
             if format == "txt" && speakerTurns {
                 arguments.append("--speaker-turns")
             }
-            if items.contains(where: { $0.diarize || $0.speakerCount != nil }) {
+            if !pass.usesApple && items.contains(where: { $0.diarize || $0.speakerCount != nil }) {
                 arguments += ["--diarization-model", diarizationModelArgument]
             }
             let process = Process()
@@ -1460,7 +1854,7 @@ final class AppState: ObservableObject {
             process.environment = environment
             let errors = PipeCollector()
             process.standardError = errors.pipe
-            let qwenEngine = engine == "qwen"
+            let qwenEngine = pass.engine == "qwen"
             let progressReader = ProgressReader()
             // Resolve once: realpath for every row every poll is thousands of syscalls
             // per second on the main actor for a large queue.
@@ -1479,6 +1873,7 @@ final class AppState: ObservableObject {
                         finished = finished || (!wasDone && item.state == .done)
                     }
                     self.applyMerges(events)
+                    finished = self.updatePassOutcomes() || finished
                     self.objectWillChange.send()
                     // Persist finished rows now: after a crash or force quit they would
                     // otherwise reload as queued and be transcribed again as `name-2`.
@@ -1517,14 +1912,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    private var cliEngine: String {
-        switch engine {
-        case "parakeet-v3": "parakeet-v3"
-        case "apple-native": "apple-native"
-        default: "qwen3"
-        }
-    }
-
     private func progressKey(_ path: String) -> String {
         canonicalPath(path)
     }
@@ -1535,6 +1922,8 @@ final class AppState: ObservableObject {
         outputDestination = OutputDestination(rawValue: saved.outputDestination) ?? .folder
         modelID = saved.modelID
         engine = saved.engine ?? "qwen"
+        additionalPasses = saved.additionalPasses ?? []
+        appendModelID = saved.appendModelID ?? false
         speakerTurns = saved.speakerTurns ?? false
         zoomMeetings = saved.zoomMeetings ?? []
         removedZoomInputs = saved.removedZoomInputs ?? []
@@ -1584,10 +1973,21 @@ final class AppState: ObservableObject {
             item.progress = value.progress
             item.selected = value.selected
             item.outputURL = value.outputPath.map(URL.init(fileURLWithPath:))
+            item.modelOutputs = value.modelOutputHistory ?? (value.modelOutputs ?? [:]).map { ModelOutput(tag: $0.key, path: $0.value) }
             item.resultSummary = value.resultSummary
             return item
         }
-        if engine == "apple-native" {
+        outcomes = (saved.passOutcomes ?? [:]).mapValues { passes in
+            passes.map { outcome in
+                guard outcome.phase == .running || outcome.phase == .waiting else { return outcome }
+                var interrupted = outcome
+                interrupted.phase = .canceled
+                interrupted.message = "Interrupted before completion"
+                return interrupted
+            }
+        }
+        pruneOutcomes()
+        if !supportsDiarization {
             diarize = false
             items.forEach {
                 $0.diarize = false
@@ -1611,7 +2011,7 @@ final class AppState: ObservableObject {
         let saved = SavedQueue(
             items: items.map { item in
                 let error: String? = if case .failed(let message) = item.state { message } else { nil }
-                return SavedItem(id: item.id, path: item.url.path, duration: item.duration, state: item.state.stateName, error: error, progress: item.progress, selected: item.selected, diarize: item.diarize, speakerCount: item.speakerCount, outputPath: item.outputURL?.path, resultSummary: item.resultSummary, isoTrack: item.isoTrack, isoOverride: item.isoOverride, speakerName: item.speakerName, sessionLabel: item.sessionLabel, zoomMeeting: item.zoomMeeting, zoomRecording: item.zoomRecording, skipReason: item.skipReason, coveredBy: item.coveredBy)
+                return SavedItem(id: item.id, path: item.url.path, duration: item.duration, state: item.state.stateName, error: error, progress: item.progress, selected: item.selected, diarize: item.diarize, speakerCount: item.speakerCount, outputPath: item.outputURL?.path, resultSummary: item.resultSummary, isoTrack: item.isoTrack, isoOverride: item.isoOverride, speakerName: item.speakerName, sessionLabel: item.sessionLabel, zoomMeeting: item.zoomMeeting, zoomRecording: item.zoomRecording, skipReason: item.skipReason, coveredBy: item.coveredBy, modelOutputHistory: item.modelOutputs)
             },
             outputFolder: outputFolder.path,
             outputDestination: outputDestination.rawValue,
@@ -1625,7 +2025,10 @@ final class AppState: ObservableObject {
             speakerTurns: speakerTurns,
             mergedSessions: mergedSessions,
             zoomMeetings: zoomMeetings,
-            removedZoomInputs: removedZoomInputs
+            removedZoomInputs: removedZoomInputs,
+            additionalPasses: additionalPasses,
+            appendModelID: appendModelID,
+            passOutcomes: outcomes
         )
         guard let data = try? JSONEncoder().encode(saved) else { return }
         try? FileManager.default.createDirectory(at: queueFile.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1669,691 +2072,170 @@ final class AppState: ObservableObject {
 
 }
 
-private struct ModelActivitySheet: View {
-    @ObservedObject var state: AppState
+struct PlannedTranscript: Identifiable, Equatable {
+    let path: String
+    let model: String
+    let tag: String?
+    let exists: Bool
+    var id: String { "\(tag ?? "")|\(path)" }
+}
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 12) {
-                Image(systemName: state.modelActivitySucceeded ? "checkmark.circle.fill" : (state.modelActivityCanDismiss ? "exclamationmark.triangle.fill" : "arrow.down.circle.fill"))
-                    .font(.system(size: 28))
-                    .foregroundStyle(state.modelActivitySucceeded ? .green : (state.modelActivityCanDismiss ? .orange : Color.accentColor))
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(state.modelActivityTitle).font(.title3.weight(.semibold))
-                    Text(state.modelActivityMessage).font(.callout).foregroundStyle(.secondary).lineLimit(2)
-                }
-                Spacer()
-            }
-            if let progress = state.modelActivityProgress {
-                ProgressView(value: progress)
-                    .tint(.accentColor)
-            } else {
-                ProgressView().controlSize(.small)
-            }
-            Text("Models are stored in the local Transcriberrr cache. This may take several minutes on a first run.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(state.modelActivityLog.isEmpty ? "Waiting for the model manager…" : state.modelActivityLog.joined(separator: "\n"))
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .id("model-log")
-                }
-                .frame(minHeight: 180, maxHeight: 300)
-                .padding(10)
-                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
-                .onChange(of: state.modelActivityLog.count) { _, _ in
-                    withAnimation { proxy.scrollTo("model-log", anchor: .bottom) }
-                }
-            }
-            HStack {
-                Spacer()
-                if state.isRunning {
-                    // No Esc shortcut: pressing Esc to dismiss the panel canceled the run.
-                    Button(state.isCancelling ? "Stopping…" : "Cancel") {
-                        state.cancelTranscription()
-                    }
-                    .disabled(state.isCancelling)
-                }
-                if state.modelActivityCanDismiss {
-                    Button("Close") {
-                        state.showModelActivity = false
-                    }
-                    .keyboardShortcut(.defaultAction)
-                }
-            }
+struct LibraryModel: Decodable, Identifiable, Equatable {
+    let id: String
+    let description: String
+    let cached: Bool
+    let path: String?
+    var isLocal: Bool { id.hasPrefix("/") || id.hasPrefix("~/") || id.hasPrefix("./") || id.hasPrefix("../") }
+}
+
+extension TranscriptionPass {
+    var displayName: String {
+        switch engine {
+        case "parakeet-v3": "Parakeet"
+        case "apple-native": "Apple SpeechTranscriber"
+        default: "Qwen3 ASR"
         }
-        .padding(24)
-        .frame(width: 620, height: 460)
     }
 }
 
-struct ContentView: View {
-    @ObservedObject var state: AppState
-    @State private var dropTargeted = false
-    @State private var queueFilter = ""
-    @State private var compiledFilter: NSRegularExpression?
-    @State private var filterErrorMessage: String?
-    @State private var expandedMeetings: Set<String> = []
-
-    var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            dropZone
-            if state.items.isEmpty { emptyState } else { queue }
-            Divider()
-            footer
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .alert("Couldn’t plan the queue", isPresented: Binding(
-            get: { state.planningError != nil },
-            set: { if !$0 { state.planningError = nil } }
-        )) {
-            Button("OK") { state.planningError = nil }
-        } message: {
-            Text(state.planningError ?? "")
-        }
-        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
-            // Refuse (so Finder animates the files back) rather than silently drop them.
-            guard !state.isRunning else { return false }
-            loadDroppedItems(providers)
-            return true
-        }
-        .onChange(of: state.outputDestination) { _, _ in state.saveQueue() }
-        .onChange(of: state.outputFolder) { _, _ in state.saveQueue() }
-        .onChange(of: state.speakerTurns) { _, _ in state.saveQueue() }
-        .onChange(of: state.engine) { _, value in state.selectEngine(value); state.saveQueue() }
-        .onChange(of: state.modelID) { _, _ in state.invalidateModelStatus(); state.saveQueue() }
-        .onChange(of: state.diarizationModel) { _, _ in state.saveQueue() }
-        .onChange(of: state.device) { _, _ in state.saveQueue() }
-        .onChange(of: state.format) { _, _ in state.saveQueue() }
-        .onChange(of: state.timestamps) { _, _ in state.saveQueue() }
-        .onAppear { updateFilter(queueFilter) }
-        .onChange(of: queueFilter) { _, value in updateFilter(value) }
-        // An overlay rather than a sheet: macOS refuses to quit (Cmd-Q, Dock, logout) while a
-        // sheet is open, which blocked quitting for an entire first-run model download.
-        .overlay {
-            if state.showModelActivity {
-                ZStack {
-                    Color.black.opacity(0.25).ignoresSafeArea()
-                    ModelActivitySheet(state: state)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-                        .shadow(radius: 20)
-                }
-            }
-        }
+extension AppState {
+    var configuredPasses: [TranscriptionPass] {
+        [TranscriptionPass(engine: engine, model: modelID)] + additionalPasses
     }
 
-    private var header: some View {
-        HStack {
-            Image(systemName: "waveform.and.mic")
-                .font(.system(size: 24, weight: .semibold))
-                .foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Transcriberrr").font(.title2.weight(.semibold))
-                Text("Private, offline transcription on Apple Silicon").foregroundStyle(.secondary)
+    func replaceModelPasses(_ passes: [TranscriptionPass], appendSuffix: Bool) {
+        guard let first = passes.first, !isRunning, downloadingLibraryModel == nil else { return }
+        engine = first.engine
+        modelID = first.model
+        additionalPasses = Array(passes.dropFirst())
+        appendModelID = appendSuffix
+        saveQueue()
+    }
+
+    func validateModelPasses(_ passes: [TranscriptionPass], appendSuffix: Bool? = nil) async throws -> [String?] {
+        let tagged = passes.count > 1 || (appendSuffix ?? appendModelID)
+        var tags: [String?] = []
+        var used: [String: Int] = [:]
+        for (index, pass) in passes.enumerated() {
+            try Task.checkCancellation()
+            if pass.usesApple {
+                guard #available(macOS 26, *) else {
+                    throw PlanningFailure(message: "Apple SpeechTranscriber requires macOS 26 or later.")
+                }
             }
-            Spacer()
-            Button("Choose files…") { chooseFiles() }
-                .keyboardShortcut("o")
-                .disabled(state.isRunning)
+            let model = pass.modelArgument
+            if (pass.engine == "parakeet-v3" && isQwenModel(model)) || (pass.engine == "qwen" && isParakeetModel(model)) {
+                throw PlanningFailure(message: "Pass \(index + 1) needs a \(pass.displayName) model.")
+            }
+            guard tagged else {
+                tags.append(nil)
+                continue
+            }
+            guard let tag = await readModelTag(pass) else {
+                throw PlanningFailure(message: "Couldn’t determine the model identifier for pass \(index + 1).")
+            }
+            if let previous = used.updateValue(index + 1, forKey: tag) {
+                throw PlanningFailure(message: "Passes \(previous) and \(index + 1) both use .\(tag). Choose a different model or remove one pass.")
+            }
+            tags.append(tag)
         }
-        .padding(20)
+        return tags
     }
 
-    private var dropZone: some View {
-        Group {
-            if state.items.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: dropTargeted ? "arrow.down.circle.fill" : "arrow.down.doc")
-                        .font(.system(size: 32))
-                        .foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary)
-                    Text(dropTargeted ? "Release to add audio" : "Drop audio files or folders here")
-                        .font(.headline)
-                    Text("WAV, AIFF, CAF, M4A, M4B, MP3, MP4, FLAC, AAC, OGG, Opus, or WebM")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Label(dropTargeted ? "Release to add audio" : "Drop more files or folders",
-                      systemImage: dropTargeted ? "arrow.down.circle.fill" : "arrow.down.doc")
-                    .font(.callout)
-                    .foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary)
-            }
+    func previewOutputs(for selection: QueueSelection, passes: [TranscriptionPass], tags: [String?]) async throws -> [PlannedTranscript] {
+        let inspected: [AudioItem]
+        switch selection {
+        case .recording(let id):
+            guard let item = items.first(where: { $0.id == id }) else { return [] }
+            if let meeting = item.zoomMeeting { inspected = items.filter { $0.zoomMeeting == meeting } }
+            else { inspected = [item] }
+        case .meeting(let id):
+            inspected = items.filter { $0.zoomMeeting == id }
+        case .merge:
+            return []
         }
-        .frame(maxWidth: .infinity)
-        .frame(height: state.items.isEmpty ? 116 : 44)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(dropTargeted ? Color.accentColor : .secondary.opacity(0.25), style: StrokeStyle(lineWidth: 2, dash: [8])))
-        .padding(.horizontal, 20)
-        .padding(.top, 18)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(dropTargeted ? "Release to add audio" : "Drop audio files or folders here")
-        .accessibilityHint("You can also use the Choose files button to select audio.")
-    }
-
-    private var emptyState: some View {
-        ContentUnavailableView("No audio queued", systemImage: "music.note.list", description: Text("Add a file or folder to begin."))
-            .frame(maxHeight: .infinity)
-    }
-
-    private var queue: some View {
-        let visible = visibleItems
-        let visibleMeetings = Set(visible.compactMap(\.zoomMeeting))
-        let children = Dictionary(grouping: state.items.filter { $0.zoomMeeting != nil }, by: { $0.zoomMeeting ?? "" })
-        let meetingOutputs = Set(state.zoomMeetings.map(\.output))
-        let otherMerges = state.mergedSessions.filter { !meetingOutputs.contains($0.id) }
-        return VStack(spacing: 0) {
-            HStack {
-                Text("Queue").font(.headline)
-                let count = state.zoomMeetings.count
-                if count > 0 {
-                    Text("\(count) \(count == 1 ? "meeting" : "meetings")").foregroundStyle(.secondary)
-                }
-                if count == 0 || !queueFilter.isEmpty {
-                    Text("\(visible.count) \(visible.count == 1 ? "file" : "files")").foregroundStyle(.secondary)
-                }
-                Spacer()
-                TextField("Regex filter", text: $queueFilter)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 180)
-                // Selection drives queue progress and ETA; changing it mid-run skews both.
-                Button("Check all") { state.selectAll(visibleItems, selected: true) }
-                    .buttonStyle(.borderless)
-                    .disabled(state.isRunning)
-                Button("Check none") { state.selectAll(visibleItems, selected: false) }
-                    .buttonStyle(.borderless)
-                    .disabled(state.isRunning)
-                Button("Speaker tracks") { state.toggleIsoTracks(visibleItems) }
-                    .buttonStyle(.borderless)
-                    .disabled(state.isRunning || !visible.contains { $0.zoomMeeting == nil })
-                    .help("Mark the visible files as one speaker's track each (or unmark them). Tracks of one session are merged.")
-                Button("Clear completed") { state.clearCompleted() }
-                    .buttonStyle(.borderless)
-                .disabled((state.completedItemCount == 0 && !state.mergedSessions.contains { $0.state == "done" }) || state.isRunning)
+        guard !inspected.isEmpty else { return [] }
+        let targetIDs = Set(inspected.map(\.id))
+        let targetPaths = Set(inspected.map { canonicalPath($0.url.path) })
+        let includedMeetings = Set(selectedItems.compactMap(\.zoomMeeting) + inspected.compactMap(\.zoomMeeting))
+        let requested = items.filter { item in
+            guard item.selected || targetIDs.contains(item.id) || item.zoomMeeting.map(includedMeetings.contains) == true else { return false }
+            return item.zoomMeeting == nil || item.isoTrack || item.skipReason == nil || FileManager.default.fileExists(atPath: item.url.path)
+        }
+        let requestedIDs = Set(requested.map(\.id))
+        let excluded = itemsByPath(items).compactMap { path, item in requestedIDs.contains(item.id) ? nil : path }
+        let format = self.format
+        let plans = zip(passes, tags).map { pass, tag in
+            (pass, tag, makeRunManifest(requested, excluding: Set(excluded).union(removedZoomInputs).sorted(), pass: pass, tag: tag))
+        }
+        var outputs: [PlannedTranscript] = []
+        var errors: [String] = []
+        for (pass, tag, manifest) in plans {
+            try Task.checkCancellation()
+            if tag == nil, inspected.count == 1, let item = inspected.first,
+               item.zoomMeeting == nil, !item.zoomRecording, !item.isoTrack, item.skipReason == nil,
+               item.state == .done, let saved = reusableUntaggedOutput(for: item) {
+                outputs.append(PlannedTranscript(path: saved.path, model: pass.modelArgument, tag: nil, exists: true))
+                continue
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 18)
-            if let regexError = filterError {
-                Text("Invalid regex: \(regexError)").font(.caption).foregroundStyle(.red).padding(.horizontal, 20).padding(.top, 4)
-            }
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(state.zoomMeetings.filter { visibleMeetings.contains($0.id) }) { meeting in
-                        meetingRow(meeting, files: children[meeting.id] ?? [])
-                    }
-                    ForEach(visible.filter { $0.zoomMeeting == nil }) { item in queueRow(item) }
-                    if !otherMerges.isEmpty {
-                        Text("Merged transcripts").font(.headline).padding(.top, 14).padding(.bottom, 4)
-                        ForEach(otherMerges) { session in mergedRow(session) }
-                    }
-                }
-                .padding(.horizontal, 20)
+            let plan = try await preview(manifest, format: format, pass: pass, tag: tag, trackProcess: false)
+            try Task.checkCancellation()
+            let matched = plan.files.filter { targetPaths.contains($0.path) }
+            errors.append(contentsOf: matched.compactMap(\.error))
+            let coveringPaths = Set(matched.flatMap { $0.coveredBy ?? [] })
+            let related = plan.files.filter { targetPaths.contains($0.path) || coveringPaths.contains($0.path) }
+            let meetingIDs = Set(related.compactMap(\.meeting))
+            let paths = plan.meetings.filter { meetingIDs.contains($0.id) }.map(\.output)
+                + related.flatMap { [$0.output, $0.mergeOutput].compactMap { $0 } }
+            var seen: Set<String> = []
+            for path in paths where seen.insert(path).inserted {
+                outputs.append(PlannedTranscript(path: path, model: pass.modelArgument, tag: tag, exists: outputExists(path)))
             }
         }
-        .frame(maxHeight: .infinity)
+        if outputs.isEmpty, let error = errors.first { throw PlanningFailure(message: error) }
+        return outputs
     }
 
-    private func meetingRow(_ meeting: ZoomMeeting, files: [AudioItem]) -> some View {
-        let tracks = files.filter { $0.skipReason == nil }
-        let result = state.meetingResult(meeting)
-        let running = result?.state == "running" || tracks.contains { $0.state == .processing }
-        let failed = tracks.first { if case .failed = $0.state { return true }; return false }
-        let canceled = tracks.contains { $0.state == .canceled }
-        let included = files.contains(where: \.selected)
-        let progress = tracks.reduce(0.0) { $0 + $1.progress } / Double(max(1, tracks.count))
-        let status = result?.state == "done" ? "Merged"
-            : result?.state == "failed" || failed != nil ? "Failed"
-            : result?.state == "canceled" || canceled ? "Canceled"
-            : running ? "Transcribing" : "Queued"
-        let participants = meeting.participants == 1 ? "1 participant’s audio"
-            : "\(meeting.participants) participants"
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 10) {
-                Button {
-                    state.selectAll(files, selected: !included)
-                } label: {
-                    Image(systemName: included ? "checkmark.square.fill" : "square")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Include \(meeting.label) in transcription")
-                .accessibilityValue(included ? "On" : "Off")
-                .disabled(state.isRunning)
-                DisclosureGroup(isExpanded: Binding(
-                    get: { expandedMeetings.contains(meeting.id) },
-                    set: { expanded in
-                        if expanded { expandedMeetings.insert(meeting.id) }
-                        else { expandedMeetings.remove(meeting.id) }
-                    }
-                )) {
-                    ForEach(files) { item in
-                        HStack(alignment: .firstTextBaseline) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.speakerName ?? item.url.lastPathComponent)
-                                if item.speakerName != nil {
-                                    Text(item.url.lastPathComponent).font(.caption2).foregroundStyle(.secondary)
-                                }
-                            }
-                            Spacer()
-                            Text(item.skipReason ?? (item.resultSummary.isEmpty ? item.state.label : item.resultSummary))
-                                .foregroundStyle(.secondary)
-                        }
-                        .font(.caption)
-                        .padding(.vertical, 3)
-                    }
-                } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Label(meeting.label, systemImage: "video")
-                            .font(.headline).lineLimit(1)
-                        Text("\(participants) • \(tracks.count) \(tracks.count == 1 ? "track" : "tracks")")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                if running {
-                    ProgressView(value: min(progress, 0.99)).frame(width: 72)
-                        .accessibilityLabel("Progress for \(meeting.label)")
-                }
-                Text(status).font(.caption).foregroundStyle(status == "Merged" ? .green : status == "Failed" ? .red : .secondary)
-                    .frame(minWidth: 82, alignment: .trailing)
-                Button { state.removeMeeting(meeting) } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Remove \(meeting.label) from queue")
-                .disabled(state.isRunning)
-            }
-            if let result, result.state == "done" {
-                Button { state.revealMerged(result) } label: {
-                    Text(URL(fileURLWithPath: result.id).lastPathComponent).lineLimit(1)
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.tint)
-                .accessibilityLabel("Show merged transcript in Finder")
-                .help(result.id)
-            }
-            if let message = result?.message ?? failed?.resultSummary {
-                Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-            }
-            Divider()
+    func modelLibrary() async throws -> [LibraryModel] {
+        guard let report = await readCLI(["--model-status"]),
+              var models = try? JSONDecoder().decode([LibraryModel].self, from: Data(report.utf8)) else {
+            throw PlanningFailure(message: "Couldn’t read the local model cache.")
         }
-        .padding(.vertical, 7)
-    }
-
-    private var visibleItems: [AudioItem] {
-        guard let regex = compiledFilter else { return state.items }
-        return state.items.filter { item in
-            let value = "\(item.url.lastPathComponent) \(item.url.path)"
-            return regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
+        let configured = configuredPasses.filter { !$0.usesApple }.map(\.modelArgument) + [diarizationModelArgument]
+        var seen = Set(models.map(\.id) + ["sortformer"])
+        let extra = configured.filter { seen.insert($0).inserted }
+        if !extra.isEmpty {
+            let cached = await cachedModels(extra)
+            models += extra.map { LibraryModel(id: $0, description: $0, cached: cached?[$0] == true, path: nil) }
         }
+        return models
     }
 
-    private var filterError: String? {
-        filterErrorMessage
+    func fetchLibraryModel(_ model: LibraryModel) async {
+        guard !isRunning, downloadingLibraryModel == nil, !model.cached, !model.isLocal else { return }
+        downloadingLibraryModel = model.id
+        isCancelling = false
+        beginModelActivity(title: "Downloading Model", message: model.description)
+        let result = await downloadModels([model.id])
+        modelActivityCanDismiss = true
+        modelActivityMessage = isCancelling ? "Download canceled." : result.status == 0 ? "Model downloaded."
+            : result.message.isEmpty ? "Model download failed." : result.message
+        downloadingLibraryModel = nil
+        isCancelling = false
     }
 
-    private func updateFilter(_ value: String) {
-        guard !value.isEmpty else {
-            compiledFilter = nil
-            filterErrorMessage = nil
-            return
-        }
-        do {
-            compiledFilter = try NSRegularExpression(pattern: value, options: [.caseInsensitive])
-            filterErrorMessage = nil
-        } catch {
-            compiledFilter = try! NSRegularExpression(pattern: "(?!)")
-            filterErrorMessage = error.localizedDescription
-        }
-    }
-
-    @ViewBuilder
-    private func queueRow(_ item: AudioItem) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Button {
-                    state.setSelection(for: item, !item.selected)
-                } label: {
-                    Image(systemName: item.selected ? "checkmark.square.fill" : "square")
-                }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(item.selected ? .primary : .secondary)
-                    .accessibilityLabel("Include \(item.url.lastPathComponent) in transcription")
-                    .accessibilityValue(item.selected ? "On" : "Off")
-                    .disabled(state.isRunning)
-                Image(systemName: item.diarize ? "person.2.wave.2" : item.isoTrack ? "person.wave.2" : "waveform")
-                    .foregroundStyle(.tint).frame(width: 22)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.url.lastPathComponent).lineLimit(1)
-                    Text("\(formatDuration(item.duration))  •  \(item.url.deletingLastPathComponent().path)")
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    if item.state == .processing || item.elapsedSeconds > 0 {
-                        Text(itemTimingLabel(item))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    if let outputURL = item.outputURL {
-                        Button {
-                            state.revealOutput(for: item)
-                        } label: {
-                            Text(item.resultSummary.isEmpty ? outputURL.path : item.resultSummary)
-                                .font(.caption2)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                        .buttonStyle(.borderless)
-                        .foregroundStyle(.tint)
-                        .accessibilityLabel("Show saved transcript in Finder")
-                        .help("Reveal \(outputURL.path) in Finder")
-                    } else if !item.resultSummary.isEmpty {
-                        Text(item.resultSummary).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                }
-                Spacer(minLength: 8)
-                if item.state == .processing {
-                    Group {
-                        if state.engine == "apple-native" {
-                            ProgressView()
-                        } else {
-                            ProgressView(value: item.progress)
-                        }
-                    }
-                        .frame(width: 72)
-                        .accessibilityLabel("Transcribing \(item.url.lastPathComponent)")
-                }
-                Text(item.state.label).font(.caption).foregroundStyle(color(for: item.state)).frame(minWidth: 82, alignment: .trailing).lineLimit(1)
-                Button { state.remove(item) } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary) }
-                    .buttonStyle(.borderless)
-                    .accessibilityLabel("Remove \(item.url.lastPathComponent) from queue")
-                    .disabled(state.isRunning)
-            }
-            HStack(spacing: 14) {
-                Button {
-                    state.setDiarization(for: item, enabled: !item.diarize)
-                } label: {
-                    Label("Diarize this track", systemImage: item.diarize ? "checkmark.square.fill" : "square")
-                }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                    .foregroundStyle(item.diarize ? .primary : .secondary)
-                    .accessibilityLabel("Diarize this track")
-                    .accessibilityValue(item.diarize ? "On" : "Off")
-                    // SpeechTranscriber has no speaker labels; enabling this only fails the item.
-                    .disabled(state.isRunning || state.engine == "apple-native")
-                if item.diarize && state.engine != "apple-native" {
-                    Picker("Speakers", selection: Binding<Int>(get: { item.speakerCount ?? 0 }, set: { state.setSpeakerCount(for: item, $0 == 0 ? nil : $0) })) {
-                        Text("Auto").tag(0)
-                        ForEach(1...8, id: \.self) { count in Text("\(count)").tag(count) }
-                    }
-                    .pickerStyle(.menu).font(.caption).frame(width: 140)
-                    .disabled(state.isRunning)
-                }
-                Button {
-                    state.setIsoTrack(for: item, enabled: !item.isoTrack)
-                } label: {
-                    Label("Speaker track", systemImage: item.isoTrack ? "checkmark.square.fill" : "square")
-                }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                    .foregroundStyle(item.isoTrack ? .primary : .secondary)
-                    .accessibilityLabel("One speaker's track, merged with its session")
-                    .accessibilityValue(item.isoTrack ? "On" : "Off")
-                    .help("This file holds one speaker. Tracks from one Zoom session or folder are transcribed together with the other speakers' bleed muted, then merged.")
-                    .disabled(state.isRunning)
-                if item.isoTrack, let speaker = item.speakerName {
-                    Text(item.sessionLabel.map { "\(speaker) • \($0)" } ?? speaker)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-                Spacer()
-            }
-            Divider()
-        }
-        .padding(.vertical, 7)
-    }
-
-    @ViewBuilder
-    private func mergedRow(_ session: MergedSession) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Image(systemName: "rectangle.stack.badge.person.crop").foregroundStyle(.tint).frame(width: 22)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(session.label).lineLimit(1)
-                    if session.state == "done" {
-                        Button {
-                            state.revealMerged(session)
-                        } label: {
-                            Text(session.id).font(.caption2).lineLimit(1).truncationMode(.middle)
-                        }
-                        .buttonStyle(.borderless)
-                        .foregroundStyle(.tint)
-                        .accessibilityLabel("Show merged transcript in Finder")
-                        .help("Reveal \(session.id) in Finder")
-                    }
-                    Text(session.message).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-                }
-                Spacer(minLength: 8)
-                if session.state == "running" { ProgressView().controlSize(.small) }
-                Text(session.state == "done" ? "Merged" : session.state == "failed" ? "Failed" : session.state == "canceled" ? "Canceled" : "Merging")
-                    .font(.caption)
-                    .foregroundStyle(session.state == "done" ? .green : session.state == "failed" ? .red : .secondary)
-                    .frame(minWidth: 82, alignment: .trailing)
-            }
-            Divider()
-        }
-        .padding(.vertical, 7)
-    }
-
-    private var footer: some View {
-        VStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 16) {
-                    setting("Engine") {
-                        Picker("", selection: $state.engine) {
-                            Text("Qwen3 ASR (Metal)").tag("qwen")
-                            Text("Apple SpeechTranscriber").tag("apple-native")
-                            Text("Parakeet Unified EN (latest)").tag("parakeet-v3")
-                        }
-                        .labelsHidden().pickerStyle(.menu).frame(width: 190)
-                    }
-                    setting("Model") {
-                        TextField("Hugging Face ID or local path", text: $state.modelID)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 300)
-                    }
-                    Text(state.modelStatus).font(.caption2).foregroundStyle(.secondary)
-                    Spacer()
-                }
-                HStack(spacing: 16) {
-                    setting("Output") {
-                        Picker("", selection: $state.outputDestination) {
-                            ForEach(OutputDestination.allCases) { destination in Text(destination.title).tag(destination) }
-                        }
-                        .labelsHidden().pickerStyle(.menu).frame(width: 170)
-                    }
-                    if state.outputDestination == .folder {
-                        Button(state.outputFolder.path) { state.chooseFolder(state.outputFolder) { state.outputFolder = $0; state.saveQueue() } }
-                            .buttonStyle(.borderless).lineLimit(1).frame(maxWidth: 300, alignment: .leading)
-                    }
-                    Spacer()
-                }
-                HStack(spacing: 16) {
-                    setting("Acceleration") {
-                        Picker("", selection: $state.device) { Text("Metal GPU").tag("metal"); Text("CPU").tag("cpu") }
-                            .labelsHidden().pickerStyle(.menu).frame(width: 130)
-                    }
-                    setting("Format") {
-                        Picker("", selection: Binding(
-                            get: { state.format },
-                            set: { format in
-                                state.format = format
-                                if format == "txt" { state.timestamps = "none" }
-                            }
-                        )) {
-                            Text("JSON").tag("json")
-                            Text("Text").tag("txt")
-                            Text("SRT").tag("srt")
-                            Text("VTT").tag("vtt")
-                        }
-                        .labelsHidden().pickerStyle(.menu).frame(width: 100)
-                    }
-                    Toggle("Include timestamps", isOn: Binding(
-                        get: { state.timestamps != "none" },
-                        set: { enabled in
-                            if enabled {
-                                if state.format == "txt" { state.format = "json" }
-                                state.timestamps = "words"
-                            } else {
-                                state.timestamps = "none"
-                            }
-                        }
-                    ))
-                    .toggleStyle(.checkbox)
-                    // Text is always untimed; speaker turns only change diarized tracks.
-                    if state.format == "txt" {
-                        Toggle("Speaker turns", isOn: $state.speakerTurns)
-                            .toggleStyle(.checkbox)
-                            .help("Start a [Speaker N] paragraph at each speaker change in diarized tracks.")
-                            .disabled(state.engine == "apple-native")
-                    }
-                    if state.timestamps != "none" {
-                        setting("Timestamp level") {
-                            Picker("", selection: $state.timestamps) {
-                                Text("Word level").tag("words")
-                                Text("Sentence level").tag("sentences")
-                            }
-                            .labelsHidden().pickerStyle(.menu).frame(width: 150)
-                        }
-                    }
-                    Button {
-                        state.diarize.toggle()
-                        state.saveQueue()
-                    } label: {
-                        Label("Diarization default", systemImage: state.diarize ? "checkmark.square.fill" : "square")
-                    }
-                        .buttonStyle(.borderless)
-                        .accessibilityValue(state.diarize ? "On" : "Off")
-                        .disabled(state.engine == "apple-native")
-                    Spacer()
-                }
-            }
-            .disabled(state.isRunning)
-            // Also when only individual tracks diarize: they use this model too.
-            if state.diarize || state.items.contains(where: \.diarize) {
-                HStack {
-                    Text("Diarization model").foregroundStyle(.secondary)
-                    Text(state.diarizationModelArgument).lineLimit(1).foregroundStyle(.secondary)
-                    Button("Choose…") { state.chooseDiarizationModel(state.diarizationModel) { state.diarizationModel = $0; state.saveQueue() } }
-                        .disabled(state.isRunning)
-                }
-                .font(.caption)
-            }
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("\(state.completedCount) of \(state.selectedCount) selected complete")
-                    Text("\(formatDuration(state.totalDuration)) queued")
-                        .font(.caption).foregroundStyle(.secondary)
-                    if state.isRunning || state.queueElapsedSeconds > 0 {
-                        HStack(spacing: 6) {
-                            Text("\(formatElapsed(state.queueElapsedSeconds)) elapsed")
-                            if let remaining = state.queueEstimatedRemainingSeconds {
-                                Text("• ~\(formatElapsed(remaining)) remaining")
-                            }
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-                if state.isRunning {
-                    HStack(spacing: 8) {
-                        ProgressView(value: state.queueProgress).frame(width: 130)
-                        Text(state.activeStatus).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                Button(state.isRunning ? (state.isCancelling ? "Stopping…" : "Cancel") : "Transcribe") {
-                    if state.isRunning { state.cancelTranscription() } else { state.transcribe() }
-                }
-                // Not Return/Esc: text fields (model ID, regex filter) pass those through, so
-                // confirming a field started the queue and Esc in the filter canceled a run.
-                .keyboardShortcut(state.isRunning ? "." : .return, modifiers: .command)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(state.items.isEmpty || state.isCancelling || state.addOperations > 0)
-            }
-            if state.timestamps != "none" {
-                Text(state.timestamps == "words"
-                     ? "JSON stores each word with start and end seconds; SRT and VTT write one cue per word."
-                     : "JSON, SRT, and VTT store one timed entry per sentence.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(20)
-    }
-
-    private func setting<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 3) { Text(title).font(.caption).foregroundStyle(.secondary); content() }
-    }
-
-    private func loadDroppedItems(_ providers: [NSItemProvider]) {
-        guard !state.isRunning else { return }
-        guard !providers.isEmpty else { return }
-        let group = DispatchGroup()
-        let collector = URLCollector()
-        for provider in providers {
-            group.enter()
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                let url: URL?
-                if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
-                else if let value = item as? URL { url = value }
-                else if let value = item as? NSURL { url = value as URL }
-                else { url = nil }
-                if let url {
-                    collector.append(url)
-                }
-                group.leave()
-            }
-        }
-        // A single add call deduplicates the whole drop, schedules one duration
-        // probe, and coalesces persistence for folders containing thousands of files.
-        DispatchQueue.global(qos: .userInitiated).async {
-            group.wait()
-            let urls = collector.values()
-            DispatchQueue.main.async {
-                guard !self.state.isRunning else { return }
-                self.state.add(urls: urls)
-            }
-        }
-    }
-
-    private func chooseFiles() { state.chooseFiles() }
-
-    private func color(for itemState: ItemState) -> Color {
-        switch itemState { case .done: .green; case .failed: .red; default: .secondary }
+    func cancelLibraryDownload() {
+        guard downloadingLibraryModel != nil, !isCancelling else { return }
+        isCancelling = true
+        modelActivityMessage = "Stopping download…"
+        activeProcess?.terminate()
     }
 }
 
-private func formatDuration(_ duration: TimeInterval) -> String {
-    guard duration.isFinite, duration > 0 else { return "Unknown duration" }
-    let total = Int(duration.rounded())
-    return total >= 3600 ? String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60) : String(format: "%d:%02d", total / 60, total % 60)
-}
-
-private func formatElapsed(_ duration: TimeInterval) -> String {
+func formatElapsed(_ duration: TimeInterval) -> String {
     guard duration.isFinite, duration >= 0 else { return "--:--" }
     let total = Int(duration.rounded())
     return total >= 3600
         ? String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
         : String(format: "%d:%02d", total / 60, total % 60)
-}
-
-@MainActor
-private func itemTimingLabel(_ item: AudioItem) -> String {
-    var label = "\(formatElapsed(item.elapsedSeconds)) elapsed"
-    if let remaining = item.estimatedRemainingSeconds {
-        label += " • ~\(formatElapsed(remaining)) remaining"
-    }
-    return label
 }

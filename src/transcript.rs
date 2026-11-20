@@ -444,7 +444,7 @@ pub(crate) fn render_output(doc: &TranscriptDocument, options: RenderOptions) ->
                     timestamp(start, true),
                     timestamp(end, true),
                     speaker,
-                    text.trim()
+                    text.split_whitespace().collect::<Vec<_>>().join(" ")
                 )),
                 OutputFormat::Srt | OutputFormat::Vtt => {
                     if !vtt {

@@ -27,7 +27,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -45,9 +45,10 @@ type ParakeetEngine = parakeet_engine::ParakeetEngine;
 type ParakeetEngine = ();
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
+const CLI_SCHEMA_VERSION: u32 = 1;
 const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "m4v", "mov", "mp3", "mp4", "ogg", "opus",
-    "wav", "webm",
+    "qta", "wav", "webm",
 ];
 /// Upper bound on Qwen output tokens per second of audio: fast speech is about 4 words (~6
 /// tokens) per second, so this leaves headroom while still stopping a runaway generation.
@@ -60,28 +61,32 @@ const PARAKEET_DEFAULT_CHUNK_SECONDS: f32 = 120.0;
 /// qwen3_asr's MAX_FORCE_ALIGN_INPUT_SECONDS.
 const QWEN_MAX_CHUNK_SECONDS: f32 = 180.0;
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "transcriberrr",
     version,
-    about = "Offline Qwen3-ASR transcription on Apple Silicon",
+    about = "Local transcription and speaker-track merging on Apple Silicon",
+    after_help = "For automation, start with `transcriberrr capabilities`, preview with --plan, then stream results with --jsonl.",
     subcommand_negates_reqs = true,
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
-    #[arg(value_name = "INPUT", required_unless_present_any = ["input_dir", "manifest", "model_status", "download_model", "cached_model"])]
+    /// Audio/video files, Zoom meetings, or folders. Positional folders are searched recursively.
+    #[arg(value_name = "INPUT", required_unless_present_any = ["input_dir", "manifest", "model_status", "download_model", "cached_model", "print_model_tag"])]
     inputs: Vec<PathBuf>,
+    /// Scan a directory for recordings, including Zoom meetings in subfolders.
     #[arg(long, conflicts_with_all = ["inputs", "manifest"])]
     input_dir: Option<PathBuf>,
-    /// JSON job manifest for per-track diarization/output settings.
+    /// JSON job manifest for per-track settings. Use `-` to read from stdin.
     #[arg(long, conflicts_with_all = ["inputs", "input_dir"])]
     manifest: Option<PathBuf>,
+    /// With --input-dir, also include ordinary recordings from subfolders.
     #[arg(long)]
     recursive: bool,
     /// Print the planned inputs, Zoom meetings, and destinations as JSON without running models.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["model_status", "download_model", "cached_model", "print_model_tag"])]
     plan: bool,
     /// List inputs for the app before it assigns distinct output names.
     #[arg(long, hide = true, requires = "plan")]
@@ -93,9 +98,24 @@ struct Cli {
     /// pass an explicit legacy TDT model path with `--model` when needed.
     #[arg(long, value_enum, default_value_t = EngineKind::Qwen3)]
     engine: EngineKind,
+    /// Run a model pass over the inputs, reusing existing results unless --overwrite is set.
+    /// Repeat for multiple passes, using ENGINE or ENGINE=MODEL.
+    #[arg(long = "pass", value_name = "ENGINE[=MODEL]", value_parser = parse_model_pass, conflicts_with_all = ["engine", "model", "model_status", "download_model", "cached_model", "print_model_tag", "inventory_only"])]
+    passes: Vec<ModelPass>,
+    /// Append a short model identifier to transcript filenames. Enabled automatically for --pass.
+    #[arg(long)]
+    model_suffix: bool,
+    /// Print the filename identifier for --engine and --model, then exit.
+    #[arg(long)]
+    print_model_tag: bool,
+    #[arg(skip)]
+    output_tag: Option<String>,
     /// Root directory for downloaded model snapshots. Defaults to the macOS application-support cache.
     #[arg(long)]
     model_cache: Option<PathBuf>,
+    /// Use only local model files and installed Apple speech assets. Disable downloads and cache repair.
+    #[arg(long, conflicts_with = "download_model")]
+    offline: bool,
     /// Download one or more model IDs/aliases, then exit when no input is supplied.
     #[arg(long = "download-model")]
     download_model: Vec<String>,
@@ -114,6 +134,7 @@ struct Cli {
     /// Sortformer ONNX file, or a model ID/alias. Defaults to `sortformer` when diarizing.
     #[arg(long)]
     diarization_model: Option<PathBuf>,
+    /// Detect speakers in mixed audio. Separate speaker tracks use their own labels.
     #[arg(long)]
     diarize: bool,
     /// Limit diarization output to at most N speakers (Sortformer supports up to 8). Implies
@@ -134,10 +155,11 @@ struct Cli {
     /// length; 120 s chunks peaked above 20 GB) and 120 for Parakeet.
     #[arg(long, value_parser = positive_f32)]
     chunk_seconds: Option<f32>,
+    /// Replace existing transcripts, including when --resume is supplied.
     #[arg(long)]
     overwrite: bool,
-    /// With `--format txt --timestamps none`, write one `[Speaker N]` paragraph per speaker
-    /// turn instead of the exact transcript text. Requires diarization to have any effect.
+    /// With `--format txt --timestamps none`, write one labeled paragraph per speaker turn.
+    /// Uses diarization labels or names from separate speaker tracks.
     #[arg(long)]
     speaker_turns: bool,
     /// Which inputs are per-speaker tracks: by default, Zoom's participant files
@@ -161,7 +183,10 @@ struct Cli {
     /// Append JSONL status events so long queues can be resumed safely.
     #[arg(long, value_name = "PATH")]
     progress_file: Option<PathBuf>,
-    /// Skip inputs already marked completed in --progress-file.
+    /// Stream versioned JSON Lines progress and run results on stdout. Diagnostics stay on stderr.
+    #[arg(long, conflicts_with_all = ["plan", "model_status", "cached_model", "download_model", "print_model_tag"])]
+    jsonl: bool,
+    /// Skip completed outputs recorded in --progress-file, if they still exist.
     #[arg(long, requires = "progress_file")]
     resume: bool,
     /// Stop at the first failed input instead of continuing a bulk queue.
@@ -169,8 +194,10 @@ struct Cli {
     fail_fast: bool,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum CliCommand {
+    /// Print available engines, model defaults, formats and automation options as JSON.
+    Capabilities,
     /// Convert a transcript JSON without loading audio or models.
     Convert(ConvertArgs),
     /// Merge transcripts of one session's per-speaker (iso) tracks into one transcript, each
@@ -178,7 +205,7 @@ enum CliCommand {
     Merge(MergeArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct ConvertArgs {
     #[arg(value_name = "TRANSCRIPT.json")]
     input: PathBuf,
@@ -196,9 +223,12 @@ struct ConvertArgs {
     /// turn instead of the exact transcript text.
     #[arg(long)]
     speaker_turns: bool,
+    /// Print a JSON result with the saved transcript's absolute path.
+    #[arg(long)]
+    json: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct MergeArgs {
     /// One transcript per speaker track, all on the same timeline; a Zoom participant's
     /// files from reconnecting are one speaker. A folder, or a single Zoom track, merges
@@ -216,6 +246,9 @@ struct MergeArgs {
     /// to merge from a folder.
     #[arg(long, value_name = "ID")]
     session: Option<String>,
+    /// Select transcripts ending in .TAG.json, for example `--model-tag qw` in a multi-pass folder.
+    #[arg(long, value_name = "TAG", value_parser = parse_model_tag)]
+    model_tag: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
     format: OutputFormat,
     #[arg(long, value_enum, default_value_t = TimestampGranularity::Words)]
@@ -226,6 +259,9 @@ struct MergeArgs {
     /// instead of the exact transcript text.
     #[arg(long)]
     speaker_turns: bool,
+    /// Print a JSON result with the saved transcript's absolute path.
+    #[arg(long)]
+    json: bool,
 }
 
 fn read_transcript(path: &Path) -> Result<TranscriptDocument> {
@@ -256,6 +292,23 @@ fn merge_transcripts(args: MergeArgs) -> Result<()> {
         .iter()
         .map(|path| expand_home(path))
         .collect::<Vec<_>>();
+    let matches_tag = |path: &Path| {
+        args.model_tag.as_ref().is_none_or(|tag| {
+            path.file_stem()
+                .and_then(|stem| Path::new(stem).extension())
+                == Some(std::ffi::OsStr::new(tag))
+        })
+    };
+    if let Some(path) = paths
+        .iter()
+        .find(|path| !path.is_dir() && !matches_tag(path))
+    {
+        bail!(
+            "{} does not match --model-tag {}",
+            path.display(),
+            args.model_tag.as_deref().unwrap_or_default()
+        );
+    }
     // Folders and a lone track are searched for the rest of the session; listed files are
     // merged as given.
     let discover = paths.len() == 1 || paths.iter().any(|path| path.is_dir());
@@ -279,7 +332,10 @@ fn merge_transcripts(args: MergeArgs) -> Result<()> {
         }
         // One entry per file, however it was reached.
         let mut seen = std::collections::HashSet::new();
-        files.retain(|file| seen.insert(fs::canonicalize(file).unwrap_or_else(|_| file.clone())));
+        files.retain(|file| {
+            matches_tag(file)
+                && seen.insert(fs::canonicalize(file).unwrap_or_else(|_| file.clone()))
+        });
         files.sort();
         let anchor = anchor.map(|anchor| {
             let canonical = fs::canonicalize(&anchor).ok();
@@ -357,7 +413,23 @@ fn merge_transcripts(args: MergeArgs) -> Result<()> {
         args.overwrite,
     )?;
     eprintln!("-> {}", output.display());
+    if args.json {
+        write_json_line(&serde_json::json!({
+            "schema_version": CLI_SCHEMA_VERSION, "output": output_key(&output),
+        }))?;
+    }
     Ok(())
+}
+
+fn parse_model_tag(tag: &str) -> std::result::Result<String, String> {
+    if tag.is_empty()
+        || !tag
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return Err("model identifiers use lowercase ASCII letters and digits".to_owned());
+    }
+    Ok(tag.to_owned())
 }
 
 /// The transcript JSON files directly inside a folder (not its subfolders).
@@ -407,17 +479,105 @@ fn convert_transcript(args: ConvertArgs) -> Result<()> {
         args.overwrite,
     )?;
     eprintln!("{} -> {}", input.display(), output.display());
+    if args.json {
+        write_json_line(&serde_json::json!({
+            "schema_version": CLI_SCHEMA_VERSION, "output": output_key(&output),
+        }))?;
+    }
     Ok(())
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum EngineKind {
-    #[value(name = "qwen3")]
+    #[value(name = "qwen3", alias = "qwen")]
     Qwen3,
     #[value(name = "apple-native", alias = "apple")]
     AppleNative,
     #[value(name = "parakeet-v3", alias = "parakeet")]
     ParakeetV3,
+}
+
+fn engine_name(engine: EngineKind) -> &'static str {
+    match engine {
+        EngineKind::Qwen3 => "qwen3",
+        EngineKind::AppleNative => "apple-native",
+        EngineKind::ParakeetV3 => "parakeet-v3",
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ModelPass {
+    engine: EngineKind,
+    model: String,
+}
+
+const fn default_asr(engine: EngineKind) -> &'static str {
+    match engine {
+        EngineKind::Qwen3 => model_cache::QWEN3_ASR_17B,
+        EngineKind::ParakeetV3 => model_cache::PARAKEET_UNIFIED_EN,
+        EngineKind::AppleNative => "Apple SpeechTranscriber",
+    }
+}
+
+fn parse_model_pass(value: &str) -> std::result::Result<ModelPass, String> {
+    let (engine, model) = value
+        .split_once('=')
+        .map_or((value, None), |(engine, model)| (engine, Some(model)));
+    let engine = EngineKind::from_str(engine, true)?;
+    if model.is_some_and(|model| model.trim().is_empty()) {
+        return Err("a model override must not be empty".to_owned());
+    }
+    if model.is_some() && matches!(engine, EngineKind::AppleNative) {
+        return Err("apple-native uses the system model and takes no model override".to_owned());
+    }
+    if let Some(model) = model {
+        let model = model_cache::canonical_id(model);
+        if (matches!(engine, EngineKind::ParakeetV3) && model.starts_with("Qwen/Qwen3-ASR"))
+            || (matches!(engine, EngineKind::Qwen3)
+                && [
+                    model_cache::PARAKEET_UNIFIED_EN,
+                    model_cache::PARAKEET_TDT_V3,
+                ]
+                .contains(&model.as_str()))
+        {
+            return Err("the model override belongs to a different engine".to_owned());
+        }
+    }
+    Ok(ModelPass {
+        engine,
+        model: model.unwrap_or(default_asr(engine)).to_owned(),
+    })
+}
+
+fn model_tag(engine: EngineKind, model: &str) -> String {
+    if matches!(engine, EngineKind::AppleNative) {
+        return "ap".to_owned();
+    }
+    let model = model_cache::canonical_id(model);
+    let prefix = match engine {
+        EngineKind::Qwen3 => "qw",
+        EngineKind::ParakeetV3 => "pk",
+        EngineKind::AppleNative => unreachable!(),
+    };
+    if model == default_asr(engine) {
+        return prefix.to_owned();
+    }
+    match model.as_str() {
+        model_cache::QWEN3_ASR_06B if matches!(engine, EngineKind::Qwen3) => {
+            return "qw06".to_owned();
+        }
+        model_cache::PARAKEET_TDT_V3 if matches!(engine, EngineKind::ParakeetV3) => {
+            return "pkt".to_owned();
+        }
+        _ => {}
+    }
+    let local = Path::new(&model);
+    let resolved = fs::canonicalize(local).ok();
+    let identity = resolved.as_deref().unwrap_or(local);
+    format!(
+        "{prefix}{:06x}",
+        stable_hash(identity.as_os_str().as_encoded_bytes().iter().copied()) & 0x00ff_ffff
+    )
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -485,9 +645,13 @@ struct Job {
     iso: bool,
     /// Zoom's mixed audio or video, used when participant tracks are unavailable.
     zoom_recording: bool,
+    /// The Zoom audio-only export encoded identically to a video with a custom filename.
+    zoom_audio_copy: Option<PathBuf>,
     diarize: bool,
     speakers: Option<usize>,
     output: Option<PathBuf>,
+    /// An output already resolved by the recording planner, including any model suffix.
+    planned_output: Option<PathBuf>,
     output_dir: PathBuf,
     output_location: OutputLocation,
 }
@@ -561,6 +725,7 @@ struct Processed {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JobManifest {
     items: Vec<ManifestItem>,
     discover_zoom: Option<bool>,
@@ -569,6 +734,7 @@ struct JobManifest {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ManifestItem {
     input: PathBuf,
     #[serde(default)]
@@ -625,7 +791,11 @@ impl ProgressEvent {
 
 struct ProgressLog {
     writer: Option<BufWriter<File>>,
-    latest: HashMap<String, ProgressEvent>,
+    latest: HashMap<(String, Option<String>), ProgressEvent>,
+    /// What earlier runs logged, without this run's own events: a session records events
+    /// for its first track before that track's turn.
+    earlier: HashMap<(String, Option<String>), ProgressEvent>,
+    stream_pass: Option<serde_json::Value>,
 }
 
 impl ProgressLog {
@@ -646,8 +816,9 @@ impl ProgressLog {
                     // A crash or kill can leave a torn final line. Losing one status event only
                     // means that input is processed again, so never let it block a resume.
                     match serde_json::from_slice::<ProgressEvent>(&line) {
-                        Ok(event) => {
-                            latest.insert(event.input.clone(), event);
+                        Ok(mut event) => {
+                            normalize_event_output(&mut event);
+                            latest.insert((event.input.clone(), event.output.clone()), event);
                         }
                         Err(error) => eprintln!(
                             "warning: ignoring invalid progress event at {}:{}: {error}",
@@ -660,7 +831,9 @@ impl ProgressLog {
         }
         Ok(Self {
             writer: None,
+            earlier: latest.clone(),
             latest,
+            stream_pass: None,
         })
     }
 
@@ -698,24 +871,46 @@ impl ProgressLog {
         Ok(log)
     }
 
-    fn is_completed(&self, input: &Path) -> bool {
-        self.completed_key(&input_key(input))
+    fn event_for_output(&self, key: &str, path: &Path) -> Option<&ProgressEvent> {
+        self.latest.get(&(key.to_owned(), Some(output_key(path))))
     }
 
-    fn completed_key(&self, key: &str) -> bool {
-        self.latest
-            .get(key)
-            .is_some_and(|event| event.status == "completed" || event.status == "skipped")
+    /// Whether an earlier run logged anything for `key` writing to `path`.
+    fn logged_before(&self, key: &str, path: &Path) -> bool {
+        self.earlier
+            .contains_key(&(key.to_owned(), Some(output_key(path))))
     }
 
-    fn record(&mut self, event: ProgressEvent) -> Result<()> {
-        self.latest.insert(event.input.clone(), event.clone());
+    fn interrupted_write(&self, key: &str, path: &Path) -> bool {
+        let earlier = self.earlier.get(&(key.to_owned(), Some(output_key(path))));
+        earlier.is_some_and(|event| {
+            event.status == "running" && event.phase.as_deref() == Some("Writing output")
+        })
+    }
+
+    fn record(&mut self, mut event: ProgressEvent) -> Result<()> {
+        normalize_event_output(&mut event);
         if let Some(writer) = self.writer.as_mut() {
             serde_json::to_writer(&mut *writer, &event)?;
             writer.write_all(b"\n")?;
             writer.flush()?;
         }
+        if let Some(pass) = &self.stream_pass {
+            let mut data = serde_json::to_value(&event)?;
+            data["pass"] = pass.clone();
+            data["event"] = "progress".into();
+            data["schema_version"] = CLI_SCHEMA_VERSION.into();
+            write_json_line(&data)?;
+        }
+        self.latest
+            .insert((event.input.clone(), event.output.clone()), event);
         Ok(())
+    }
+}
+
+fn normalize_event_output(event: &mut ProgressEvent) {
+    if let Some(output) = &mut event.output {
+        *output = output_key(Path::new(output));
     }
 }
 
@@ -746,36 +941,309 @@ struct AlignedWord {
 
 fn main() -> Result<()> {
     install_cancel_handler();
-    audio_convert::remove_stale_temp_files();
-    let mut cli = Cli::parse();
+    let cli = Cli::parse();
+    if cli.jsonl {
+        write_json_line(&serde_json::json!({
+            "schema_version": CLI_SCHEMA_VERSION, "event": "run_started",
+            "pass_count": cli.passes.len().max(1),
+        }))?;
+    }
+    let stream = cli.jsonl;
+    let result = run_command(cli);
+    if stream {
+        let event = write_finished_event("run_finished", None, &result);
+        result.and(event)
+    } else {
+        result
+    }
+}
+
+fn write_json_line(value: &serde_json::Value) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, value)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn write_finished_event(
+    event: &str,
+    pass: Option<&serde_json::Value>,
+    result: &Result<()>,
+) -> Result<()> {
+    let mut data = serde_json::json!({
+        "schema_version": CLI_SCHEMA_VERSION, "event": event,
+        "status": if cancel_requested() { "canceled" } else if result.is_ok() { "completed" } else { "failed" },
+    });
+    if let Some(pass) = pass {
+        data["pass"] = pass.clone();
+    }
+    if let Err(error) = result {
+        data["error"] = format!("{error:#}").into();
+    }
+    write_json_line(&data)
+}
+
+fn print_capabilities() -> Result<()> {
+    let engines = [
+        EngineKind::Qwen3,
+        EngineKind::ParakeetV3,
+        EngineKind::AppleNative,
+    ]
+    .map(|engine| {
+        let (alias, included, model_source, devices) = match engine {
+            EngineKind::Qwen3 => ("qwen", true, "hugging-face", &["metal", "cpu"][..]),
+            EngineKind::ParakeetV3 => (
+                "parakeet",
+                cfg!(feature = "parakeet"),
+                "hugging-face",
+                &["metal", "cpu"][..],
+            ),
+            EngineKind::AppleNative => ("apple", true, "macos", &[][..]),
+        };
+        let native = matches!(engine, EngineKind::AppleNative);
+        serde_json::json!({
+            "name": engine_name(engine), "aliases": [alias], "included": included,
+            "default_model": default_asr(engine), "model_source": model_source,
+            "model_tag": model_tag(engine, default_asr(engine)), "devices": devices,
+            "diarization": !native && included && cfg!(feature = "diarization"),
+            "minimum_macos": if native { "26.0" } else { "14.0" },
+            "helper_present": native.then(|| apple_native_helper().is_some()),
+        })
+    });
+    write_json_line(&serde_json::json!({
+        "schema_version": CLI_SCHEMA_VERSION, "version": env!("CARGO_PKG_VERSION"),
+        "platform": "macos-arm64", "engines": engines, "models": model_cache::SUPPORTED_MODELS,
+        "input_extensions": AUDIO_EXTENSIONS, "output_formats": ["json", "txt", "srt", "vtt"],
+        "timestamps": ["words", "sentences", "none"],
+        "automation": {
+            "plan": "--plan", "events": "--jsonl", "offline": "--offline", "manifest_stdin": ["--manifest", "-"],
+            "cache_status": "--model-status", "check_model": "--cached-model", "model_tag": "--print-model-tag",
+            "convert": ["convert", "--json"], "merge": ["merge", "--json"],
+        },
+    }))
+}
+
+fn run_command(mut cli: Cli) -> Result<()> {
     match cli.command.take() {
+        Some(CliCommand::Capabilities) => return print_capabilities(),
         Some(CliCommand::Convert(args)) => return convert_transcript(args),
         Some(CliCommand::Merge(args)) => return merge_transcripts(args),
         None => {}
     }
-    // Clap intentionally leaves path values untouched. Expand shell-style home paths here so
-    // output/model paths behave the same way as input paths on macOS.
     cli.output_dir = expand_home(&cli.output_dir);
     cli.input_dir = cli.input_dir.as_deref().map(expand_home);
     cli.diarization_model = cli.diarization_model.as_deref().map(expand_home);
     cli.progress_file = cli.progress_file.as_deref().map(expand_home);
+    let passes = std::mem::take(&mut cli.passes);
+    if passes.is_empty() {
+        configure_model(&mut cli);
+        if cli.print_model_tag {
+            println!("{}", model_tag(cli.engine, &cli.model));
+            return Ok(());
+        }
+        return run_pass(cli, None, 1);
+    }
+
+    let mut tags = HashSet::new();
+    let mut jobs = Vec::with_capacity(passes.len());
+    for pass in passes {
+        let mut job = cli.clone();
+        job.engine = pass.engine;
+        job.model = pass.model;
+        job.model_suffix = true;
+        job.skip_existing = !job.overwrite;
+        configure_model(&mut job);
+        let tag = job.output_tag.as_deref().expect("model suffix enabled");
+        if !tags.insert(tag.to_owned()) {
+            bail!("model passes must have distinct identifiers; repeated identifier {tag}");
+        }
+        job.progress_file = cli
+            .progress_file
+            .as_deref()
+            .map(|path| append_tag(path, tag));
+        jobs.push(job);
+    }
+    let progress_paths = jobs
+        .iter()
+        .filter_map(|job| job.progress_file.as_deref())
+        .collect::<Vec<_>>();
+    // Snapshot the inputs once. In particular, avoid re-reading Zoom media to match exports
+    // and give each pass the same tracks even if recordings arrive during transcription.
+    let inputs = collect_plan_inputs(&cli)?;
+    let plans = jobs
+        .iter()
+        .map(|job| {
+            let plan = plan_inputs(job, inputs.clone())?;
+            protect_progress_files(job, &plan.0, &plan.1, &plan.2, &progress_paths)?;
+            Ok(plan)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if cli.plan {
+        let previews = jobs
+            .iter()
+            .zip(&plans)
+            .map(|(job, (units, skips, rejected))| queue_plan(job, units, skips, rejected))
+            .collect::<Result<Vec<_>>>()?;
+        return write_json_line(&serde_json::json!({
+            "schema_version": CLI_SCHEMA_VERSION, "passes": previews,
+        }));
+    }
+    let mut failed = 0;
+    for (index, (job, plan)) in jobs.into_iter().zip(plans).enumerate() {
+        check_cancelled()?;
+        JOBS_STARTED.store(false, Ordering::SeqCst);
+        let tag = job.output_tag.clone().expect("model suffix enabled");
+        eprintln!("Running model pass {tag} ({})", job.model);
+        if let Err(error) = run_pass(job, Some(plan), index + 1) {
+            check_cancelled()?;
+            if cli.fail_fast {
+                return Err(error.context(format!("model pass {tag}")));
+            }
+            eprintln!("error in model pass {tag}: {error:#}");
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} model pass(es) failed");
+    }
+    Ok(())
+}
+
+fn run_pass(cli: Cli, plan: Option<Plan>, index: usize) -> Result<()> {
+    if !cli.jsonl {
+        return run_cli(cli, plan, None);
+    }
+    let pass = serde_json::json!({
+        "index": index, "engine": engine_name(cli.engine), "model": cli.model,
+        "model_tag": cli.output_tag, "progress_file": cli.progress_file.as_deref().map(output_key),
+    });
+    write_json_line(&serde_json::json!({
+        "schema_version": CLI_SCHEMA_VERSION, "event": "pass_started", "pass": pass,
+    }))?;
+    let result = run_cli(cli, plan, Some(pass.clone()));
+    let event = write_finished_event("pass_finished", Some(&pass), &result);
+    result.and(event)
+}
+
+fn configure_model(cli: &mut Cli) {
+    if matches!(cli.engine, EngineKind::AppleNative) {
+        cli.model = default_asr(cli.engine).to_owned();
+    }
     if cli.model.starts_with('~') {
         cli.model = expand_home(Path::new(&cli.model))
             .to_string_lossy()
             .into_owned();
     }
+    // Preserve the original Parakeet default when a caller supplies a Qwen preset.
+    if matches!(cli.engine, EngineKind::ParakeetV3)
+        && model_cache::canonical_id(&cli.model).starts_with("Qwen/Qwen3-ASR")
+    {
+        cli.model = default_asr(cli.engine).to_owned();
+    }
+    cli.output_tag = cli.model_suffix.then(|| model_tag(cli.engine, &cli.model));
+}
+
+fn effective_timestamps(cli: &Cli) -> TimestampGranularity {
+    if matches!(cli.format, OutputFormat::Srt | OutputFormat::Vtt)
+        && cli.timestamps == TimestampGranularity::None
+    {
+        TimestampGranularity::Sentences
+    } else {
+        cli.timestamps
+    }
+}
+
+struct RunRequirements {
+    aligner: bool,
+    diarization: bool,
+}
+
+impl RunRequirements {
+    fn for_units(cli: &Cli, units: &[&Unit]) -> Self {
+        let diarization = units
+            .iter()
+            .flat_map(|unit| unit.jobs())
+            .any(|job| job.diarize);
+        let aligner = matches!(cli.engine, EngineKind::Qwen3)
+            && (effective_timestamps(cli) != TimestampGranularity::None
+                || diarization
+                || units.iter().any(|unit| matches!(unit, Unit::Session(_))));
+        Self {
+            aligner,
+            diarization,
+        }
+    }
+
+    fn models<'a>(&self, cli: &'a Cli) -> Vec<(&'static str, &'a str)> {
+        let mut models = Vec::new();
+        if !matches!(cli.engine, EngineKind::AppleNative) {
+            models.push(("asr", cli.model.as_str()));
+        }
+        if self.aligner {
+            models.push(("aligner", cli.forced_aligner.as_str()));
+        }
+        if self.diarization {
+            models.push((
+                "diarization",
+                cli.diarization_model
+                    .as_deref()
+                    .and_then(Path::to_str)
+                    .unwrap_or("sortformer"),
+            ));
+        }
+        models
+    }
+
+    fn validate(&self, cli: &Cli) -> Result<()> {
+        ensure_apple_silicon()?;
+        if matches!(cli.engine, EngineKind::AppleNative) {
+            if self.diarization {
+                bail!(
+                    "Apple SpeechTranscriber does not provide diarization; use --engine qwen3 with --diarize"
+                );
+            }
+            if apple_native_helper().is_none() {
+                bail!(
+                    "Apple SpeechTranscriber helper is not bundled; set TRANSCRIBERRR_NATIVE or build the macOS app"
+                );
+            }
+        } else if matches!(cli.device, DeviceKind::Coreml) {
+            bail!(
+                "CoreML/ANE is not available for these Rust engines; use --device metal for native Apple GPU execution"
+            );
+        }
+        if !cfg!(feature = "parakeet") && matches!(cli.engine, EngineKind::ParakeetV3) {
+            bail!(
+                "Parakeet support is not included in this build; rebuild with --features parakeet"
+            );
+        }
+        if !cfg!(feature = "diarization") && self.diarization {
+            bail!(
+                "diarization support is not included in this build; rebuild with --features diarization"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn preview_cli(cli: &Cli, progress_paths: &[&Path]) -> Result<serde_json::Value> {
+    let (units, skips, rejected) = prepare_plan(cli)?;
+    protect_progress_files(cli, &units, &skips, &rejected, progress_paths)?;
+    queue_plan(cli, &units, &skips, &rejected)
+}
+
+fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Value>) -> Result<()> {
     if cli.forced_aligner.starts_with('~') {
         cli.forced_aligner = expand_home(Path::new(&cli.forced_aligner))
             .to_string_lossy()
             .into_owned();
     }
     if cli.plan {
-        let (units, skips, rejected) = prepare_plan(&cli)?;
-        protect_progress_file(&cli, &units, &skips, &rejected)?;
-        println!("{}", queue_plan(&cli, &units, &skips, &rejected)?);
-        return Ok(());
+        let progress_paths = cli.progress_file.as_deref().into_iter().collect::<Vec<_>>();
+        return write_json_line(&preview_cli(&cli, &progress_paths)?);
     }
-    let model_cache = model_cache::ModelCache::new(cli.model_cache.clone())?;
+    let model_cache = model_cache::ModelCache::new(cli.model_cache.clone(), cli.offline);
     if !cli.cached_model.is_empty() {
         let report = cli
             .cached_model
@@ -810,86 +1278,30 @@ fn main() -> Result<()> {
             return Ok(());
         }
     }
-    // `--model` defaults to Qwen, and the app keeps the last Qwen model in its field. Any Qwen
-    // ASR model (any size or alias) means "use the Parakeet default" for this engine; only
-    // the exact default string used to be recognised, so Qwen 0.6B was loaded as Parakeet.
-    if matches!(cli.engine, EngineKind::ParakeetV3)
-        && model_cache::canonical_id(&cli.model).starts_with("Qwen/Qwen3-ASR")
-    {
-        #[cfg(feature = "parakeet")]
-        {
-            cli.model = parakeet_engine::DEFAULT_MODEL_ID.to_owned();
-        }
-    }
     // Keep the user-facing model identifier before replacing it with a local cache snapshot path.
     // Inference needs the resolved directory, while transcript metadata should remain stable
     // across cache revisions and machines.
     // Subtitles need cue timing. Without timestamps, Qwen loads no aligner and produced one
     // cue spanning the whole file; give subtitle formats sentence cues instead.
-    if matches!(cli.format, OutputFormat::Srt | OutputFormat::Vtt)
-        && cli.timestamps == TimestampGranularity::None
-    {
-        cli.timestamps = TimestampGranularity::Sentences;
-    }
+    cli.timestamps = effective_timestamps(&cli);
     let model_label = model_display_name(&cli.model);
-    ensure_apple_silicon()?;
-    // `--iso-tracks off` takes `off` as a file and every input as a speaker track.
-    if cli.iso_tracks == IsoMode::All
-        && let Some(mode) = cli.inputs.iter().find(|input| {
-            ["auto", "all", "off"].contains(&input.to_string_lossy().as_ref()) && !input.exists()
-        })
-    {
-        bail!(
-            "write --iso-tracks={}: without `=`, \"{}\" is read as a file",
-            mode.display(),
-            mode.display()
-        );
-    }
-    let (units, skips, rejected) = prepare_plan(&cli)?;
+    let (units, skips, rejected) = match plan {
+        Some(plan) => plan,
+        None => prepare_plan(&cli)?,
+    };
     if units.is_empty() && rejected.is_empty() {
         bail!("no supported audio files were found");
     }
-    protect_progress_file(&cli, &units, &skips, &rejected)?;
+    let progress_paths = cli.progress_file.as_deref().into_iter().collect::<Vec<_>>();
+    protect_progress_files(&cli, &units, &skips, &rejected, &progress_paths)?;
     let mut progress = ProgressLog::open(cli.progress_file.as_deref(), cli.resume)?;
+    progress.stream_pass = stream_pass;
     let pending = units
         .iter()
         .filter(|unit| !unit_done(&cli, &progress, unit))
         .collect::<Vec<_>>();
-    let jobs = pending
-        .iter()
-        .flat_map(|unit| unit.jobs())
-        .collect::<Vec<_>>();
-    // Merging needs every track's word timings, whatever the requested output.
-    let wants_words = pending.iter().any(|unit| matches!(unit, Unit::Session(_)));
-    if jobs.iter().any(|job| job.diarize) && cli.diarization_model.is_none() {
-        // The bundled-compatible Sortformer export; downloaded on first use like other models.
-        cli.diarization_model = Some(PathBuf::from("sortformer"));
-    }
-    if matches!(cli.engine, EngineKind::AppleNative)
-        && jobs.iter().any(|job| job.diarize || job.speakers.is_some())
-    {
-        bail!(
-            "Apple SpeechTranscriber does not provide diarization; use --engine qwen3 with --diarize"
-        );
-    }
-    if matches!(cli.device, DeviceKind::Coreml) && !matches!(cli.engine, EngineKind::AppleNative) {
-        bail!(
-            "CoreML/ANE is not available for these Rust engines; use --device metal for native Apple GPU execution"
-        );
-    }
-    #[cfg(not(feature = "parakeet"))]
-    if !pending.is_empty() && matches!(cli.engine, EngineKind::ParakeetV3) {
-        bail!("Parakeet support is not included in this build; rebuild with --features parakeet");
-    }
-    let wants_diarization = jobs.iter().any(|job| job.diarize);
-    #[cfg(not(feature = "diarization"))]
-    if wants_diarization {
-        bail!(
-            "diarization support is not included in this build; rebuild with --features diarization"
-        );
-    }
+    let requirements = RunRequirements::for_units(&cli, &pending);
 
-    fs::create_dir_all(&cli.output_dir)?;
     for (input, error) in &rejected {
         eprintln!("error processing {}: {error}", input.display());
         progress.record(ProgressEvent {
@@ -914,7 +1326,7 @@ fn main() -> Result<()> {
     if !rejected.is_empty() && (cli.fail_fast || units.is_empty()) {
         bail!("{} input file(s) failed", rejected.len());
     }
-    if units.iter().all(|unit| unit_done(&cli, &progress, unit)) {
+    if pending.is_empty() {
         for unit in &units {
             record_skipped(&cli, &mut progress, unit)?;
         }
@@ -923,13 +1335,27 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    requirements.validate(&cli)?;
+    if cli.offline {
+        for (_, id) in requirements.models(&cli) {
+            if model_cache.lookup(id).is_none() {
+                bail!(
+                    "model {id:?} is not available locally (--offline); prefetch it with --download-model or supply a local model path"
+                );
+            }
+        }
+    }
+    audio_convert::remove_stale_temp_files();
     // Resolved after the --resume early exit so an already-finished queue needs no model
     // (and no network to fetch one).
     #[cfg(feature = "diarization")]
-    let diarization_model_path = if wants_diarization {
-        let value = cli.diarization_model.as_ref().expect("validated above");
+    let diarization_model_path = if requirements.diarization {
+        let value = cli
+            .diarization_model
+            .as_deref()
+            .unwrap_or_else(|| Path::new("sortformer"));
         if value.is_file() {
-            Some(value.clone())
+            Some(value.to_path_buf())
         } else {
             Some(model_cache.ensure(&value.to_string_lossy())?)
         }
@@ -970,7 +1396,7 @@ fn main() -> Result<()> {
         })?);
         // Speaker labels are assigned per word, so diarization needs word timings even
         // when the requested output has no timestamps.
-        if cli.timestamps != TimestampGranularity::None || wants_diarization || wants_words {
+        if requirements.aligner {
             aligner = Some(load_model(&model_cache, &cli.forced_aligner, |path| {
                 let path = path
                     .to_str()
@@ -996,7 +1422,7 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "parakeet"))]
     let mut parakeet: Option<ParakeetEngine> = None;
     #[cfg(feature = "diarization")]
-    let mut diarizer = if wants_diarization {
+    let mut diarizer = if requirements.diarization {
         let path = diarization_model_path.as_ref().expect("validated above");
         let provider = if matches!(cli.device, DeviceKind::Cpu) {
             parakeet_rs::ExecutionProvider::BurnCpu
@@ -1308,7 +1734,26 @@ fn reject_uncovered(skips: &mut Vec<Skip>, rejected: &mut Vec<(PathBuf, String)>
 /// The units to run, the files left out, and the files of sessions that cannot run.
 type Plan = (Vec<Unit>, Vec<Skip>, Vec<(PathBuf, String)>);
 
-fn prepare_plan(cli: &Cli) -> Result<Plan> {
+#[derive(Clone)]
+struct PlanInputs {
+    jobs: Vec<Job>,
+    missing: Vec<PathBuf>,
+    rejected: Vec<(PathBuf, String)>,
+}
+
+fn collect_plan_inputs(cli: &Cli) -> Result<PlanInputs> {
+    // `--iso-tracks off` takes `off` as a file and every input as a speaker track.
+    if cli.iso_tracks == IsoMode::All
+        && let Some(mode) = cli.inputs.iter().find(|input| {
+            ["auto", "all", "off"].contains(&input.to_string_lossy().as_ref()) && !input.exists()
+        })
+    {
+        bail!(
+            "write --iso-tracks={}: without `=`, \"{}\" is read as a file",
+            mode.display(),
+            mode.display()
+        );
+    }
     let mut rejected = Vec::new();
     let mut missing = Vec::new();
     let mut jobs = collect_jobs(cli, &mut rejected, &mut missing)?;
@@ -1318,6 +1763,25 @@ fn prepare_plan(cli: &Cli) -> Result<Plan> {
             job.speakers = None;
         }
     }
+    Ok(PlanInputs {
+        jobs,
+        missing,
+        rejected,
+    })
+}
+
+fn prepare_plan(cli: &Cli) -> Result<Plan> {
+    plan_inputs(cli, collect_plan_inputs(cli)?)
+}
+
+fn plan_inputs(
+    cli: &Cli,
+    PlanInputs {
+        jobs,
+        missing,
+        mut rejected,
+    }: PlanInputs,
+) -> Result<Plan> {
     let (mut units, mut skips, unplanned) = plan_units(cli, jobs, &missing)?;
     reject_missing_zoom_parts(&mut units, &missing, &mut rejected);
     rejected.extend(unplanned);
@@ -1406,8 +1870,12 @@ fn queue_plan(
     let mut files = Vec::new();
     let mut meetings = Vec::new();
     let mut meeting_members = HashMap::new();
+    let mut pending = Vec::new();
     for unit in units {
         let done = unit_done(cli, &progress, unit);
+        if !done {
+            pending.push(unit);
+        }
         match unit {
             Unit::Session(session) if let Some(id) = &session.zoom => {
                 let folder = session_folder(&session.jobs[0].input);
@@ -1425,11 +1893,19 @@ fn queue_plan(
                 }
             }
             _ => {
+                let (merge, group) = match unit {
+                    Unit::Session(session) => (
+                        Some(output_key(&session.output)),
+                        Some(session.label.as_str()),
+                    ),
+                    Unit::Single(_) => (None, None),
+                };
                 for job in unit.jobs() {
                     files.push(serde_json::json!({
                         "path": input_key(&job.input), "output": output_key(&output_path(cli, job)),
                         "iso": job.iso, "diarize": job.diarize, "done": done,
                         "zoom_recording": job.zoom_recording,
+                        "merge_output": merge, "group": group,
                     }));
                 }
             }
@@ -1449,7 +1925,41 @@ fn queue_plan(
     for (path, error) in rejected {
         files.push(serde_json::json!({"path": input_key(path), "error": error}));
     }
-    Ok(serde_json::json!({"files": files, "meetings": meetings}))
+    let cache = model_cache::ModelCache::new(cli.model_cache.clone(), true);
+    let mut issues = Vec::new();
+    let mut required_models = Vec::new();
+    if units.is_empty() && rejected.is_empty() {
+        issues.push("no supported audio files were found".to_owned());
+    }
+    if !pending.is_empty() && !cli.inventory_only {
+        let requirements = RunRequirements::for_units(cli, &pending);
+        if let Err(error) = requirements.validate(cli) {
+            issues.push(error.to_string());
+        }
+        for (role, id) in requirements.models(cli) {
+            let path = cache.lookup(id);
+            if cli.offline && path.is_none() {
+                issues.push(format!("model {id:?} is not available locally (--offline)"));
+            }
+            required_models.push(serde_json::json!({
+                "role": role, "id": id, "cached": path.is_some(),
+                "path": path.as_deref().map(output_key),
+            }));
+        }
+    }
+    Ok(serde_json::json!({
+        "schema_version": CLI_SCHEMA_VERSION,
+        "files": files, "meetings": meetings, "engine": engine_name(cli.engine),
+        "model": cli.model, "model_tag": cli.output_tag,
+        "progress_file": cli.progress_file.as_deref().map(output_key),
+        "format": format_extension(cli.format),
+        "timestamps": effective_timestamps(cli).to_possible_value().expect("CLI timestamp option").get_name(),
+        "required_models": required_models, "issues": issues,
+        "summary": {
+            "pending_units": pending.len(), "existing_units": units.len() - pending.len(),
+            "skipped_inputs": skips.len(), "rejected_inputs": rejected.len(),
+        },
+    }))
 }
 
 /// Group Zoom files by canonical meeting folder and recording ID, and manually marked
@@ -1465,6 +1975,9 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
         .iter()
         .zip(&names)
         .map(|(job, name)| {
+            if let Some(copy) = &job.zoom_audio_copy {
+                return zoom_media(&job.input, &merge::parse_path(copy));
+            }
             (!job.iso || matches!(name, merge::TrackName::ZoomMixed { .. }))
                 .then(|| zoom_media(&job.input, name))
                 .flatten()
@@ -1506,6 +2019,7 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
     let mut taken = vec![false; jobs.len()];
 
     let mut audio_by_stem: HashMap<_, Vec<_>> = HashMap::new();
+    let mut audio_by_input = HashMap::new();
     let mut iso_by_meeting: HashMap<_, Vec<_>> = HashMap::new();
     let stem_key = |index: usize| folded_path(&input_key(&jobs[index].input.with_extension("")));
     for (index, job) in jobs.iter().enumerate() {
@@ -1516,6 +2030,7 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
             .entry(stem_key(index))
             .or_default()
             .push(index);
+        audio_by_input.insert(input_key(&job.input), index);
         if let merge::TrackName::Zoom { meeting, .. } = &names[index]
             && job.iso
         {
@@ -1545,7 +2060,14 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
             };
             (
                 format!("Zoom {kind} covered by the meeting's participant tracks"),
-                iso,
+                iso.as_slice(),
+            )
+        } else if let Some(copy) = &job.zoom_audio_copy
+            && let Some(index) = audio_by_input.get(&input_key(copy))
+        {
+            (
+                "a renamed Zoom video whose identical audio-only export is used instead".to_owned(),
+                std::slice::from_ref(index),
             )
         } else if !job.iso
             && is_video(&job.input)
@@ -1553,7 +2075,7 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
         {
             (
                 "a video whose audio-only copy is transcribed instead".to_owned(),
-                audio,
+                audio.as_slice(),
             )
         } else {
             continue;
@@ -1733,7 +2255,7 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
         if let Some((parts, output)) = joined.remove(&index) {
             job.parts = parts.into_iter().map(|index| take(index).input).collect();
             if let Some(output) = output {
-                job.output = Some(output);
+                job.planned_output = Some(output);
             }
         }
         planned.push((index, Unit::Single(job)));
@@ -1743,7 +2265,8 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
         .into_iter()
         .map(|(_, unit)| unit)
         .collect::<Vec<_>>();
-    let clashes = name_sessions(cli, &mut units);
+    let progress = ProgressLog::read(cli.progress_file.as_deref(), cli.resume)?;
+    let clashes = name_sessions(cli, &progress, &mut units);
     let mut rejected = Vec::new();
     for (index, error) in clashes.into_iter().rev() {
         for job in units.remove(index).jobs() {
@@ -1756,7 +2279,7 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
 /// Name each session after its source folder. Zoom uses a fixed destination so later runs
 /// find the same transcript. Manual sessions keep their numbered collision handling.
 /// Returns the overlapping merged destinations by session index.
-fn name_sessions(cli: &Cli, units: &mut [Unit]) -> Vec<(usize, String)> {
+fn name_sessions(cli: &Cli, progress: &ProgressLog, units: &mut [Unit]) -> Vec<(usize, String)> {
     let base = |session: &IsoSession| {
         session_folder(&session.jobs[0].input)
             .file_name()
@@ -1796,15 +2319,19 @@ fn name_sessions(cli: &Cli, units: &mut [Unit]) -> Vec<(usize, String)> {
                 OutputLocation::Folder => (zoom_destination(job, Some(id)), stem.to_owned()),
                 OutputLocation::NextToSource => (source, format!("{stem} [{id}]")),
             };
-            session.output = folder.join(format!("{filename}.merged.{extension}"));
+            session.output =
+                tagged_output(cli, folder.join(format!("{filename}.merged.{extension}")));
             label = base;
         } else {
             let folder = folder(session);
-            let output = |label: &str| folder.join(format!("{label}.merged.{extension}"));
+            let output = |label: &str| {
+                tagged_output(cli, folder.join(format!("{label}.merged.{extension}")))
+            };
             let mut candidate = base.clone();
             let mut number = 2;
             while !taken.insert(key(&folder, &candidate))
                 || merged_elsewhere(&output(&candidate), session)
+                || kept_merge(cli, progress, &output(&candidate), session)
             {
                 candidate = format!("{base} {number}");
                 number += 1;
@@ -1833,29 +2360,66 @@ fn name_sessions(cli: &Cli, units: &mut [Unit]) -> Vec<(usize, String)> {
     clashes
 }
 
+/// Whether `--resume` may replace a manual session's existing merged transcript: one whose
+/// write it logged as interrupted, or a JSON merge of this very session (a re-run).
+fn resume_replaces_merge(
+    cli: &Cli,
+    progress: &ProgressLog,
+    path: &Path,
+    session: &IsoSession,
+) -> bool {
+    cli.resume
+        && (progress.interrupted_write(&output_key(path), path)
+            || merge_owner(path, session) == Some(true))
+}
+
+/// Whether a manual session's merged transcript exists and this run would neither skip the
+/// session for it nor replace it: under `--resume`, a transcript that cannot tell which
+/// session wrote it (not JSON). The session is merged under the next free name (`ep 2`)
+/// instead of failing, as the app numbers re-run transcripts.
+fn kept_merge(cli: &Cli, progress: &ProgressLog, path: &Path, session: &IsoSession) -> bool {
+    if !cli.resume || cli.overwrite || cli.skip_existing || !path.exists() {
+        return false;
+    }
+    let completed = progress
+        .event_for_output(&output_key(path), path)
+        .is_some_and(|event| matches!(event.status.as_str(), "completed" | "skipped"));
+    !completed && !resume_replaces_merge(cli, progress, path, session)
+}
+
 /// Whether an existing merged transcript was merged from other recordings: those of another
 /// session with this one's name (two "Episode 1" folders, run on different days into one
 /// output folder). Only JSON tells; another format is taken to be this session's.
 fn merged_elsewhere(path: &Path, session: &IsoSession) -> bool {
-    let Ok(doc) = read_transcript(path) else {
-        return false;
-    };
+    merge_owner(path, session) == Some(false)
+}
+
+/// Whether a merged transcript at `path` is this session's (`Some(true)`), another's
+/// (`Some(false)`), or cannot tell (`None`: missing, not JSON, or not a merge).
+fn merge_owner(path: &Path, session: &IsoSession) -> Option<bool> {
+    let doc = read_transcript(path).ok()?;
+    if doc.metadata.merged_from.is_empty() {
+        return None;
+    }
     let inputs = session
         .jobs
         .iter()
         .map(|job| input_key(&job.input))
         .collect::<std::collections::HashSet<_>>();
-    !doc.metadata.merged_from.is_empty()
-        && !doc
-            .metadata
+    Some(
+        doc.metadata
             .merged_from
             .iter()
-            .any(|track| inputs.contains(&input_key(Path::new(&track.source))))
+            .any(|track| inputs.contains(&input_key(Path::new(&track.source)))),
+    )
 }
 
 /// Whether a unit can be skipped: finished in an earlier run (`--resume`), or with its
 /// transcript already there (`--skip-existing`).
 fn unit_done(cli: &Cli, progress: &ProgressLog, unit: &Unit) -> bool {
+    if cli.overwrite {
+        return false;
+    }
     let (exists, zoom) = match unit {
         Unit::Single(job) => (output_path(cli, job).is_file(), job.zoom_recording),
         Unit::Session(session) => (session.output.is_file(), session.zoom.is_some()),
@@ -1868,14 +2432,16 @@ fn unit_done(cli: &Cli, progress: &ProgressLog, unit: &Unit) -> bool {
 }
 
 fn unit_completed(cli: &Cli, progress: &ProgressLog, unit: &Unit) -> bool {
-    match unit {
-        Unit::Single(job) => progress.is_completed(&job.input) && output_path(cli, job).exists(),
+    let (key, output) = match unit {
+        Unit::Single(job) => (input_key(&job.input), output_path(cli, job)),
         // A session counts as done only once merged; otherwise all its tracks run again,
         // since the merge needs every track's words.
-        Unit::Session(session) => {
-            progress.completed_key(&output_key(&session.output)) && session.output.exists()
-        }
-    }
+        Unit::Session(session) => (output_key(&session.output), session.output.clone()),
+    };
+    output.is_file()
+        && progress
+            .event_for_output(&key, &output)
+            .is_some_and(|event| matches!(event.status.as_str(), "completed" | "skipped"))
 }
 
 fn record_skipped(cli: &Cli, progress: &mut ProgressLog, unit: &Unit) -> Result<()> {
@@ -1914,7 +2480,9 @@ fn record_skipped_session(
             output: session
                 .zoom
                 .is_none()
-                .then(|| output_path(cli, job).display().to_string()),
+                .then(|| output_path(cli, job))
+                .filter(|path| path.is_file())
+                .map(|path| path.display().to_string()),
             group: Some(session.label.clone()),
             speaker: Some(speaker.to_owned()),
             progress: Some(1.0),
@@ -1967,7 +2535,8 @@ fn run_job(
 ) -> Result<Option<Processed>> {
     let key = input_key(&job.input);
     // Before this run's own events.
-    let logged = progress.latest.contains_key(&key);
+    let logged = cli.resume && progress.interrupted_write(&key, &output_path(cli, job));
+    let seen = cli.resume && progress.logged_before(&key, &output_path(cli, job));
     let predicted_output = (!member.is_some_and(|member| member.merged_only))
         .then(|| output_path(cli, job).display().to_string());
     let event = |status: &str| ProgressEvent {
@@ -2002,7 +2571,7 @@ fn run_job(
         } else {
             None
         };
-        process_one(cli, job, models, member, logged, &mut report).map(Some)
+        process_one(cli, job, models, member, (logged, seen), &mut report).map(Some)
     })();
     let elapsed_seconds = Some(started.elapsed().as_secs_f32());
     match result {
@@ -2101,7 +2670,8 @@ fn run_session(
     } else {
         None
     };
-    let overwrite = cli.overwrite || (!merged_only && cli.resume);
+    let overwrite = cli.overwrite
+        || (!merged_only && resume_replaces_merge(cli, progress, &session.output, session));
     if session.output.is_file() && merged_only && !overwrite {
         return record_skipped_session(cli, progress, session);
     }
@@ -2224,6 +2794,13 @@ fn run_session(
     let inputs = docs
         .into_iter()
         .zip(&session.jobs)
+        .map(|(mut doc, job)| {
+            // The merged transcript lists its tracks by absolute path: `merged_elsewhere`
+            // tells sessions apart by them, from whatever directory a later run starts in.
+            doc.source = input_key(&job.input);
+            doc
+        })
+        .zip(&session.jobs)
         .map(|(doc, job)| merge::TrackInput {
             doc,
             path: job.input.display().to_string(),
@@ -2237,6 +2814,11 @@ fn run_session(
                 "Zoom exported tracks for one participant; only their audio is included".to_owned(),
             );
         }
+        progress.record(ProgressEvent {
+            phase: Some("Writing output".to_owned()),
+            ..event("running")
+        })?;
+        check_cancelled()?;
         write_job_output(cli, doc, &session.output, overwrite)?;
         Ok(warnings)
     });
@@ -2409,12 +2991,40 @@ fn chunk_ranges(samples: &[f32], chunk_samples: usize) -> Vec<std::ops::Range<us
     ranges
 }
 
-/// Whether a job may replace its transcript: with `--overwrite`; with `--resume`, for an input
-/// the progress file has seen started (`logged`) but not finished, since a kill can land
-/// between the write and its event; or as a track of a session rerun by `--skip-existing` or
-/// `--resume` because it was never merged, which needs the track's words again.
+/// Whether a job may replace its transcript: with `--overwrite`; with `--resume`, when the log
+/// recorded writing this exact destination but not completion; or as a track of a session
+/// rerun by `--skip-existing` or `--resume` because the merge needs the track's words again.
 fn may_replace(cli: &Cli, gate: Option<&bleed::Mask>, logged: bool) -> bool {
     cli.overwrite || (cli.resume && logged) || (gate.is_some() && (cli.skip_existing || cli.resume))
+}
+
+/// Whether an existing transcript at a speaker track's output could be this track's own,
+/// from an unfinished run of its session. A JSON transcript of another recording (a session
+/// with the same folder and file names, elsewhere) is not. Other formats do not name their
+/// source: one is this track's when the progress log has it (`seen`), and is taken to be
+/// under `--skip-existing`, which skips a session whose merge exists.
+fn own_track_output(cli: &Cli, destination: &Path, job: &Job, seen: bool) -> bool {
+    let Ok(doc) = read_transcript(destination) else {
+        // Unreadable as the JSON this run writes: a broken intermediate, nobody's transcript.
+        return matches!(cli.format, OutputFormat::Json) || seen || cli.skip_existing;
+    };
+    if !doc.metadata.merged_from.is_empty() {
+        return false;
+    }
+    let source = Path::new(&doc.source);
+    if fs::canonicalize(source).is_ok() {
+        return input_key(source) == input_key(&job.input);
+    }
+    // A relative source from a run started elsewhere does not resolve here.
+    let same_name = source
+        .file_name()
+        .zip(job.input.file_name())
+        .is_some_and(|(left, right)| {
+            folded_path(&left.to_string_lossy()) == folded_path(&right.to_string_lossy())
+        });
+    same_name
+        && doc.metadata.source_modified_at.is_some()
+        && doc.metadata.source_modified_at == source_timestamp(&job.input, FileTimestamp::Modified)
 }
 
 /// Transcribe one job. With a `gate` (a speaker track), other speakers' bleed is muted
@@ -2424,7 +3034,7 @@ fn process_one(
     job: &Job,
     models: InferenceModels<'_>,
     member: Option<Member<'_>>,
-    logged: bool,
+    (logged, seen): (bool, bool),
     report: &mut dyn FnMut(f32, &str) -> Result<()>,
 ) -> Result<Processed> {
     let gate = member.map(|member| member.gate);
@@ -2433,6 +3043,11 @@ fn process_one(
         cli.overwrite
     } else {
         may_replace(cli, gate, logged)
+            && (cli.overwrite
+                || (cli.resume && logged)
+                || output
+                    .as_deref()
+                    .is_none_or(|destination| own_track_output(cli, destination, job, seen)))
     };
     if let Some(destination) = &output
         && destination.exists()
@@ -2514,17 +3129,14 @@ fn process_one(
         .into_iter()
         .map(|item| {
             let (start, end) = match &timeline {
-                Some(timeline) => (
-                    timeline.original(item.start_time),
-                    timeline.original(item.end_time),
-                ),
+                Some(timeline) => timeline.original_span(item.start_time, item.end_time),
                 None => (item.start_time, item.end_time),
             };
             Word {
                 text: item.text,
                 start,
                 end,
-                speaker: speaker_at(&speaker_segments, start, end),
+                speaker: None,
             }
         })
         // Parakeet times punctuation as its own token, often 0.3-1.4 s late and inside the
@@ -2536,6 +3148,11 @@ fn process_one(
         bail!("recognizer returned text without word timestamps");
     }
     normalize_word_timing(&mut words, audio.duration_seconds);
+    // Speakers by the corrected timings: a word the aligner stretched over another speaker's
+    // turn would otherwise take that speaker.
+    for word in &mut words {
+        word.speaker = speaker_at(&speaker_segments, word.start, word.end);
+    }
     preserve_word_text(&text, &mut words)?;
     if let Some(gate) = gate {
         // Words timed wholly inside muted audio were made up from silence or leaked bleed.
@@ -2639,18 +3256,27 @@ fn process_apple_native(
     let helper = apple_native_helper().context(
         "Apple SpeechTranscriber helper is not bundled; set TRANSCRIBERRR_NATIVE or build the macOS app",
     )?;
-    // AVFoundation cannot open Matroska/WebM, and the helper hangs forever on FLAC in Ogg;
-    // decode those here and hand the helper a WAV. A speaker track goes as a WAV with the
-    // other speakers' bleed muted, and a recording in parts as one WAV of them all.
+    // Decode WebM and Ogg here for the helper. Normalize QTA too so every engine uses the same
+    // playback-compatible track. Speaker tracks and split recordings also need a single WAV.
+    let mut decode_warning = None;
     let converted = if gate.is_some()
         || !job.parts.is_empty()
         || job.input.extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("webm") || extension.eq_ignore_ascii_case("ogg")
+            ["webm", "ogg", "qta"]
+                .iter()
+                .any(|format| extension.eq_ignore_ascii_case(format))
         }) {
         let mut audio = decode_job(job)?;
+        if audio.samples.is_empty() {
+            bail!(
+                "audio file contains no decodable samples: {}",
+                job.input.display()
+            );
+        }
         if let Some(gate) = gate {
             gate.apply(&mut audio.samples);
         }
+        decode_warning = audio.warning.take();
         let wav = audio_convert::TempPath::new("wav");
         audio_convert::write_float_wav(wav.path(), &audio.samples, TARGET_SAMPLE_RATE)?;
         Some(wav)
@@ -2660,8 +3286,12 @@ fn process_apple_native(
     let helper_input = converted
         .as_ref()
         .map_or(job.input.as_path(), audio_convert::TempPath::path);
-    let mut child = Command::new(&helper)
-        .arg(helper_input)
+    let mut command = Command::new(&helper);
+    command.arg(helper_input);
+    if cli.offline {
+        command.arg("--offline");
+    }
+    let mut child = command
         .args(["--format", "json", "--timestamps", "words"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2722,6 +3352,9 @@ fn process_apple_native(
     doc.metadata.version = env!("CARGO_PKG_VERSION").to_owned();
     doc.metadata.source_created_at = source_timestamp(&job.input, FileTimestamp::Created);
     doc.metadata.source_modified_at = source_timestamp(&job.input, FileTimestamp::Modified);
+    // Same labels as the other engines, whatever helper build wrote the transcript.
+    doc.language = "English".to_owned();
+    doc.metadata.transcribed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     doc.validate()?;
     if let Some(gate) = gate {
         let words = doc
@@ -2732,10 +3365,15 @@ fn process_apple_native(
             .collect();
         doc.segments = build_segments(words);
     }
-    let warning = doc
-        .segments
-        .is_empty()
-        .then(|| "No speech detected; the transcript is empty".to_owned());
+    let warning = [
+        doc.segments
+            .is_empty()
+            .then(|| "No speech detected; the transcript is empty".to_owned()),
+        decode_warning,
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(|first, second| format!("{first}; {second}"));
     let words = gate.is_some().then(|| doc.clone());
     if let Some(destination) = &output {
         write_job_output(cli, doc, destination, overwrite)?;
@@ -2816,6 +3454,41 @@ struct ZoomMedia {
 }
 
 fn zoom_media(path: &Path, name: &merge::TrackName) -> Option<ZoomMedia> {
+    let media = zoom_media_by_name(path, name)?;
+    // `video` and ten digits is also a Unix-time name (`video1700000000.mp4`, from screen
+    // recorders and phones); only Zoom's folder around it makes it a meeting recording.
+    if media.kind == ZoomMediaKind::Video
+        && !matches!(name, merge::TrackName::ZoomMixed { .. })
+        && let Some(meeting) = &media.meeting
+        && !zoom_folder_evidence(path, meeting)
+    {
+        return None;
+    }
+    Some(media)
+}
+
+/// Whether the folder holding `path` looks like a Zoom recording of `meeting`: participant
+/// tracks, a playlist, or another file of the same meeting (audio, a later segment, a view).
+fn zoom_folder_evidence(path: &Path, meeting: &str) -> bool {
+    let folder = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if folder.join("Audio Record").is_dir() || folder.join("playback.m3u").is_file() {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir(folder) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let other = entry.path();
+        other.file_name() != path.file_name()
+            && zoom_media_by_name(&other, &merge::parse_path(&other))
+                .is_some_and(|media| media.meeting.as_deref() == Some(meeting))
+    })
+}
+
+fn zoom_media_by_name(path: &Path, name: &merge::TrackName) -> Option<ZoomMedia> {
     let video = is_video(path);
     let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
     if let merge::TrackName::ZoomMixed { segment, meeting } = name {
@@ -2835,7 +3508,9 @@ fn zoom_media(path: &Path, name: &merge::TrackName) -> Option<ZoomMedia> {
     }
     let prefix = stem.trim_end_matches(|c: char| c.is_ascii_digit());
     let tail = &stem[prefix.len()..];
-    if prefix == "zoom_" {
+    // Zoom numbers these `zoom_0`, `zoom_1`, …; a date such as `zoom_20240115` is someone's
+    // own name, and taking it for a segment joined unrelated videos into one transcript.
+    if prefix == "zoom_" && (1..=2).contains(&tail.len()) {
         return Some(ZoomMedia {
             meeting: None,
             segment: tail.parse().ok()?,
@@ -2919,7 +3594,9 @@ fn input_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
 
 struct ZoomInventory {
     exports: Vec<(PathBuf, Option<String>)>,
+    audio_copies: HashMap<String, PathBuf>,
     multiple_ids: bool,
+    converting: bool,
 }
 
 fn zoom_inventory(folder: &Path) -> Result<ZoomInventory> {
@@ -2941,27 +3618,41 @@ fn zoom_inventory(folder: &Path) -> Result<ZoomInventory> {
             files.extend(read(&directory)?);
         }
     }
-    if files.iter().any(|path| {
+    let converting = files.iter().any(|path| {
         path.extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zoom"))
             && path
                 .file_name()
                 .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
             && path.is_file()
-    }) {
-        bail!(
-            "Zoom is still converting the recording in {}",
-            folder.display()
-        );
-    }
+    });
     files.sort_unstable();
-    let exports = files
-        .into_iter()
-        .filter_map(|path| {
-            let id = zoom_candidate(&path)?;
-            (path.is_file() && is_audio_path(&path)).then_some((path, id))
-        })
+    let mut exports = files
+        .iter()
+        .filter(|path| path.is_file() && is_audio_path(path))
+        .filter_map(|path| zoom_candidate(path).map(|id| (path.clone(), id)))
         .collect::<Vec<_>>();
+    let mixed_audio = exports
+        .iter()
+        .filter(|(path, _)| {
+            !is_video(path) && matches!(merge::parse_path(path), merge::TrackName::ZoomMixed { .. })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut audio_copies = HashMap::new();
+    for video in files.into_iter().filter(|path| {
+        is_video(path) && zoom_candidate(path).is_none() && path.is_file() && is_audio_path(path)
+    }) {
+        let mut candidates = mixed_audio.iter().filter(|(audio, _)| {
+            without_panic(|| audio_convert::same_aac_audio(audio, &video)).unwrap_or(false)
+        });
+        if let Some((audio, meeting)) = candidates.next()
+            && candidates.next().is_none()
+        {
+            audio_copies.insert(input_key(&video), audio.clone());
+            exports.push((video, meeting.clone()));
+        }
+    }
     let multiple_ids = exports
         .iter()
         .filter_map(|(_, id)| id.as_ref())
@@ -2970,7 +3661,9 @@ fn zoom_inventory(folder: &Path) -> Result<ZoomInventory> {
         > 1;
     Ok(ZoomInventory {
         exports,
+        audio_copies,
         multiple_ids,
+        converting,
     })
 }
 
@@ -2987,10 +3680,11 @@ fn add_zoom_companions(
     let mut expanded = HashSet::new();
     let mut companions = Vec::new();
     let mut unavailable = HashMap::new();
-    for job in jobs.iter() {
-        let Some(id) = zoom_candidate(&job.input) else {
+    for job in jobs.iter_mut() {
+        let named_id = zoom_candidate(&job.input);
+        if named_id.is_none() && !is_video(&job.input) {
             continue;
-        };
+        }
         if opt_out.contains(&input_key(&job.input))
             || (job.iso
                 && !is_iso_track(IsoMode::Auto, &job.input)
@@ -3008,10 +3702,30 @@ fn add_zoom_companions(
         {
             Ok(inventory) => inventory,
             Err(error) => {
-                unavailable.insert(job.input.clone(), format!("{error:#}"));
+                if named_id.is_some() {
+                    unavailable.insert(job.input.clone(), format!("{error:#}"));
+                }
                 continue;
             }
         };
+        let audio_copy = inventory.audio_copies.get(&input_key(&job.input));
+        let Some(id) = named_id.or_else(|| audio_copy.and_then(|path| zoom_candidate(path))) else {
+            continue;
+        };
+        if inventory.converting {
+            unavailable.insert(
+                job.input.clone(),
+                format!(
+                    "Zoom is still converting the recording in {}",
+                    folder.display()
+                ),
+            );
+            continue;
+        }
+        if let Some(audio) = audio_copy {
+            job.zoom_audio_copy = Some(audio.clone());
+            job.zoom_recording = true;
+        }
         if id.is_none() && inventory.multiple_ids {
             unavailable.insert(
                 job.input.clone(),
@@ -3036,7 +3750,9 @@ fn add_zoom_companions(
                 input: path.clone(),
                 iso,
                 zoom_recording: !iso,
+                zoom_audio_copy: inventory.audio_copies.get(&input_key(path)).cloned(),
                 output: None,
+                planned_output: None,
                 ..job.clone()
             });
         }
@@ -3105,11 +3821,13 @@ fn collect_jobs(
         jobs.push(Job {
             iso,
             zoom_recording,
+            zoom_audio_copy: None,
             parts: Vec::new(),
             input,
             diarize: item.diarize.unwrap_or(cli.diarize) || speakers.is_some(),
             speakers,
             output: item.output.clone(),
+            planned_output: None,
             output_dir: item
                 .output_dir
                 .clone()
@@ -3119,10 +3837,15 @@ fn collect_jobs(
     };
     if let Some(manifest) = &cli.manifest {
         let manifest_path = expand_home(manifest);
-        let content = fs::read_to_string(&manifest_path)
-            .with_context(|| format!("reading job manifest {}", manifest_path.display()))?;
-        let manifest: JobManifest = serde_json::from_str(&content)
-            .with_context(|| format!("parsing job manifest {}", manifest_path.display()))?;
+        let manifest: JobManifest = if manifest_path == Path::new("-") {
+            serde_json::from_reader(std::io::stdin().lock())
+                .context("parsing job manifest from stdin")?
+        } else {
+            let file = File::open(&manifest_path)
+                .with_context(|| format!("opening job manifest {}", manifest_path.display()))?;
+            serde_json::from_reader(BufReader::new(file))
+                .with_context(|| format!("parsing job manifest {}", manifest_path.display()))?
+        };
         let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         discover = manifest.discover_zoom.unwrap_or(true);
         excluded = manifest
@@ -3253,13 +3976,22 @@ fn without_panic<T>(decode: impl FnOnce() -> Result<T>) -> Result<T> {
 /// first track: browser screen recordings put the video track first, and it has no sample rate.
 fn audio_track(
     format: &dyn symphonia::core::formats::FormatReader,
+    prefer_aac: bool,
 ) -> Result<(u32, Box<dyn symphonia::core::codecs::Decoder>)> {
-    let track = format
-        .tracks()
-        .iter()
-        .find(|track| {
-            track.codec_params.codec != CODEC_TYPE_NULL && track.codec_params.sample_rate.is_some()
+    let mut audio = format.tracks().iter().filter(|track| {
+        track.codec_params.codec != CODEC_TYPE_NULL && track.codec_params.sample_rate.is_some()
+    });
+    // A Voice Memo can carry alternate encodings of the same audio. AAC is the
+    // compatibility track in Apple's spatial recordings.
+    let compatible = prefer_aac
+        .then(|| {
+            audio
+                .clone()
+                .find(|track| track.codec_params.codec == CODEC_TYPE_AAC)
         })
+        .flatten();
+    let track = compatible
+        .or_else(|| audio.next())
         .context("file has no audio track")?;
     let decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
     Ok((track.id, decoder))
@@ -3303,7 +4035,10 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
         &MetadataOptions::default(),
     )?;
     let mut format = probed.format;
-    let (mut track_id, mut decoder) = audio_track(format.as_ref())?;
+    let prefer_aac = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("qta"));
+    let (mut track_id, mut decoder) = audio_track(format.as_ref(), prefer_aac)?;
     let mut output = Vec::new();
     // Resample from the decoder's output rate. Apple's ALAC encoder writes 44100 in the MP4
     // sample entry for every file; the true rate is in the codec config, which the decoder
@@ -3318,7 +4053,7 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
             // A chained Ogg file (streams joined end to end) starts a new stream, with new
             // track IDs and possibly another sample rate.
             Err(SymphoniaError::ResetRequired) => {
-                (track_id, decoder) = audio_track(format.as_ref())?;
+                (track_id, decoder) = audio_track(format.as_ref(), prefer_aac)?;
                 continue;
             }
             Err(SymphoniaError::IoError(error))
@@ -3526,17 +4261,32 @@ fn limit_speakers(mut spans: Vec<SpeakerSpan>, max_speakers: usize) -> Vec<Speak
     for span in &spans {
         *talk_time.entry(span.speaker_id).or_default() += span.end.saturating_sub(span.start);
     }
-    if talk_time.len() <= max_speakers {
-        return spans;
+    if talk_time.len() > max_speakers {
+        let mut ranked = talk_time.into_iter().collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        let kept = ranked
+            .into_iter()
+            .take(max_speakers)
+            .map(|(speaker, _)| speaker)
+            .collect::<Vec<_>>();
+        spans.retain(|span| kept.contains(&span.speaker_id));
     }
-    let mut ranked = talk_time.into_iter().collect::<Vec<_>>();
-    ranked.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
-    let kept = ranked
-        .into_iter()
-        .take(max_speakers)
-        .map(|(speaker, _)| speaker)
-        .collect::<Vec<_>>();
-    spans.retain(|span| kept.contains(&span.speaker_id));
+    // Number the speakers kept 0, 1, … by first appearance: transcripts label raw IDs, and
+    // "Speaker 0" and "Speaker 3" for two speakers reads as if some were lost.
+    let mut order = spans.clone();
+    order.sort_by_key(|span| span.start);
+    let mut ids: Vec<usize> = Vec::new();
+    for span in &order {
+        if !ids.contains(&span.speaker_id) {
+            ids.push(span.speaker_id);
+        }
+    }
+    for span in &mut spans {
+        span.speaker_id = ids
+            .iter()
+            .position(|&id| id == span.speaker_id)
+            .unwrap_or(span.speaker_id);
+    }
     spans
 }
 
@@ -3621,21 +4371,43 @@ fn zoom_destination(job: &Job, meeting: Option<&str>) -> PathBuf {
         .copied()
         .chain([0])
         .chain(meeting.unwrap_or_default().bytes());
-    // FNV-1a is stable across runs and Rust versions.
-    let hash = identity.fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    });
+    let hash = stable_hash(identity);
     let name = source.file_name().unwrap_or_default().to_string_lossy();
     let name = name.trim();
     let name = &name[..name.floor_char_boundary(200)];
     job.output_dir.join(format!("{name} [{hash:016x}]"))
 }
 
+fn stable_hash(bytes: impl Iterator<Item = u8>) -> u64 {
+    // FNV-1a is stable across runs and Rust versions.
+    bytes.fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn append_tag(path: &Path, tag: &str) -> PathBuf {
+    let mut name = path.file_stem().unwrap_or_default().to_os_string();
+    name.push(".");
+    name.push(tag);
+    if let Some(extension) = path.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    path.with_file_name(name)
+}
+
+fn tagged_output(cli: &Cli, path: PathBuf) -> PathBuf {
+    match cli.output_tag.as_deref() {
+        Some(tag) => append_tag(&path, tag),
+        None => path,
+    }
+}
+
 fn fallback_output_path(cli: &Cli, job: &Job, folder: &Path, meeting: Option<&str>) -> PathBuf {
     let name = folder.file_name().unwrap_or_default().to_string_lossy();
     let name = &name[..name.floor_char_boundary(200)];
     let extension = format_extension(cli.format);
-    match job.output_location {
+    let path = match job.output_location {
         OutputLocation::Folder => {
             zoom_destination(job, meeting).join(format!("{name}.zoom.{extension}"))
         }
@@ -3643,10 +4415,18 @@ fn fallback_output_path(cli: &Cli, job: &Job, folder: &Path, meeting: Option<&st
             let name = meeting.map_or_else(|| name.to_owned(), |id| format!("{name} [{id}]"));
             folder.join(format!("{name}.zoom.{extension}"))
         }
-    }
+    };
+    tagged_output(cli, path)
 }
 
 fn output_path(cli: &Cli, job: &Job) -> PathBuf {
+    if let Some(path) = &job.planned_output {
+        return path.clone();
+    }
+    tagged_output(cli, base_output_path(cli, job))
+}
+
+fn base_output_path(cli: &Cli, job: &Job) -> PathBuf {
     let extension = format_extension(cli.format);
     if let Some(path) = &job.output {
         // Replace a transcript extension the caller supplied; otherwise append, so a dotted
@@ -3666,7 +4446,7 @@ fn output_path(cli: &Cli, job: &Job) -> PathBuf {
     }
     let parent = match job.output_location {
         OutputLocation::Folder if job.zoom_recording => {
-            let id = zoom_recording_id(&job.input);
+            let id = zoom_recording_id(job.zoom_audio_copy.as_deref().unwrap_or(&job.input));
             return zoom_destination(job, id.as_deref())
                 .join(job.input.file_name().unwrap_or_default())
                 .with_extension(extension);
@@ -3731,29 +4511,37 @@ fn folded_path(path: &str) -> String {
 
 /// A progress log is appended to before transcription starts. It must be a different
 /// file from every source and destination, including through symlinks or hard links.
-fn protect_progress_file(
+fn protect_progress_files(
     cli: &Cli,
     units: &[Unit],
     skips: &[Skip],
     rejected: &[(PathBuf, String)],
+    progress_paths: &[&Path],
 ) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let Some(progress) = &cli.progress_file else {
+    if progress_paths.is_empty() {
         return Ok(());
-    };
-    if fs::symlink_metadata(progress).is_ok_and(|info| info.is_symlink()) {
-        fs::canonicalize(progress)
-            .with_context(|| format!("resolving progress file {}", progress.display()))?;
     }
-    let progress_key = folded_path(&input_key(progress));
-    let progress_metadata = fs::metadata(progress).ok();
+    let inode = |path: &Path| fs::metadata(path).ok().map(|file| (file.dev(), file.ino()));
+    let mut progress_keys = HashSet::new();
+    let mut progress_inodes = HashSet::new();
+    for &progress in progress_paths {
+        if fs::symlink_metadata(progress).is_ok_and(|info| info.is_symlink()) {
+            fs::canonicalize(progress)
+                .with_context(|| format!("resolving progress file {}", progress.display()))?;
+        }
+        if !progress_keys.insert(folded_path(&input_key(progress)))
+            || inode(progress).is_some_and(|identity| !progress_inodes.insert(identity))
+        {
+            bail!("model passes share a progress file: {}", progress.display());
+        }
+    }
     let check = |candidate: &Path| -> Result<()> {
-        let same_inode = progress_metadata.as_ref().is_some_and(|log| {
-            fs::metadata(candidate)
-                .is_ok_and(|file| file.dev() == log.dev() && file.ino() == log.ino())
-        });
-        if same_inode || folded_path(&input_key(candidate)) == progress_key {
+        if progress_keys.contains(&folded_path(&input_key(candidate)))
+            || (!progress_inodes.is_empty()
+                && inode(candidate).is_some_and(|identity| progress_inodes.contains(&identity)))
+        {
             bail!(
                 "the progress file overlaps an input or transcript: {}",
                 candidate.display()
@@ -3781,7 +4569,9 @@ fn protect_progress_file(
     for (input, _) in rejected {
         check(input)?;
     }
-    if let Some(manifest) = &cli.manifest {
+    if let Some(manifest) = &cli.manifest
+        && manifest != Path::new("-")
+    {
         check(&expand_home(manifest))?;
     }
     Ok(())
@@ -3983,8 +4773,13 @@ mod tests {
         let kept = limit_speakers(spans.clone(), 2);
         let mut ids = kept.iter().map(|span| span.speaker_id).collect::<Vec<_>>();
         ids.dedup();
-        assert_eq!(ids, vec![2, 1]);
-        assert_eq!(limit_speakers(spans, 3).len(), 4);
+        // Speakers 2 and 1 are kept, numbered by first appearance.
+        assert_eq!(ids, vec![0, 1]);
+        assert_eq!(kept[0].end, span(1.0, 20.0, 0).end);
+        let all = limit_speakers(spans, 3);
+        assert_eq!(all.len(), 4);
+        let ids = all.iter().map(|span| span.speaker_id).collect::<Vec<_>>();
+        assert_eq!(ids, vec![0, 1, 2, 0]);
     }
 
     #[test]
@@ -4430,7 +5225,7 @@ mod tests {
         bytes.extend_from_slice(&"{\"input\":\"/é".as_bytes()[..13]);
         fs::write(path.path(), bytes).unwrap();
         let log = ProgressLog::open(Some(path.path()), true).expect("torn UTF-8 must not abort");
-        assert!(log.latest.contains_key("/a.wav"));
+        assert!(log.latest.contains_key(&("/a.wav".to_owned(), None)));
     }
 
     #[test]
@@ -4441,9 +5236,11 @@ mod tests {
             parts: Vec::new(),
             iso: false,
             zoom_recording: false,
+            zoom_audio_copy: None,
             diarize: false,
             speakers: None,
             output: None,
+            planned_output: None,
             output_dir: PathBuf::from("out"),
             output_location: OutputLocation::Folder,
         };
@@ -4478,16 +5275,44 @@ mod tests {
         let mut log = ProgressLog::open(Some(&path), true).expect("torn line must not abort");
         assert!(
             log.latest
-                .get("/a.wav")
+                .get(&("/a.wav".to_owned(), None))
                 .is_some_and(|event| event.status == "completed")
         );
         log.record(ProgressEvent::new("/c.wav".to_owned(), "completed"))
             .unwrap();
         drop(log);
         let reopened = ProgressLog::open(Some(&path), true).unwrap();
-        assert!(reopened.latest.contains_key("/a.wav"));
-        assert!(reopened.latest.contains_key("/c.wav"));
+        assert!(reopened.latest.contains_key(&("/a.wav".to_owned(), None)));
+        assert!(reopened.latest.contains_key(&("/c.wav".to_owned(), None)));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A session records a "Comparing speaker tracks" event for its first track before that
+    /// track runs; it must not hide what the earlier run logged for the track.
+    #[test]
+    fn earlier_runs_events_survive_this_runs_own() {
+        let path = audio_convert::TempPath::new("jsonl");
+        fs::write(
+            path.path(),
+            "{\"input\":\"/a.wav\",\"output\":\"/out/a.json\",\"status\":\"running\",\"phase\":\"Writing output\"}\n",
+        )
+        .unwrap();
+        let mut log = ProgressLog::open(Some(path.path()), true).unwrap();
+        let output = Path::new("/out/a.json");
+        log.record(ProgressEvent {
+            output: Some(output.display().to_string()),
+            phase: Some("Comparing speaker tracks (1/2)".to_owned()),
+            ..ProgressEvent::new("/a.wav".to_owned(), "running")
+        })
+        .unwrap();
+        assert!(log.interrupted_write("/a.wav", output));
+        assert!(log.logged_before("/a.wav", output));
+        log.record(ProgressEvent {
+            output: Some("/out/b.json".to_owned()),
+            ..ProgressEvent::new("/b.wav".to_owned(), "running")
+        })
+        .unwrap();
+        assert!(!log.logged_before("/b.wav", Path::new("/out/b.json")));
     }
 
     /// Stereo Ogg Vorbis used to panic inside Symphonia, and Opus (Ogg or WebM) was rejected
@@ -4562,6 +5387,47 @@ mod tests {
     }
 
     #[test]
+    fn plans_qta_and_decodes_its_compatible_audio_track() {
+        let Ok(ffmpeg) = which_ffmpeg() else {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        };
+        let source = audio_convert::TempPath::new("wav");
+        audio_convert::write_float_wav(source.path(), &tone(440.0, 48_000, 1.0), 48_000).unwrap();
+        let memo = audio_convert::TempPath::new("QTA");
+        // Put a silent PCM track before the AAC compatibility track.
+        let status = Command::new(&ffmpeg)
+            .args(["-loglevel", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "anullsrc=r=48000:cl=mono:d=1", "-i"])
+            .arg(source.path())
+            .args([
+                "-map",
+                "0:a",
+                "-map",
+                "1:a",
+                "-c:a:0",
+                "pcm_s16le",
+                "-c:a:1",
+                "aac",
+                "-f",
+                "mov",
+            ])
+            .arg(memo.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let cli = Cli::parse_from(["transcriberrr".as_ref(), memo.path().as_os_str()]);
+        let (units, skipped, rejected) = prepare_plan(&cli).unwrap();
+        assert!(skipped.is_empty() && rejected.is_empty());
+        assert!(matches!(&units[..], [Unit::Single(job)] if job.input == memo.path()));
+
+        let audio = decode_with_symphonia(memo.path()).unwrap();
+        assert!((audio.duration_seconds - 1.0).abs() < 0.1);
+        assert!(rms(&audio.samples) > 0.3);
+    }
+
+    #[test]
     fn decodes_the_audio_track_of_a_video_webm() {
         let Ok(ffmpeg) = which_ffmpeg() else {
             eprintln!("skipping: ffmpeg not found");
@@ -4629,9 +5495,11 @@ mod tests {
             parts: Vec::new(),
             iso: false,
             zoom_recording: false,
+            zoom_audio_copy: None,
             diarize: false,
             speakers: None,
             output: Some(PathBuf::from(output)),
+            planned_output: None,
             output_dir: PathBuf::from("."),
             output_location: OutputLocation::Folder,
         };
@@ -4673,5 +5541,45 @@ mod tests {
             },
         ]);
         assert_eq!(segments[0].content(), "你好。");
+    }
+
+    #[test]
+    fn dated_zoom_names_are_not_zoom_segments() {
+        let media = |name: &str| {
+            let path = Path::new(name);
+            zoom_media(path, &merge::parse_path(path)).map(|media| media.segment)
+        };
+        assert_eq!(media("zoom_0.mp4"), Some(0));
+        assert_eq!(media("zoom_12.mp4"), Some(12));
+        assert_eq!(media("zoom_20240115.mp4"), None);
+        assert_eq!(media("zoom_.mp4"), None);
+    }
+
+    #[test]
+    fn a_unix_time_video_name_needs_a_zoom_folder() {
+        let directory = audio_convert::TempPath::new("dir");
+        let root = directory.path();
+        let is_zoom = |name: &str| {
+            let path = root.join(name);
+            zoom_media(&path, &merge::parse_path(&path)).is_some()
+        };
+        for file in [
+            "phone/video1700000000.mp4",
+            "phone/talk.mp4",
+            "call/video1067067067.mp4",
+            "call/audio1067067067.m4a",
+            "view/video1067067067.mp4",
+            "view/shared_screen_with_speaker_view1067067067.mp4",
+            "tracks/video1067067067.mp4",
+            "tracks/Audio Record/audioAlice11067067067.m4a",
+        ] {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, []).unwrap();
+        }
+        assert!(!is_zoom("phone/video1700000000.mp4"));
+        assert!(is_zoom("call/video1067067067.mp4"));
+        assert!(is_zoom("view/video1067067067.mp4"));
+        assert!(is_zoom("tracks/video1067067067.mp4"));
     }
 }

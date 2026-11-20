@@ -514,6 +514,8 @@ pub(crate) fn merge_tracks(inputs: Vec<TrackInput>) -> Result<(TranscriptDocumen
     let mut warnings = Vec::new();
     let mut speakers: Vec<Speaker> = Vec::new();
     let mut zoom_speakers = HashMap::new();
+    let mut sources = HashMap::new();
+    let mut timed_sources = HashMap::new();
     let mut meetings = Vec::new();
     let (stems, mut names): (Vec<_>, Vec<_>) = inputs.iter().map(TrackInput::track_name).unzip();
     resolve_name_digits(&mut names);
@@ -524,6 +526,35 @@ pub(crate) fn merge_tracks(inputs: Vec<TrackInput>) -> Result<(TranscriptDocumen
             .with_context(|| format!("invalid transcript {}", input.path))?;
         if input.is_merged() {
             bail!("{} is already a merged transcript", input.path);
+        }
+        let source = Path::new(&input.doc.source);
+        // The source path is as typed. Two absolute paths compare directly. A relative one
+        // names the file from whatever directory that run started in, so it is matched by
+        // file name and timestamps (against a relative or an absolute source).
+        let relative = !source.is_absolute();
+        let file_name = source
+            .file_name()
+            .map(|name| crate::folded_path(&name.to_string_lossy()));
+        let by_time = match (file_name, input.doc.metadata.source_modified_at.as_deref()) {
+            (Some(name), Some(modified)) => Some((
+                name,
+                input.doc.metadata.source_created_at.as_deref(),
+                modified,
+            )),
+            _ => None,
+        };
+        let same_time = by_time.and_then(|identity| {
+            let previous = timed_sources.insert(identity, (&input.path, relative))?;
+            (previous.1 || relative).then_some(previous.0)
+        });
+        let same_path = (!relative)
+            .then(|| sources.insert(crate::input_key(source), &input.path))
+            .flatten();
+        if let Some(previous) = same_time.or(same_path) {
+            bail!(
+                "{} and {previous} are transcripts of the same source; list one transcript per track",
+                input.path
+            );
         }
         if input
             .doc

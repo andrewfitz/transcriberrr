@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -56,7 +57,7 @@ impl Fixture {
         );
         let helper = self.file(
             "speech-helper",
-            "#!/bin/sh\nprintf 'called\\n' >> calls.log\nsleep 0.2\ncat words.json\n",
+            "#!/bin/sh\nprintf 'called\\n' >> calls.log\nprintf '%s\\n' \"$@\" >> helper-arguments.log\nsleep 0.2\ncat words.json\n",
         );
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
         helper
@@ -98,6 +99,371 @@ fn success(output: &Output) {
 
 fn destination(plan: &Value) -> &Path {
     Path::new(plan["meetings"][0]["output"].as_str().unwrap())
+}
+
+fn json_lines(output: &Output) -> Vec<Value> {
+    std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn capabilities_and_stdin_plan_are_read_only_and_report_offline_requirements() {
+    let fixture = Fixture::new();
+    fixture.track("voice memo.qta");
+    let capabilities = fixture.command(&["capabilities"]).output().unwrap();
+    success(&capabilities);
+    let capabilities = &json_lines(&capabilities)[0];
+    assert_eq!(capabilities["schema_version"], 1);
+    assert!(
+        capabilities["input_extensions"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("qta"))
+    );
+    assert_eq!(capabilities["automation"]["events"], "--jsonl");
+    assert_eq!(
+        capabilities["engines"][1]["included"],
+        cfg!(feature = "parakeet")
+    );
+
+    let mut child = fixture
+        .command(&[
+            "--manifest",
+            "-",
+            "--plan",
+            "--offline",
+            "--model-cache",
+            "cold-cache",
+            "-o",
+            "out",
+            "--progress-file",
+            "events/run.jsonl",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"items":[{"input":"voice memo.qta","output":"chosen.json"}]}"#)
+        .unwrap();
+    let plan = child.wait_with_output().unwrap();
+    success(&plan);
+    let plan = &json_lines(&plan)[0];
+    assert_eq!(plan["summary"]["pending_units"], 1);
+    assert!(
+        plan["files"][0]["output"]
+            .as_str()
+            .unwrap()
+            .ends_with("/chosen.json")
+    );
+    assert_eq!(plan["required_models"][0]["role"], "asr");
+    assert_eq!(plan["required_models"][1]["role"], "aligner");
+    assert_eq!(plan["required_models"][0]["cached"], false);
+    assert!(
+        plan["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains("--offline"))
+    );
+    for path in ["cold-cache", "chosen.json", "out", "events"] {
+        assert!(!fixture.0.join(path).exists());
+    }
+
+    fixture.file(
+        "typo.json",
+        br#"{"items":[{"input":"voice memo.qta","diarzie":true}]}"#,
+    );
+    let output = fixture
+        .command(&["--manifest", "typo.json", "--plan"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown field"));
+}
+
+#[test]
+fn jsonl_tracks_multiple_passes_and_partial_failures() {
+    let fixture = Fixture::new();
+    let helper = fixture.fake_native_helper();
+    fixture.track("meeting/Audio Record/audioAlice11067067067.wav");
+    fixture.track("meeting/Audio Record/audioBob21067067067.wav");
+    fixture.file("meeting/video1067067067.mp4", []);
+    let args = [
+        "meeting",
+        "missing.wav",
+        "-o",
+        "out",
+        "--offline",
+        "--pass",
+        "qwen3",
+        "--pass",
+        "apple-native",
+        "--model-cache",
+        "cold-cache",
+        "--progress-file",
+        "run.jsonl",
+    ];
+    let plan = fixture.plan(&args);
+    let qwen = destination(&plan["passes"][0]);
+    let apple = destination(&plan["passes"][1]);
+    fixture.file(qwen.to_str().unwrap(), "existing Qwen output");
+    let result = fixture
+        .command(&args)
+        .arg("--jsonl")
+        .env("TRANSCRIBERRR_NATIVE", &helper)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let events = json_lines(&result);
+    assert!(events.iter().all(|event| event["schema_version"] == 1));
+    assert_eq!(events[0]["event"], "run_started");
+    assert_eq!(events.last().unwrap()["event"], "run_finished");
+    assert_eq!(events.last().unwrap()["status"], "failed");
+    assert!(events.iter().any(|event| event["kind"] == "merge"
+        && event["status"] == "skipped"
+        && event["pass"]["model_tag"] == "qw"
+        && event["output"] == qwen.to_str().unwrap()));
+    assert!(events.iter().any(|event| event["kind"] == "merge"
+        && event["status"] == "completed"
+        && event["pass"]["index"] == 2
+        && event["output"] == apple.to_str().unwrap()));
+    assert!(events.iter().any(|event| event["event"] == "progress"
+        && event["status"] == "failed"
+        && event["input"].as_str().unwrap().ends_with("/missing.wav")));
+    let log = fs::read_to_string(fixture.0.join("run.ap.jsonl")).unwrap();
+    assert!(log.lines().all(|line| {
+        serde_json::from_str::<Value>(line)
+            .unwrap()
+            .get("event")
+            .is_none()
+    }));
+    assert_eq!(fixture.calls(), 2);
+    assert!(
+        fs::read_to_string(fixture.0.join("helper-arguments.log"))
+            .unwrap()
+            .lines()
+            .any(|arg| arg == "--offline")
+    );
+    assert!(!fixture.0.join("cold-cache").exists());
+}
+
+#[test]
+fn offline_run_reports_missing_model_without_creating_a_cache() {
+    let fixture = Fixture::new();
+    fixture.track("test.wav");
+    let result = fixture
+        .command(&[
+            "test.wav",
+            "--jsonl",
+            "--offline",
+            "--model-cache",
+            "cold-cache",
+            "-o",
+            "out",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let events = json_lines(&result);
+    assert_eq!(events[2]["event"], "pass_finished");
+    assert!(
+        events[2]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not available locally")
+    );
+    assert_eq!(events[3]["status"], "failed");
+    assert!(!fixture.0.join("cold-cache").exists());
+    assert!(!fixture.0.join("out").exists());
+}
+
+#[test]
+fn model_pass_plans_tag_regular_and_zoom_destinations() {
+    let fixture = Fixture::new();
+    fixture.track("library/interview.2026.wav");
+    fixture.track("library/Call/Audio Record/audioAlice11067067067.m4a");
+    fixture.file("library/Call/video1067067067.mp4", []);
+    fixture.track("library/Review/audio1187878787.m4a");
+    let untagged = fixture.plan(&["library", "-o", "out"]);
+    assert!(destination(&untagged).ends_with("Call.merged.json"));
+    let plan = fixture.plan(&[
+        "library",
+        "-o",
+        "out",
+        "--pass",
+        "qwen3",
+        "--pass",
+        "parakeet",
+        "--pass",
+        "qwen3=qwen3-asr-0.6b",
+    ]);
+    for (pass, tag) in plan["passes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(["qw", "pk", "qw06"])
+    {
+        assert_eq!(pass["model_tag"], tag);
+        assert_eq!(pass["meetings"][0]["id"], untagged["meetings"][0]["id"]);
+        assert!(destination(pass).ends_with(format!("Call.merged.{tag}.json")));
+        let files = pass["files"].as_array().unwrap();
+        for name in ["interview.2026", "Review.zoom"] {
+            assert!(files.iter().any(|file| {
+                file["output"]
+                    .as_str()
+                    .is_some_and(|path| Path::new(path).ends_with(format!("{name}.{tag}.json")))
+            }));
+        }
+        assert!(files.iter().any(|file| {
+            file["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("video1067067067.mp4"))
+                && file["skip"].is_string()
+        }));
+    }
+    let single = fixture.plan(&[
+        "library",
+        "-o",
+        "out",
+        "--engine",
+        "parakeet-v3",
+        "--model-suffix",
+    ]);
+    assert_eq!(&single, &plan["passes"][1]);
+}
+
+#[test]
+fn model_passes_resume_independently_and_reject_repeated_models() {
+    let fixture = Fixture::new();
+    let helper = fixture.fake_native_helper();
+    fixture.track("meeting/Audio Record/audioAlice11067067067.m4a");
+    fixture.track("interview.wav");
+    let duplicate = fixture
+        .command(&[
+            "meeting",
+            "--pass",
+            "qwen3",
+            "--pass",
+            "qwen3=qwen3-asr-1.7b",
+        ])
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("repeated identifier qw"));
+    let incompatible = fixture
+        .command(&[
+            "interview.wav",
+            "--pass",
+            "parakeet=qwen3-asr-0.6b",
+            "--plan",
+        ])
+        .output()
+        .unwrap();
+    assert!(!incompatible.status.success());
+    assert!(String::from_utf8_lossy(&incompatible.stderr).contains("different engine"));
+
+    let args = [
+        "meeting",
+        "interview.wav",
+        "-o",
+        "out",
+        "--pass",
+        "qwen3",
+        "--pass",
+        "apple-native",
+        "--progress-file",
+        "run.jsonl",
+        "--resume",
+    ];
+    let plan = fixture.plan(&args);
+    let qwen = destination(&plan["passes"][0]);
+    let apple = destination(&plan["passes"][1]);
+    fixture.file(qwen.to_str().unwrap(), b"existing Qwen result");
+    fixture.file("out/interview.qw.json", b"existing Qwen interview");
+    let run = || {
+        success(
+            &fixture
+                .command(&args)
+                .env("TRANSCRIBERRR_NATIVE", &helper)
+                .output()
+                .unwrap(),
+        )
+    };
+    run();
+    run();
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(fs::read(qwen).unwrap(), b"existing Qwen result");
+    assert!(fixture.0.join("out/interview.ap.json").is_file());
+    for (tag, output) in [("qw", qwen), ("ap", apple)] {
+        let events = fs::read_to_string(fixture.0.join(format!("run.{tag}.jsonl"))).unwrap();
+        assert!(events.contains(output.to_str().unwrap()));
+    }
+    assert!(!fixture.0.join("run.jsonl").exists());
+    fs::remove_file(apple).unwrap();
+    run();
+    assert_eq!(fixture.calls(), 3);
+    assert!(apple.is_file());
+
+    let other_log = fixture.0.join("alias.qw.jsonl");
+    let existing = fs::read(apple).unwrap();
+    fs::hard_link(apple, other_log).unwrap();
+    let collision = fixture
+        .command(&[
+            "meeting",
+            "-o",
+            "out",
+            "--pass",
+            "qwen3",
+            "--pass",
+            "apple-native",
+            "--progress-file",
+            "alias.jsonl",
+            "--resume",
+        ])
+        .output()
+        .unwrap();
+    assert!(!collision.status.success());
+    assert!(String::from_utf8_lossy(&collision.stderr).contains("progress file overlaps"));
+    assert_eq!(fs::read(apple).unwrap(), existing);
+    assert!(!fixture.0.join("alias.ap.jsonl").exists());
+}
+
+#[test]
+fn overwrite_reprocesses_tagged_outputs_even_with_resume() {
+    let fixture = Fixture::new();
+    let helper = fixture.fake_native_helper();
+    fixture.track("interview.wav");
+    let args = [
+        "interview.wav",
+        "--pass",
+        "apple-native",
+        "--progress-file",
+        "run.jsonl",
+        "--resume",
+    ];
+    let run = |extra: &[&str]| {
+        success(
+            &fixture
+                .command(&args)
+                .args(extra)
+                .env("TRANSCRIBERRR_NATIVE", &helper)
+                .output()
+                .unwrap(),
+        );
+    };
+    run(&[]);
+    run(&[]);
+    assert_eq!(fixture.calls(), 1);
+    run(&["--overwrite"]);
+    assert_eq!(fixture.calls(), 2);
 }
 
 #[test]
@@ -340,6 +706,123 @@ fn recognizes_mixed_mp4_and_leaves_generic_short_video_names_alone() {
 }
 
 #[test]
+fn identifies_renamed_zoom_video_by_its_complete_audio_stream() {
+    let Some(ffmpeg) = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+    else {
+        eprintln!("skipping: ffmpeg not found");
+        return;
+    };
+    let fixture = Fixture::new();
+    let mixed = "Call/audio1067067067.m4a";
+    let renamed = "Call/Renamed session.mp4";
+    let unrelated = "Call/Other footage.mp4";
+    fixture.track("Call/Audio Record/audioAlice11067067067.wav");
+    let encode = |args: &[&str]| {
+        success(
+            &Command::new(ffmpeg)
+                .current_dir(&fixture.0)
+                .args(["-hide_banner", "-nostdin", "-loglevel", "error"])
+                .args(args)
+                .output()
+                .unwrap(),
+        );
+    };
+    encode(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=1",
+        "-c:a",
+        "aac",
+        mixed,
+    ]);
+    encode(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=s=32x32:d=1",
+        "-i",
+        mixed,
+        "-c:v",
+        "mpeg4",
+        "-c:a",
+        "copy",
+        renamed,
+    ]);
+    encode(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=s=32x32:d=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=880:duration=1",
+        "-c:v",
+        "mpeg4",
+        "-c:a",
+        "aac",
+        unrelated,
+    ]);
+
+    let plan = fixture.plan(&["Call", "-o", "out"]);
+    let output = destination(&plan);
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    fs::write(output, b"existing merge").unwrap();
+    for input in ["Call", renamed] {
+        let plan = fixture.plan(&[input, "-o", "out"]);
+        assert_eq!(destination(&plan), output);
+        assert_eq!(plan["meetings"][0]["done"], true);
+        let files = plan["files"].as_array().unwrap();
+        let named = |name: &str| {
+            files
+                .iter()
+                .find(|file| file["path"].as_str().unwrap().ends_with(name))
+        };
+        let video = named(renamed).unwrap();
+        assert_eq!(video["meeting"], plan["meetings"][0]["id"]);
+        assert!(
+            video["skip"]
+                .as_str()
+                .unwrap()
+                .contains("participant tracks")
+        );
+        assert!(video["output"].is_null());
+        if input == "Call" {
+            let other = named(unrelated).unwrap();
+            assert!(other["skip"].is_null() && other["output"].is_string());
+        } else {
+            assert!(named(unrelated).is_none());
+        }
+    }
+
+    let legacy = "Legacy/audio_only01.m4a";
+    let legacy_video = "Legacy/Renamed legacy session.mp4";
+    fs::create_dir(fixture.0.join("Legacy")).unwrap();
+    fs::copy(fixture.0.join(mixed), fixture.0.join(legacy)).unwrap();
+    fs::copy(fixture.0.join(renamed), fixture.0.join(legacy_video)).unwrap();
+    let plan = fixture.plan(&[legacy_video, "-o", "out", "--model-suffix"]);
+    let files = plan["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().any(|file| {
+        file["path"].as_str().unwrap().ends_with(legacy_video)
+            && file["skip"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("identical audio")
+    }));
+    assert!(files.iter().any(|file| {
+        file["path"].as_str().unwrap().ends_with(legacy)
+            && file["output"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("audio_only01.qw.json")
+    }));
+}
+
+#[test]
 fn rejects_overlapping_progress_logs_before_creating_or_appending_to_them() {
     let fixture = Fixture::new();
     let source = fixture.file(
@@ -493,9 +976,47 @@ fn preview_honors_resume_and_zoom_overwrite_forces_a_rerun() {
     success(&run(&["--resume", "--overwrite"]));
     assert_eq!(
         fixture.calls(),
-        3,
-        "overwrite forces the Zoom merge even with a resume log"
+        4,
+        "overwrite reruns both outputs even with a resume log"
     );
+}
+
+#[test]
+fn resume_does_not_claim_or_replace_a_different_destination() {
+    let fixture = Fixture::new();
+    let helper = fixture.fake_native_helper();
+    fixture.track("ordinary.wav");
+    let args = [
+        "ordinary.wav",
+        "--engine",
+        "apple-native",
+        "--progress-file",
+        "run.jsonl",
+        "--resume",
+    ];
+    let run = |folder| {
+        fixture
+            .command(&args)
+            .args(["-o", folder])
+            .env("TRANSCRIBERRR_NATIVE", &helper)
+            .output()
+            .unwrap()
+    };
+    success(&run("first"));
+    fixture.file("second/ordinary.json", "a different output");
+    let plan = fixture.plan(&[&args[..], &["-o", "second"]].concat());
+    assert_eq!(plan["files"][0]["done"], false);
+    for _ in 0..2 {
+        let conflict = run("second");
+        assert!(!conflict.status.success());
+        assert!(String::from_utf8_lossy(&conflict.stderr).contains("output exists"));
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("second/ordinary.json")).unwrap(),
+        "a different output"
+    );
+    success(&run("first"));
+    assert_eq!(fixture.calls(), 1);
 }
 
 #[test]
@@ -673,4 +1194,150 @@ fn protects_a_transcript_from_an_equivalent_unicode_progress_filename() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("progress file overlaps"));
     assert!(!output.exists() && !decomposed.exists());
+}
+
+#[test]
+fn skip_existing_keeps_another_sessions_track_transcripts() {
+    let fixture = Fixture::new();
+    let helper = fixture.fake_native_helper();
+    for session in ["A", "B"] {
+        fixture.track(&format!("{session}/ep2/alice.wav"));
+        fixture.track(&format!("{session}/ep2/bob.wav"));
+    }
+    let run = |session: &str| {
+        fixture
+            .command(&[
+                &format!("{session}/ep2/alice.wav"),
+                &format!("{session}/ep2/bob.wav"),
+                "--iso-tracks",
+                "-o",
+                "shared",
+                "--engine",
+                "apple-native",
+                "--skip-existing",
+            ])
+            .env("TRANSCRIBERRR_NATIVE", &helper)
+            .output()
+            .unwrap()
+    };
+    success(&run("A"));
+    let before = fs::read_to_string(fixture.0.join("shared/alice.json")).unwrap();
+    assert!(before.contains("A/ep2/alice.wav"));
+    let output = run("B");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("output exists"));
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("shared/alice.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn rerun_from_another_directory_skips_a_merged_session() {
+    let fixture = Fixture::new();
+    let helper = fixture.fake_native_helper();
+    fixture.track("proj/ep1/alice.wav");
+    fixture.track("proj/ep1/bob.wav");
+    fs::create_dir_all(fixture.0.join("elsewhere")).unwrap();
+    let common = [
+        "--iso-tracks",
+        "--engine",
+        "apple-native",
+        "--skip-existing",
+    ];
+    success(
+        &fixture
+            .command(&["proj/ep1/alice.wav", "proj/ep1/bob.wav", "-o", "proj/out"])
+            .args(common)
+            .env("TRANSCRIBERRR_NATIVE", &helper)
+            .output()
+            .unwrap(),
+    );
+    let absolute = |name: &str| fixture.0.join(name).display().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_transcriberrr"))
+        .current_dir(fixture.0.join("elsewhere"))
+        .args([
+            absolute("proj/ep1/alice.wav"),
+            absolute("proj/ep1/bob.wav"),
+            "-o".to_owned(),
+            absolute("proj/out"),
+        ])
+        .args(common)
+        .env("TRANSCRIBERRR_NATIVE", &helper)
+        .output()
+        .unwrap();
+    success(&output);
+    assert!(!fixture.0.join("elsewhere/calls.log").exists());
+    assert!(!fixture.0.join("proj/out/ep1 2.merged.json").exists());
+}
+
+#[test]
+fn app_rerun_of_a_manual_session_keeps_another_sessions_transcripts() {
+    let fixture = Fixture::new();
+    let helper = fixture.fake_native_helper();
+    for session in ["A", "B"] {
+        fixture.track(&format!("{session}/ep/alice.wav"));
+        fixture.track(&format!("{session}/ep/bob.wav"));
+    }
+    let run = |session: &str, format: &str, log: &str| {
+        let output = fixture
+            .command(&[
+                &format!("{session}/ep/alice.wav"),
+                &format!("{session}/ep/bob.wav"),
+                "--iso-tracks",
+                "-o",
+                &format!("out-{format}"),
+                "--format",
+                format,
+                "--engine",
+                "apple-native",
+                "--progress-file",
+                log,
+                "--resume",
+            ])
+            .env("TRANSCRIBERRR_NATIVE", &helper)
+            .output()
+            .unwrap();
+        success(&output);
+    };
+    // JSON tells its own merge: a re-run replaces it.
+    run("A", "json", "p1.jsonl");
+    run("A", "json", "p2.jsonl");
+    assert!(fixture.0.join("out-json/ep.merged.json").is_file());
+    assert!(!fixture.0.join("out-json/ep 2.merged.json").exists());
+    // TXT cannot tell whose transcripts these are: another session with the same names
+    // stops at its track files and replaces nothing of the first one's.
+    run("A", "txt", "p3.jsonl");
+    let first = fs::read_to_string(fixture.0.join("out-txt/ep.merged.txt")).unwrap();
+    let track = fs::read_to_string(fixture.0.join("out-txt/alice.txt")).unwrap();
+    let output = fixture
+        .command(&[
+            "B/ep/alice.wav",
+            "B/ep/bob.wav",
+            "--iso-tracks",
+            "-o",
+            "out-txt",
+            "--format",
+            "txt",
+            "--engine",
+            "apple-native",
+            "--progress-file",
+            "p4.jsonl",
+            "--resume",
+        ])
+        .env("TRANSCRIBERRR_NATIVE", &helper)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("output exists"));
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("out-txt/ep.merged.txt")).unwrap(),
+        first
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("out-txt/alice.txt")).unwrap(),
+        track
+    );
+    // The same session, resumed with its own log, still redoes its tracks and merge.
+    run("A", "txt", "p3.jsonl");
 }

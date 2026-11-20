@@ -10,8 +10,9 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use symphonia::core::codecs::CODEC_TYPE_OPUS;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_NULL, CODEC_TYPE_OPUS};
+use symphonia::core::errors::Error as FormatError;
+use symphonia::core::formats::{FormatOptions, FormatReader, Packet};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
@@ -106,6 +107,79 @@ fn is_ogg(path: &Path) -> Result<bool> {
     let mut magic = [0u8; 4];
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     Ok(file.read_exact(&mut magic).is_ok() && &magic == b"OggS")
+}
+
+/// Zoom saves the same AAC audio in the meeting video and its audio-only export.
+/// Compare the complete stream so a renamed video with different audio stays in the queue.
+pub(crate) fn same_aac_audio(left: &Path, right: &Path) -> Result<bool> {
+    fn probe(path: &Path) -> Result<Box<dyn FormatReader>> {
+        let stream = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
+        Ok(get_probe()
+            .format(
+                &Hint::new(),
+                stream,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )?
+            .format)
+    }
+    fn aac_track(reader: &dyn FormatReader) -> Option<&symphonia::core::formats::Track> {
+        let mut tracks = reader.tracks().iter().filter(|track| {
+            track.codec_params.sample_rate.is_some() && track.codec_params.codec != CODEC_TYPE_NULL
+        });
+        let track = tracks.next()?;
+        (track.codec_params.codec == CODEC_TYPE_AAC && tracks.next().is_none()).then_some(track)
+    }
+    fn next_audio(reader: &mut dyn FormatReader, id: u32) -> Result<Option<Packet>> {
+        loop {
+            match reader.next_packet() {
+                Ok(packet) if packet.track_id() == id => return Ok(Some(packet)),
+                Ok(_) => {}
+                Err(FormatError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    let (mut left, mut right) = (probe(left)?, probe(right)?);
+    let (Some(a), Some(b)) = (aac_track(left.as_ref()), aac_track(right.as_ref())) else {
+        return Ok(false);
+    };
+    let (a_id, b_id) = (a.id, b.id);
+    let (a, b) = (&a.codec_params, &b.codec_params);
+    let Some(expected_frames) = a.n_frames else {
+        return Ok(false);
+    };
+    if expected_frames == 0
+        || b.n_frames != Some(expected_frames)
+        || a.time_base.map(|base| (base.numer, base.denom))
+            != b.time_base.map(|base| (base.numer, base.denom))
+        || a.sample_rate != b.sample_rate
+        || a.channels != b.channels
+        || a.extra_data != b.extra_data
+    {
+        return Ok(false);
+    }
+    let mut frames = 0u64;
+    loop {
+        match (
+            next_audio(left.as_mut(), a_id)?,
+            next_audio(right.as_mut(), b_id)?,
+        ) {
+            (Some(a), Some(b)) if a.ts == b.ts && a.dur == b.dur && a.data == b.data => {
+                frames = frames.saturating_add(a.dur);
+                if frames > expected_frames {
+                    return Ok(false);
+                }
+            }
+            (None, None) => return Ok(frames == expected_frames),
+            _ => return Ok(false),
+        }
+    }
 }
 
 /// Rewrap the default Opus track of a Matroska/WebM file as Ogg Opus. Returns `None` when the

@@ -90,7 +90,7 @@ private struct NativeDiarizationMetadata: Codable {
     let speakers: Int?
 }
 
-private let transcriberrrVersion = "0.3.0"
+private let transcriberrrVersion = "0.4.0"
 
 private enum OutputFormat: String {
     case txt, json, srt, vtt
@@ -104,6 +104,7 @@ private enum NativeError: LocalizedError {
     case usage
     case unavailable
     case unsupportedLocale
+    case assetsNotInstalled
     case unsupportedDiarization
     case missingTimestamps
 
@@ -115,6 +116,8 @@ private enum NativeError: LocalizedError {
             return "Apple SpeechTranscriber is unavailable on this Mac or requires macOS 26 or later"
         case .unsupportedLocale:
             return "Apple SpeechTranscriber does not support English (en-US) on this Mac"
+        case .assetsNotInstalled:
+            return "Apple SpeechTranscriber assets are not installed. Run once without --offline to install them."
         case .missingTimestamps:
             return "Apple SpeechTranscriber returned text without word timestamps"
         case .unsupportedDiarization:
@@ -127,9 +130,9 @@ private enum NativeError: LocalizedError {
 struct TranscriberrrNative {
     static func main() async {
         do {
-            let (input, output, format, timestamps) = try parseArguments()
+            let (input, output, format, timestamps, offline) = try parseArguments()
             guard #available(macOS 26.0, *) else { throw NativeError.unavailable }
-            let transcript = try await transcribe(input: input)
+            let transcript = try await transcribe(input: input, offline: offline)
             let data = try render(transcript: transcript, format: format, timestamps: timestamps)
             if let output {
                 try data.write(to: output, options: .atomic)
@@ -143,13 +146,14 @@ struct TranscriberrrNative {
         }
     }
 
-    private static func parseArguments() throws -> (URL, URL?, OutputFormat, TimestampMode) {
+    private static func parseArguments() throws -> (URL, URL?, OutputFormat, TimestampMode, Bool) {
         var arguments = Array(CommandLine.arguments.dropFirst())
         guard let inputPath = arguments.first else { throw NativeError.usage }
         arguments.removeFirst()
         var output: URL?
         var format: OutputFormat = .json
         var timestamps: TimestampMode = .words
+        var offline = false
         while !arguments.isEmpty {
             let option = arguments.removeFirst()
             switch option {
@@ -165,13 +169,15 @@ struct TranscriberrrNative {
                 guard let value = arguments.first, let parsed = TimestampMode(rawValue: value.lowercased()) else { throw NativeError.usage }
                 arguments.removeFirst()
                 timestamps = parsed
+            case "--offline":
+                offline = true
             case "--diarize", "--speakers":
                 throw NativeError.unsupportedDiarization
             default:
                 throw NativeError.usage
             }
         }
-        return (URL(fileURLWithPath: inputPath), output, format, timestamps)
+        return (URL(fileURLWithPath: inputPath), output, format, timestamps, offline)
     }
 
     private static func render(transcript: NativeTranscript, format: OutputFormat, timestamps: TimestampMode) throws -> Data {
@@ -214,7 +220,7 @@ struct TranscriberrrNative {
     }
 
     @available(macOS 26.0, *)
-    private static func transcribe(input: URL) async throws -> NativeTranscript {
+    private static func transcribe(input: URL, offline: Bool) async throws -> NativeTranscript {
         guard SpeechTranscriber.isAvailable else { throw NativeError.unavailable }
         guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) else {
             throw NativeError.unsupportedLocale
@@ -226,7 +232,11 @@ struct TranscriberrrNative {
             reportingOptions: [],
             attributeOptions: [.audioTimeRange, .transcriptionConfidence]
         )
-        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+        if offline {
+            guard await AssetInventory.status(forModules: [transcriber]) == .installed else {
+                throw NativeError.assetsNotInstalled
+            }
+        } else if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
             try await request.downloadAndInstall()
         }
 
@@ -279,12 +289,17 @@ struct TranscriberrrNative {
             if !pendingPrefix.isEmpty { throw NativeError.missingTimestamps }
             return words
         }
-        if let lastSample = try await analyzer.analyzeSequence(from: audioFile) {
+        // No audio (a header-only file) leaves `analyzeSequence` with no last sample, and the
+        // results stream then never ends: waiting on it would hang forever.
+        let words: [NativeWord]
+        if audioFile.length > 0, let lastSample = try await analyzer.analyzeSequence(from: audioFile) {
             try await analyzer.finalizeAndFinish(through: lastSample)
+            words = try await resultTask.value
         } else {
             await analyzer.cancelAndFinishNow()
+            resultTask.cancel()
+            words = []
         }
-        let words = try await resultTask.value
         let text = words.map(\.text).joined()
         let segments = buildSegments(words)
         let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
@@ -293,7 +308,8 @@ struct TranscriberrrNative {
             source: input.path,
             model: "Apple SpeechTranscriber",
             device: "apple-native",
-            language: locale.identifier,
+            // Same label as the other engines (the CLI is English-only).
+            language: "English",
             duration_seconds: duration.isFinite ? duration : (words.last?.end ?? 0),
             text: text,
             segments: segments,
@@ -311,7 +327,8 @@ struct TranscriberrrNative {
 
     private static func iso8601(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        // Whole seconds, like the other engines: merges order `transcribed_at` as text.
+        formatter.formatOptions = [.withInternetDateTime]
         return formatter.string(from: date)
     }
 

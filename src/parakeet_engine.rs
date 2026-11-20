@@ -14,10 +14,6 @@ use parakeet_rs::{
     ExecutionConfig, ExecutionProvider, ParakeetTDT, ParakeetUnified, TimestampMode, Transcriber,
 };
 
-/// Latest English Parakeet Unified ONNX export. The directory must contain
-/// `encoder.onnx`, `decoder_joint.onnx`, and `tokenizer.model`.
-pub const DEFAULT_MODEL_ID: &str = crate::model_cache::PARAKEET_UNIFIED_EN;
-
 /// Longest chunk the Parakeet Unified encoder accepts, with margin below its ~400 s limit.
 const MAX_CHUNK_SECONDS: f32 = 300.0;
 

@@ -55,7 +55,11 @@ fn success(output: Output) {
 #[test]
 fn converts_word_json_to_timestamped_speaker_text_without_models() {
     let f = Fixture::new();
-    success(f.run(&["--format", "txt", "-o", "out.txt"]));
+    let output = f.run(&["--format", "txt", "-o", "out.txt", "--json"]);
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["schema_version"], 1);
+    assert!(event["output"].as_str().unwrap().ends_with("/out.txt"));
+    success(output);
     assert_eq!(
         f.read("out.txt"),
         "[00:00:00.000 --> 00:00:01.000] [Speaker 1] “Hello, world!”\n[00:00:02.000 --> 00:00:03.000] [Speaker 2] Yes—it's me.\n"

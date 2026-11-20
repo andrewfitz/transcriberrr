@@ -69,6 +69,87 @@ fn success(output: &Output) {
 }
 
 #[test]
+fn rejects_multiple_model_results_for_one_manual_track() {
+    let fixture = Fixture::new();
+    let content = fixture
+        .read("andrew.json")
+        .replace("audioAndrewDaniel21067067067", "guest");
+    fs::remove_file(fixture.0.join("andrew.json")).unwrap();
+    fs::remove_file(fixture.0.join("hana.json")).unwrap();
+    fs::write(
+        fixture.0.join("guest.qw.json"),
+        content.replace("test", "Qwen"),
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.join("guest.pk.json"),
+        content.replace("test", "Parakeet"),
+    )
+    .unwrap();
+    let output = fixture.run(&[".", "-o", "combined.json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("same source"));
+    assert!(!fixture.0.join("combined.json").exists());
+}
+
+#[test]
+fn merge_selects_one_model_from_a_multi_pass_folder() {
+    let fixture = Fixture::new();
+    for track in ["andrew", "hana"] {
+        let contents = fixture.read(&format!("{track}.json"));
+        fs::write(
+            fixture.0.join(format!("{track}.qw.json")),
+            contents.replace("test", "Qwen"),
+        )
+        .unwrap();
+        fs::write(
+            fixture.0.join(format!("{track}.pk.json")),
+            contents.replace("test", "Parakeet"),
+        )
+        .unwrap();
+    }
+    let output = fixture.run(&[".", "--model-tag", "pk", "-o", "combined.pk.json", "--json"]);
+    success(&output);
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        event["output"]
+            .as_str()
+            .unwrap()
+            .ends_with("/combined.pk.json")
+    );
+    let result: serde_json::Value =
+        serde_json::from_str(&fixture.read("combined.pk.json")).unwrap();
+    assert_eq!(result["model"], "Parakeet");
+    assert_eq!(
+        result["metadata"]["merged_from"].as_array().unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn rejects_absolute_and_relative_transcripts_of_one_source() {
+    let fixture = Fixture::new();
+    let content = fixture
+        .read("andrew.json")
+        .replace("audioAndrewDaniel21067067067", "guest")
+        .replace(
+            "\"source_modified_at\":null",
+            "\"source_modified_at\":\"2026-10-21T10:00:00Z\"",
+        );
+    fs::remove_file(fixture.0.join("andrew.json")).unwrap();
+    fs::remove_file(fixture.0.join("hana.json")).unwrap();
+    fs::write(
+        fixture.0.join("guest.qw.json"),
+        content.replace("/zoom/Audio Record/guest.m4a", "guest.m4a"),
+    )
+    .unwrap();
+    fs::write(fixture.0.join("guest.pk.json"), &content).unwrap();
+    let output = fixture.run(&[".", "-o", "combined.json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("same source"));
+}
+
+#[test]
 fn merges_zoom_tracks_into_named_speaker_text() {
     let f = Fixture::new();
     let output = f.run(&[

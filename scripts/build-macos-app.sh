@@ -52,11 +52,25 @@ CLI_BIN="$ROOT_DIR/target/release/transcriberrr"
 [[ -x "$NATIVE_BIN" ]] || { echo "Native Speech helper not found: $NATIVE_BIN" >&2; exit 1; }
 [[ -x "$CLI_BIN" ]] || { echo "Rust CLI binary not found: $CLI_BIN" >&2; exit 1; }
 
+ICON_WORK="$(mktemp -d "${TMPDIR:-/tmp}/transcriberrr-icon.XXXXXX")"
+trap 'rm -rf "$ICON_WORK"' EXIT
+ICON_SET="$ICON_WORK/AppIcon.iconset"
+mkdir "$ICON_SET"
+for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$UI_DIR/Resources/AppIcon.png" \
+        --out "$ICON_SET/icon_${size}x${size}.png" >/dev/null
+    retina=$((size * 2))
+    sips -z "$retina" "$retina" "$UI_DIR/Resources/AppIcon.png" \
+        --out "$ICON_SET/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil --convert icns --output "$ICON_WORK/AppIcon.icns" "$ICON_SET"
+
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Helpers" "$APP_DIR/Contents/Resources"
 cp "$UI_BIN" "$APP_DIR/Contents/MacOS/Transcriberrr"
 cp "$CLI_BIN" "$APP_DIR/Contents/Helpers/transcriberrr"
 cp "$NATIVE_BIN" "$APP_DIR/Contents/Helpers/transcriberrr-native"
+cp "$ICON_WORK/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 chmod 755 "$APP_DIR/Contents/MacOS/Transcriberrr" "$APP_DIR/Contents/Helpers/transcriberrr" "$APP_DIR/Contents/Helpers/transcriberrr-native"
 cp "$UI_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP_DIR/Contents/Info.plist"

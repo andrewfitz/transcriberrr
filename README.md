@@ -4,13 +4,13 @@ Offline English transcription for Apple Silicon Macs. Transcriberrr ships a nati
 
 ## Features
 
-- Qwen3-ASR 1.7B (default), the latest English Parakeet Unified 0.6B export, or Apple SpeechTranscriber (macOS 26+).
+- Qwen3-ASR 1.7B (default), English Parakeet Unified 0.6B, or Apple SpeechTranscriber (macOS 26+). Run several models over the same inputs and save a separate transcript for each pass.
 - Metal GPU execution on Apple Silicon, with a CPU fallback for the Rust engines.
 - Compact word-level JSON, sentence/segment or word timestamps in TXT, SRT, and WebVTT, and plain TXT.
 - Convert saved transcript JSON between formats offline, without loading audio or models.
 - Optional Sortformer speaker diarization, including a per-job speaker limit.
 - Per-speaker tracks (Zoom participant files and other iso tracks): transcribed together with other speakers' bleed muted, then merged into one transcript with named speakers. Hand over a whole Zoom library folder to get one transcript per meeting. Reruns pick up only missing transcripts.
-- Single files, recursive folders, JSON manifests, resumable JSONL progress, and output beside the source or in one destination folder.
+- Single files, recursive folders, JSON manifests, resumable JSONL progress, and output beside the source or in one destination folder. The CLI can preview jobs without writes and stream machine-readable results.
 - Native SwiftUI queue with folder drop, regex filtering, visible Check all/None, per-track diarization, saved queue results, elapsed time and ETA per track and selected queue, and a visible model setup/download activity window.
 
 ## Install a GitHub release
@@ -61,6 +61,58 @@ The build script refuses non-`Darwin arm64` hosts. For a CLI-only build, use `ca
 
 Use `--help` for all options. `--model-status` reports the local cache without network access. `--download-model qwen3-asr-1.7b` (repeat the flag for multiple models) prefetches model files. For a complete Rust-engine setup, use `--download-model qwen3-asr-1.7b --download-model qwen3-forced-aligner-0.6b --download-model parakeet-v3 --download-model sortformer-4spk`. Set `--model-cache PATH` or `TRANSCRIBERRR_MODEL_CACHE` to change the cache location. The default is `~/Library/Application Support/Transcriberrr/models/hub`.
 
+## CLI automation
+
+Use `./target/release/transcriberrr` from a source build or the CLI embedded in the app bundle at `Contents/Helpers/transcriberrr`. The bundled executable finds the Apple SpeechTranscriber helper beside it. Invoke it with an argument list so paths with spaces and Unicode are passed intact.
+
+```bash
+TRANSCRIBERRR="$PWD/dist/Transcriberrr.app/Contents/Helpers/transcriberrr"
+
+"$TRANSCRIBERRR" capabilities
+"$TRANSCRIBERRR" --cached-model qwen3-asr-1.7b --cached-model forced-aligner --cached-model parakeet-v3
+
+# Preview the exact inputs, output paths and models for each pass.
+"$TRANSCRIBERRR" --input-dir "$HOME/Documents/Zoom" -o transcripts \
+  --pass qwen3 --pass parakeet --offline --plan
+
+# Run the same queue and save structured progress and results.
+"$TRANSCRIBERRR" --input-dir "$HOME/Documents/Zoom" -o transcripts \
+  --pass qwen3 --pass parakeet --offline --progress-file logs/zoom.jsonl --resume \
+  --jsonl > events.jsonl
+
+# Apply per-recording options from stdin.
+printf '%s\n' '{"items":[{"input":"Voice Memo.qta","output":"notes.json","diarize":false}]}' \
+  | "$TRANSCRIBERRR" --manifest - --plan
+```
+
+- `capabilities` reports the binary version, engine names and aliases, compiled features, model defaults, supported file extensions, output formats and automation flags. Use `--model-status` for the known model catalog and `--cached-model ID` for explicit Hub IDs, aliases or local paths. `--print-model-tag --engine ENGINE [--model MODEL]` prints the identifier used in filenames.
+- `--plan` emits one JSON object on stdout and does not run inference, fetch assets, or write files. With `--pass`, the object contains `passes` in execution order. Check each plan’s `issues`, `summary.rejected_inputs` and `files[].error` before running. `files[].skip` gives the reason an input was left out, `done` marks reused outputs, and `meetings[].output` contains the single merged destination for a Zoom meeting with separate speaker tracks. `required_models` lists the Rust assets needed by pending jobs and whether each resolves locally. Apple checks its speech assets when the helper runs.
+- `--jsonl` streams `run_started`, `pass_started`, `progress`, `pass_finished` and `run_finished` events on stdout. Each line has `schema_version: 1`. A `progress` event has `input`, `status` and a `pass` with its one-based `index`, `engine`, `model` and `model_tag`. A `completed` or `skipped` progress event with an `output` names a saved or reused transcript. `kind: "merge"` identifies a merged result. Check `warning` for details such as no speech or partial participant coverage, and `error` for failures. Terminal events report `completed`, `failed` or `canceled`. Use the process exit status as well. Argument errors and abrupt termination can end a process before a terminal event, and nonzero exit can still leave usable outputs from successful jobs. Diagnostics go to stderr.
+- `--offline` prevents automatic model downloads and cache repairs. Prefetch Rust assets with `--download-model` in a separate invocation. Apple SpeechTranscriber requires an installed speech asset when running offline. A pass that can reuse every destination needs no inference assets.
+- For recurring scans, `--skip-existing` reuses existing ordinary transcript files. Zoom and `--pass` runs already reuse existing destinations by default. `--progress-file PATH --resume` also reuses completed outputs at the path recorded in the log when the file is still present. With `--pass`, `logs/zoom.jsonl` becomes `logs/zoom.qw.jsonl`, `logs/zoom.pk.jsonl`, and so on. Keep one writer per progress log. Use `--overwrite` to reprocess existing destinations.
+- A manifest accepts `items` plus optional `discover_zoom` and `excluded_inputs`. Set `discover_zoom` to `false` to prevent adding unlisted Zoom companions. `excluded_inputs` blocks those paths from automatic companion discovery. An item accepts `input` and optional `diarize`, `speakers`, `iso_track`, `output`, `output_dir`, and `output_location` (`folder` or `next-to-source`). Relative paths in a manifest file resolve beside that file. Paths in a manifest from stdin resolve from the working directory. The same manifest can be sent with several model passes.
+- `convert --json` and `merge --json` return a JSON object with the saved absolute `output` path. For a folder of per-track transcripts from multiple passes, add `merge --model-tag qw` to select only the `.qw.json` files.
+
+## Model passes
+
+```bash
+# Write interview.qw.json and interview.pk.json, reusing any existing result
+./target/release/transcriberrr interview.wav --pass qwen3 --pass parakeet
+
+# Compare two Qwen models on a Zoom library
+./target/release/transcriberrr ~/Documents/Zoom -o transcripts \
+  --pass qwen3 --pass qwen3=qwen3-asr-0.6b
+
+# Add the Parakeet identifier to a single-model run
+./target/release/transcriberrr interview.wav --engine parakeet --model-suffix
+```
+
+Passes run in the order given. Each processes the whole selection and writes its own transcript, reusing existing results unless you request `--overwrite`. Zoom meetings with participant audio get one merged transcript per pass, such as `MEETING.merged.qw.json`. The default model identifiers are `qw` for Qwen3, `pk` for Parakeet, and `ap` for Apple SpeechTranscriber. Qwen 0.6B uses `qw06`, Parakeet TDT uses `pkt`, and custom models get an identifier derived from their model ID or local path.
+
+Use `--pass ENGINE=MODEL` to override a model. With multiple passes, `--plan` returns a plan for each model and `--progress-file run.jsonl` writes a log such as `run.qw.jsonl` for each model.
+
+On macOS, open **Run Settings** in the inspector and choose **Edit Passes…** to set the engine and model for each pass, add passes, or change their order. Select a recording to see its saved transcripts in the inspector and reveal them in Finder. Multi-model runs append the model identifiers automatically and reuse finished outputs. For a single pass, enable **Append model ID to filenames** in the pass editor.
+
 ## Convert a transcript
 
 ```bash
@@ -105,7 +157,7 @@ Add a Zoom library, a meeting folder, or an individual Zoom export in the app or
 ./target/release/transcriberrr --iso-tracks podcast/host.wav podcast/guest.wav -o transcripts
 ```
 
-- With participant audio, the CLI transcribes each track with bleed reduction and merges them by timestamp into one speaker-labeled transcript. It skips the meeting's matching videos and mixed audio. If Zoom saved just one participant's audio, the transcript covers that participant and the app and CLI flag the limited coverage. Reconnected participants keep the same speaker name. When Zoom restarted a recording, its participant parts are joined by segment.
+- With participant audio, the CLI transcribes each track with bleed reduction and merges them by timestamp into one speaker-labeled transcript. It skips the meeting's matching videos and mixed audio, including renamed videos whose AAC audio matches the mixed export. If Zoom saved just one participant's audio, the transcript covers that participant and the app and CLI flag the limited coverage. Reconnected participants keep the same speaker name. When Zoom restarted a recording, its participant parts are joined by segment.
 - For meetings with no participant tracks, the CLI picks one export per recording segment, using mixed audio when available and video to fill the other segments. The joined transcript can use diarization. If the folder contains multiple meeting IDs, an export without an ID is reported as ambiguous. A Zoom recording still being converted is deferred while its folder holds raw `.zoom` files.
 - Zoom destinations are stable across bulk and individual runs. A shared output folder gets a subfolder for each meeting, named with the meeting name and a stable identifier, containing `MEETING.merged.EXT` for participant tracks. With `--output-location next-to-source`, the merged file is `MEETING [ID].merged.EXT`. The CLI skips Zoom work automatically when the destination file for the requested format exists. To redo a meeting, including one with newly added tracks, delete that output or use `--overwrite`.
 - `--plan` lists what will run, which recordings will be skipped, and where transcripts will be written, then exits before loading models. `--input-dir` discovers nested Zoom meetings by default. Add `--recursive` to also include other audio in subfolders.
@@ -113,7 +165,7 @@ Add a Zoom library, a meeting folder, or an individual Zoom export in the app or
 
 Each mic also picks up the other speakers, quieter, and a recognizer transcribes that too, so a plain merge shows every sentence twice. Before transcribing, the tracks are compared every 20 ms: for each pair, the bleed is measured from moments when one speaker clearly leads (more than 10 dB louder than every other track), and a frame is muted, to exact silence, when another track is louder by about that much (within 6 dB, and never less than 8 dB). This absorbs mic gains, distances, and loud or soft talkers, and passes overlapping speech and interjections, which are loud on their own mic. Reverberation is handled too: muting continues while a muted stretch keeps fading after the other speaker stops, and short gaps in the bleed between their words are muted unless they get louder than it. Words timed wholly inside muted audio are dropped, and so are runs of three or more words the aligner put at a single instant: on the scraps of audio a muted track leaves, Qwen3 sometimes invents a sentence that matches nothing in the audio. With Qwen3 and Parakeet, muted stretches longer than 2 s (the other speakers' turns) are cut down to a half-second pause before transcription and the words put back in place; this makes Parakeet about 40% faster on a real three-person Zoom meeting, with no measurable change in accuracy, and makes no measurable difference to Qwen3. The Apple engine transcribes the whole muted track. Measured on synthetic two- and three-speaker sessions with all three engines, bleed at -12 to -18 dB, with or without room reverberation, came out once per sentence under the right speaker, and a listener's track carrying only bleed came out empty. On a real 2.6-hour, three-person Zoom meeting (with a reconnect and a restarted recording), 8 of about 19,900 words came out under two speakers; diarizing the meeting's mixed recording instead put 98.7–99.3% of words under the right speaker, while the speaker tracks also keep overlapping speech the mixed recording loses. Bleed within about 8 dB of a speaker's own level (mics that hear everyone almost equally) cannot be separated this way.
 
-The macOS queue shows an expandable row for each Zoom meeting with participant tracks. Select the entire meeting with its checkbox. Expand it to see the named tracks and the reason each mixed export was skipped. The row shows merge progress and opens the finished transcript in Finder. Use the “Speaker track” control to mark individual files from other recording tools.
+The macOS queue shows an expandable row for each Zoom meeting with participant tracks. Use the meeting’s checkbox to include it in a run. Expand the row to see the named tracks and why each mixed export was skipped. Select the meeting to see merge progress and reveal the saved transcripts in Finder. For recordings from other tools, select an individual file and enable **Speaker track** in the **Recording** inspector.
 
 ### Merge saved transcripts
 
@@ -154,7 +206,9 @@ The ONNX graph must be a Sortformer v3 export with `preds_diar` and `preds_hires
 
 ## Model and audio notes
 
-Supported inputs are AAC, AIFF/AIF, CAF, FLAC, M4A/M4B, MP3, MP4/M4V/MOV (audio track), OGG, Opus, WAV, and WebM (including video recordings; the audio track is used). Qwen3-ASR and the forced aligner are downloaded from their Hugging Face repositories. The default Parakeet engine uses the newer English Unified model, [nvidia/parakeet-unified-en-0.6b](https://huggingface.co/nvidia/parakeet-unified-en-0.6b), through the Rust-compatible [eschmidbauer/parakeet-unified-en-0.6b-onnx](https://huggingface.co/eschmidbauer/parakeet-unified-en-0.6b-onnx) export. The previous TDT v3 export remains available for compatibility with `--engine parakeet-v3 --model istupakov/parakeet-tdt-0.6b-v3-onnx`. Sortformer and Parakeet exports are third-party artifacts; review and accept each repository license before downloading or redistributing them. Transcriberrr does not bundle model weights or grant rights to redistribute them. Source code is MIT licensed; see [LICENSE](LICENSE).
+Supported inputs are AAC, AIFF/AIF, CAF, FLAC, M4A/M4B, MP3, MP4/M4V/MOV (audio track), OGG, Opus, QTA (Apple Voice Memos), WAV, and WebM (audio track). QTA uses one playback-compatible track. To transcribe a mix of all layers and effects in an editable Voice Memo, use Voice Memos’ Rendered export. [Apple’s Voice Memos export guide](https://support.apple.com/en-gw/guide/iphone/iph3d6dc359/ios)
+
+Qwen3-ASR and the forced aligner are downloaded from their Hugging Face repositories. The default Parakeet engine uses the newer English Unified model, [nvidia/parakeet-unified-en-0.6b](https://huggingface.co/nvidia/parakeet-unified-en-0.6b), through the Rust-compatible [eschmidbauer/parakeet-unified-en-0.6b-onnx](https://huggingface.co/eschmidbauer/parakeet-unified-en-0.6b-onnx) export. The previous TDT v3 export remains available for compatibility with `--engine parakeet-v3 --model istupakov/parakeet-tdt-0.6b-v3-onnx`. Sortformer and Parakeet exports are third-party artifacts; review and accept each repository license before downloading or redistributing them. Transcriberrr does not bundle model weights or grant rights to redistribute them. Source code is MIT licensed; see [LICENSE](LICENSE).
 
 The Rust Qwen and Parakeet backends use Metal; they do not use the Apple Neural Engine. `--device coreml` reports an explicit unsupported-device error for those engines. Apple-native mode uses Apple on-device Speech framework.
 

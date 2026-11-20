@@ -126,6 +126,7 @@ pub(crate) struct Timeline {
 
 impl Timeline {
     /// A time in the cut-down track, in seconds, on the track's own timeline.
+    #[cfg(test)]
     pub(crate) fn original(&self, seconds: f32) -> f32 {
         let rate = TARGET_SAMPLE_RATE as f32;
         let at = (seconds.max(0.0) * rate) as usize;
@@ -136,6 +137,30 @@ impl Timeline {
             }
             None => seconds,
         }
+    }
+
+    /// A span in the cut-down track on the track's own timeline. Both ends are mapped through
+    /// the piece holding the span's midpoint (clamped to that piece), so a word reaching across
+    /// a cut is not stretched over the whole muted stretch the cut removed.
+    pub(crate) fn original_span(&self, start: f32, end: f32) -> (f32, f32) {
+        let rate = TARGET_SAMPLE_RATE as f32;
+        let end = end.max(start);
+        let at = ((start + end) / 2.0 * rate).max(0.0) as usize;
+        let piece = self.pieces.partition_point(|&(compact, _)| compact <= at);
+        let Some(index) = piece.checked_sub(1) else {
+            return (start, end);
+        };
+        let (compact, original) = self.pieces[index];
+        let first = compact as f32 / rate;
+        let last = self
+            .pieces
+            .get(index + 1)
+            .map_or(f32::INFINITY, |&(next, _)| next as f32 / rate);
+        let map = |seconds: f32| {
+            let seconds = seconds.clamp(first, last);
+            (original as f32 + (seconds * rate - compact as f32)) / rate
+        };
+        (map(start), map(end))
     }
 }
 
@@ -374,6 +399,30 @@ mod tests {
         let seconds = |samples: usize| samples as f32 / RATE as f32;
         assert!((timeline.original(2.0 + seconds(2 * pause) + 0.2) - 10.2).abs() < 1e-3);
         assert!((timeline.original(4.0 + seconds(2 * pause) - 0.1) - 11.9).abs() < 1e-3);
+        // A word ending at or past the cut stays in its own piece, not after the muted stretch.
+        let boundary = 2.0 + seconds(pause);
+        for end in [boundary, boundary + 0.06] {
+            let (start, end) = timeline.original_span(1.8, end);
+            assert!((start - 1.8).abs() < 1e-3);
+            assert!((end - boundary).abs() < 1e-3, "end {end}");
+            assert!(!mask.mutes(start, end));
+        }
+        let (start, end) = timeline.original_span(
+            2.0 + seconds(2 * pause) + 0.2,
+            2.0 + seconds(2 * pause) + 0.5,
+        );
+        assert!((start - 10.2).abs() < 1e-3 && (end - 10.5).abs() < 1e-3);
+        // The next turn's first word, started early in the pause, stays with its turn.
+        let (start, end) = timeline.original_span(boundary - 0.04, boundary + 0.66);
+        assert!(
+            (start - (10.0 - seconds(pause))).abs() < 1e-3,
+            "start {start}"
+        );
+        assert!(
+            (end - (10.0 - seconds(pause) + 0.66)).abs() < 1e-3,
+            "end {end}"
+        );
+        assert!(!mask.mutes(start, end));
         // Nothing muted: nothing cut.
         let (same, timeline) = Mask::default().cut(&samples);
         assert_eq!(same.len(), samples.len());
