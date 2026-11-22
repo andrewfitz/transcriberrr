@@ -1,0 +1,14 @@
+{"type":"transcriberrr.track.register","track_id":"track-1","start_frame":0}
+{"type":"transcriberrr.track.append","track_id":"track-1","start_frame":0,"audio_frames":2400}
+{"type":"transcriberrr.track.register","track_id":"track-2","start_frame":28800}
+{"type":"transcriberrr.track.append","track_id":"track-1","start_frame":28800,"audio_frames":2400}
+{"type":"transcriberrr.track.append","track_id":"track-2","start_frame":28800,"audio_frames":2400}
+{"type":"transcriberrr.track.append","track_id":"track-1","start_frame":31200,"audio_frames":2400}
+{"type":"transcriberrr.track.append","track_id":"track-2","start_frame":31200,"audio_frames":2400}
+{"type":"transcriberrr.track.append","track_id":"track-1","start_frame":124800,"audio_frames":2400}
+{"type":"transcriberrr.track.append","track_id":"track-2","start_frame":124800,"audio_frames":2400}
+{"type":"transcriberrr.session.resume","last_sequence":5}
+{"type":"transcriberrr.track.append","track_id":"track-1","start_frame":124800,"audio_frames":2400}
+{"type":"transcriberrr.track.append","track_id":"track-2","start_frame":124800,"audio_frames":2400}
+{"type":"transcriberrr.track.append","track_id":"track-1","start_frame":127200,"audio_frames":2400}
+{"type":"transcriberrr.track.append","track_id":"track-2","start_frame":127200,"audio_frames":2400}

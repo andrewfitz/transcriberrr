@@ -15,59 +15,88 @@ const FRAMES_PER_SECOND: f32 = 50.0;
 /// the other tracks carry only their bleed. Also the muting threshold for a pair of tracks
 /// whose bleed could not be measured. A lav or headset mic picks up a speaker a metre or two
 /// away 15-35 dB down.
-const MARGIN_DB: f32 = 10.0;
+pub(crate) const MARGIN_DB: f32 = 10.0;
 /// A frame is bleed when the leading track is louder by at least the measured bleed less
 /// this much (frame-to-frame spread of the level difference). Someone talking over another
 /// raises their own mic far above the bleed level, so they stay.
-const TOLERANCE_DB: f32 = 6.0;
+pub(crate) const TOLERANCE_DB: f32 = 6.0;
 /// Never mute a frame less than this much quieter than the other track.
-const LOWEST_THRESHOLD_DB: f32 = 8.0;
+pub(crate) const LOWEST_THRESHOLD_DB: f32 = 8.0;
 /// The louder track must also be this far above its own noise floor, i.e. actually speaking,
 /// so a noisy track cannot mute a quiet speaker.
-const ACTIVE_DB: f32 = 15.0;
+pub(crate) const ACTIVE_DB: f32 = 15.0;
 /// Floors lower than this are digital silence (Zoom pads absent participants' tracks).
-const LOWEST_FLOOR_DB: f32 = -70.0;
-const SILENCE_DB: f32 = -120.0;
+pub(crate) const LOWEST_FLOOR_DB: f32 = -70.0;
+pub(crate) const SILENCE_DB: f32 = -120.0;
 /// Muted frames this close to a track's own speech are kept, so quiet word onsets and tails
 /// under another speaker survive (120 ms; longer lets the end of the other speaker's last word
 /// through at a turn change).
-const HOLD_FRAMES: usize = 6;
+pub(crate) const HOLD_FRAMES: usize = 6;
 /// After another speaker's bleed ends, their room's reverberation lingers on this mic while
 /// their own close mic has gone quiet, so level comparison cannot see it. Keep muting for up
 /// to 500 ms while this track's level keeps falling; speech of its own rises.
-const RELEASE_FRAMES: usize = 25;
-const RELEASE_RISE_DB: f32 = 3.0;
+pub(crate) const RELEASE_FRAMES: usize = 25;
+pub(crate) const RELEASE_RISE_DB: f32 = 3.0;
 /// Between another speaker's words their own mic dips while their reverberation still fills
 /// this one, leaving holes in the bleed that a forced aligner then times words into. Holes up
 /// to 400 ms are muted too when they get no louder than the bleed around them (half a second
 /// either side); this speaker's own interjection is much louder than bleed on their own mic.
-const HOLE_FRAMES: usize = 20;
-const HOLE_CONTEXT_FRAMES: usize = 25;
+pub(crate) const HOLE_FRAMES: usize = 20;
+pub(crate) const HOLE_CONTEXT_FRAMES: usize = 25;
 /// Gain ramp at mute boundaries (10 ms), so cuts do not click.
-const RAMP_SAMPLES: f32 = 160.0;
+const RAMP_SAMPLES: usize = (TARGET_SAMPLE_RATE / 100) as usize;
 /// Measuring a pair's bleed takes a second of frames where one of them leads.
-const MIN_LEAD_FRAMES: usize = 50;
+pub(crate) const MIN_LEAD_FRAMES: usize = 50;
 
-/// Loudness per 20 ms frame, in dB, above ~150 Hz (the voice detector's high-pass), so mains
-/// hum and rumble do not count as level.
+/// Stateful RMS meter with a ~150 Hz high pass. One state can measure
+/// consecutive analysis frames, including frames split across packets.
+pub(crate) struct LevelMeter {
+    pole: f32,
+    previous_input: f32,
+    previous_output: f32,
+    energy: f64,
+    count: usize,
+}
+
+impl LevelMeter {
+    pub(crate) fn new(sample_rate: u32) -> Self {
+        Self {
+            pole: 0.943_f32.powf(TARGET_SAMPLE_RATE as f32 / sample_rate as f32),
+            previous_input: 0.0,
+            previous_output: 0.0,
+            energy: 0.0,
+            count: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, sample: f32) {
+        self.previous_output = sample - self.previous_input + self.pole * self.previous_output;
+        self.previous_input = sample;
+        self.energy += f64::from(self.previous_output).powi(2);
+        self.count += 1;
+    }
+
+    pub(crate) fn finish_frame(&mut self) -> Option<f32> {
+        if self.count == 0 {
+            return None;
+        }
+        let mean = self.energy / self.count as f64;
+        self.energy = 0.0;
+        self.count = 0;
+        Some((10.0 * mean.log10()).max(f64::from(SILENCE_DB)) as f32)
+    }
+}
+
+/// Loudness per 20 ms frame, in dB.
 pub(crate) fn frame_levels(samples: &[f32]) -> Vec<f32> {
-    let mut previous_input = 0.0f32;
-    let mut previous_output = 0.0f32;
+    let mut meter = LevelMeter::new(TARGET_SAMPLE_RATE);
     samples
         .chunks(FRAME_SAMPLES)
         .map(|frame| {
-            let mut energy = 0.0f64;
             for &sample in frame {
-                previous_output = sample - previous_input + 0.943 * previous_output;
-                previous_input = sample;
-                energy += f64::from(previous_output).powi(2);
+                meter.push(sample);
             }
-            let mean = energy / frame.len() as f64;
-            if mean > 0.0 {
-                ((10.0 * mean.log10()) as f32).max(SILENCE_DB)
-            } else {
-                SILENCE_DB
-            }
+            meter.finish_frame().expect("nonempty sample frame")
         })
         .collect()
 }
@@ -85,27 +114,39 @@ impl Mask {
 
     /// Silence muted frames exactly, with short ramps at the edges.
     pub(crate) fn apply(&self, samples: &mut [f32]) {
-        let mut gain = 1.0f32;
-        for (index, sample) in samples.iter_mut().enumerate() {
-            let muted = self
-                .muted
-                .get(index / FRAME_SAMPLES)
-                .copied()
-                .unwrap_or(false);
-            gain = if muted {
-                (gain - 1.0 / RAMP_SAMPLES).max(0.0)
-            } else {
-                (gain + 1.0 / RAMP_SAMPLES).min(1.0)
-            };
-            *sample *= gain;
+        if self.muted.is_empty() {
+            return;
+        }
+        let mut gain = RAMP_SAMPLES;
+        for (index, frame) in samples.chunks_mut(FRAME_SAMPLES).enumerate() {
+            let muted = self.muted.get(index).copied().unwrap_or(false);
+            let ramp_len = if muted { gain } else { RAMP_SAMPLES - gain }.min(frame.len());
+            let (ramp, steady) = frame.split_at_mut(ramp_len);
+            for sample in ramp {
+                if muted {
+                    gain -= 1;
+                } else {
+                    gain += 1;
+                }
+                *sample *= gain as f32 / RAMP_SAMPLES as f32;
+            }
+            if muted {
+                steady.fill(0.0);
+            }
         }
     }
 
     /// Whether every frame of a span is muted, so a word timed there is not this speaker's.
     pub(crate) fn mutes(&self, start: f32, end: f32) -> bool {
+        if !start.is_finite() || !end.is_finite() {
+            return false;
+        }
         let first = (start.max(0.0) * FRAMES_PER_SECOND).floor() as usize;
-        let last = ((end.max(start) * FRAMES_PER_SECOND).ceil() as usize).max(first + 1);
-        last <= self.muted.len() && self.muted[first..last].iter().all(|&muted| muted)
+        let last =
+            ((end.max(start) * FRAMES_PER_SECOND).ceil() as usize).max(first.saturating_add(1));
+        first < last
+            && last <= self.muted.len()
+            && self.muted[first..last].iter().all(|&muted| muted)
     }
 }
 
@@ -177,26 +218,27 @@ impl Mask {
         };
         let mut frame = 0;
         let mut from = 0;
-        while frame < self.muted.len() {
+        let sample_frames = samples.len().div_ceil(FRAME_SAMPLES);
+        let masked_frames = self.muted.len().min(sample_frames);
+        while frame < masked_frames {
             if !self.muted[frame] {
                 frame += 1;
                 continue;
             }
             let start = frame;
-            while frame < self.muted.len() && self.muted[frame] {
+            while frame < masked_frames && self.muted[frame] {
                 frame += 1;
             }
             if frame - start > CUT_FRAMES {
                 // No pause is needed before the first word or after the last.
                 let first = if start == 0 { 0 } else { start + PAUSE_FRAMES };
-                let last = if frame == self.muted.len() {
-                    usize::MAX / FRAME_SAMPLES
+                let last = if frame == sample_frames {
+                    samples.len()
                 } else {
-                    frame - PAUSE_FRAMES
+                    (frame - PAUSE_FRAMES) * FRAME_SAMPLES
                 };
-                let cut = first * FRAME_SAMPLES..last * FRAME_SAMPLES;
-                keep(from..cut.start.min(samples.len()));
-                from = cut.end.min(samples.len());
+                keep(from..first * FRAME_SAMPLES);
+                from = last;
             }
         }
         keep(from..samples.len());
@@ -210,13 +252,12 @@ impl Mask {
     }
 }
 
-fn percentile(values: &[f32], fraction: f32) -> f32 {
+pub(crate) fn percentile(values: &mut [f32], fraction: f32) -> f32 {
     if values.is_empty() {
         return SILENCE_DB;
     }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f32::total_cmp);
-    sorted[((sorted.len() - 1) as f32 * fraction).round() as usize]
+    let rank = ((values.len() - 1) as f32 * fraction).round() as usize;
+    *values.select_nth_unstable_by(rank, f32::total_cmp).1
 }
 
 /// Bleed masks for the tracks of one session, from their `frame_levels`. `starts` places
@@ -249,12 +290,12 @@ pub(crate) fn masks(levels: &[Vec<f32>], starts: &[f32]) -> Vec<Mask> {
     let floors = levels
         .iter()
         .map(|track| {
-            let heard = track
+            let mut heard = track
                 .iter()
                 .copied()
                 .filter(|&level| level > SILENCE_DB)
                 .collect::<Vec<_>>();
-            percentile(&heard, 0.1).max(LOWEST_FLOOR_DB)
+            percentile(&mut heard, 0.1).max(LOWEST_FLOOR_DB)
         })
         .collect::<Vec<_>>();
     let active = |track: usize, frame: usize| level(track, frame) > floors[track] + ACTIVE_DB;
@@ -282,13 +323,13 @@ pub(crate) fn masks(levels: &[Vec<f32>], starts: &[f32]) -> Vec<Mask> {
     // threshold[speaker][track]: how much louder the speaker's track must be for a frame of
     // `track` to be that speaker's bleed.
     let threshold = differences
-        .iter()
+        .into_iter()
         .map(|pairs| {
             pairs
-                .iter()
-                .map(|values| {
+                .into_iter()
+                .map(|mut values| {
                     if values.len() >= MIN_LEAD_FRAMES {
-                        (percentile(values, 0.5) - TOLERANCE_DB).max(LOWEST_THRESHOLD_DB)
+                        (percentile(&mut values, 0.5) - TOLERANCE_DB).max(LOWEST_THRESHOLD_DB)
                     } else {
                         MARGIN_DB
                     }
@@ -299,12 +340,13 @@ pub(crate) fn masks(levels: &[Vec<f32>], starts: &[f32]) -> Vec<Mask> {
 
     (0..tracks)
         .map(|track| {
-            let length = levels[track].len();
+            let own_levels = &levels[track];
+            let length = own_levels.len();
             // By this track's own frame.
             let offset = offsets[track];
             let mut muted = (0..length)
                 .map(|frame| {
-                    let own = level(track, offset + frame);
+                    let own = own_levels[frame];
                     (0..tracks).any(|other| {
                         other != track
                             && active(other, offset + frame)
@@ -315,14 +357,13 @@ pub(crate) fn masks(levels: &[Vec<f32>], starts: &[f32]) -> Vec<Mask> {
             let mut frame = 1;
             while frame < length {
                 if muted[frame - 1] && !muted[frame] {
-                    let start = level(track, offset + frame - 1);
+                    let start = own_levels[frame - 1];
                     let mut next = frame;
                     while next < length
                         && next < frame + RELEASE_FRAMES
                         && !muted[next]
-                        && level(track, offset + next) <= start
-                        && level(track, offset + next)
-                            <= level(track, offset + next - 1) + RELEASE_RISE_DB
+                        && own_levels[next] <= start
+                        && own_levels[next] <= own_levels[next - 1] + RELEASE_RISE_DB
                     {
                         muted[next] = true;
                         next += 1;
@@ -346,23 +387,22 @@ pub(crate) fn masks(levels: &[Vec<f32>], starts: &[f32]) -> Vec<Mask> {
                 if start == 0 || frame == length || frame - start > HOLE_FRAMES {
                     continue;
                 }
-                let loudest = |frames: &mut dyn Iterator<Item = usize>| {
-                    frames
-                        .map(|frame| level(track, offset + frame))
-                        .fold(SILENCE_DB, f32::max)
-                };
-                let bleed = loudest(
-                    &mut (start.saturating_sub(HOLE_CONTEXT_FRAMES)..start)
-                        .chain(frame..(frame + HOLE_CONTEXT_FRAMES).min(length))
-                        .filter(|&frame| muted[frame]),
-                );
-                if loudest(&mut (start..frame)) <= bleed {
+                let bleed = (start.saturating_sub(HOLE_CONTEXT_FRAMES)..start)
+                    .chain(frame..(frame + HOLE_CONTEXT_FRAMES).min(length))
+                    .filter(|&frame| muted[frame])
+                    .map(|frame| own_levels[frame])
+                    .fold(SILENCE_DB, f32::max);
+                let hole = own_levels[start..frame]
+                    .iter()
+                    .copied()
+                    .fold(SILENCE_DB, f32::max);
+                if hole <= bleed {
                     muted[start..frame].fill(true);
                 }
             }
             // Keep muted frames next to this track's own (kept, active) speech.
             let speaking = (0..length)
-                .map(|frame| !muted[frame] && active(track, offset + frame))
+                .map(|frame| !muted[frame] && own_levels[frame] > floors[track] + ACTIVE_DB)
                 .collect::<Vec<_>>();
             for (frame, muted) in muted.iter_mut().enumerate() {
                 let near = frame.saturating_sub(HOLD_FRAMES)..(frame + HOLD_FRAMES + 1).min(length);
@@ -433,6 +473,41 @@ mod tests {
         let (audio, timeline) = Mask { muted }.cut(&samples);
         assert_eq!(audio.len(), pause + 2 * RATE + pause);
         assert!((timeline.original(seconds(pause) + 0.5) - 6.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn muting_ramps_reach_exact_silence_and_restore_full_gain() {
+        let mask = Mask { muted: vec![true] };
+        let mut samples = vec![1.0; 2 * FRAME_SAMPLES];
+        mask.apply(&mut samples);
+
+        assert_eq!(samples[0], (RAMP_SAMPLES - 1) as f32 / RAMP_SAMPLES as f32);
+        assert!(
+            samples[RAMP_SAMPLES - 1..FRAME_SAMPLES]
+                .iter()
+                .all(|&sample| sample == 0.0)
+        );
+        assert_eq!(samples[FRAME_SAMPLES], 1.0 / RAMP_SAMPLES as f32);
+        assert!(
+            samples[FRAME_SAMPLES + RAMP_SAMPLES - 1..]
+                .iter()
+                .all(|&sample| sample == 1.0)
+        );
+    }
+
+    #[test]
+    fn mask_only_cuts_where_it_covers_the_audio() {
+        let mask = Mask {
+            muted: vec![true; CUT_FRAMES + 1],
+        };
+        let trailing = CUT_FRAMES * FRAME_SAMPLES + 1;
+        let samples = vec![1.0; trailing + FRAME_SAMPLES];
+        let (audio, _) = mask.cut(&samples);
+        assert_eq!(audio.len(), PAUSE_FRAMES * FRAME_SAMPLES + 1);
+        assert!(mask.cut(&samples[..trailing]).0.is_empty());
+
+        assert!(!mask.mutes(f32::MAX, f32::MAX));
+        assert!(!mask.mutes(0.0, f32::NAN));
     }
 
     /// Deterministic noise in [-1, 1].

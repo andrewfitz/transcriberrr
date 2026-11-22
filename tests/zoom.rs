@@ -286,6 +286,55 @@ fn offline_run_reports_missing_model_without_creating_a_cache() {
 }
 
 #[test]
+fn resume_reports_reused_output_and_warning_even_if_pending_jobs_cannot_start() {
+    let fixture = Fixture::new();
+    fixture.track("reused.wav");
+    fixture.track("pending.wav");
+    let args = [
+        "reused.wav",
+        "pending.wav",
+        "--offline",
+        "--model-cache",
+        "cold-cache",
+        "--progress-file",
+        "run.jsonl",
+        "--resume",
+    ];
+    let plan = fixture.plan(&args);
+    let reused = plan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"].as_str().unwrap().ends_with("/reused.wav"))
+        .unwrap();
+    fixture.file(reused["output"].as_str().unwrap(), "existing transcript");
+    let warning = "No speech detected; the transcript is empty";
+    let event = serde_json::json!({
+        "input": reused["path"], "output": reused["output"],
+        "status": "completed", "warning": warning,
+    });
+    let log = fixture.file("run.jsonl", format!("{event}\n"));
+
+    let result = fixture.command(&args).arg("--jsonl").output().unwrap();
+    assert!(!result.status.success());
+    let events = json_lines(&result);
+    assert!(events.iter().any(|event| event["status"] == "skipped"
+        && event["output"] == reused["output"]
+        && event["warning"] == warning));
+    assert!(events.iter().any(|event| {
+        event["event"] == "pass_finished"
+            && event["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("not available locally"))
+    }));
+    assert_eq!(events.last().unwrap()["status"], "failed");
+    let contents = fs::read_to_string(log).unwrap();
+    let skipped: Value = serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+    assert_eq!(skipped["status"], "skipped");
+    assert_eq!(skipped["warning"], warning);
+}
+
+#[test]
 fn model_pass_plans_tag_regular_and_zoom_destinations() {
     let fixture = Fixture::new();
     fixture.track("library/interview.2026.wav");
@@ -1340,4 +1389,82 @@ fn app_rerun_of_a_manual_session_keeps_another_sessions_transcripts() {
     );
     // The same session, resumed with its own log, still redoes its tracks and merge.
     run("A", "txt", "p3.jsonl");
+}
+
+#[test]
+fn rejects_every_input_when_a_zoom_merge_shares_an_output() {
+    let fixture = Fixture::new();
+    let alice = "Call/Audio Record/audioAlice11067067067.m4a";
+    let bob = "Call/Audio Record/audioBob21067067067.m4a";
+    fixture.track(alice);
+    fixture.track(bob);
+    fixture.track("ordinary.wav");
+    let plan = fixture.plan(&["--output-location", "next-to-source", alice]);
+    let output = destination(&plan);
+    fixture.file(
+        "manifest.json",
+        serde_json::to_vec(&serde_json::json!({
+            "items": [
+                { "input": alice, "output_location": "next-to-source" },
+                { "input": "ordinary.wav", "output": output },
+            ],
+        }))
+        .unwrap(),
+    );
+
+    let plan = fixture.plan(&["--manifest", "manifest.json"]);
+    assert_eq!(plan["summary"]["pending_units"], 0);
+    assert_eq!(plan["summary"]["rejected_inputs"], 3);
+    assert!(plan["meetings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn zoom_discovery_ignores_nonmedia_evidence_and_an_audio_record_file() {
+    let fixture = Fixture::new();
+    fixture.track("Phone/video1700000000.mp4");
+    fixture.file("Phone/audio1700000000.txt", []);
+    fs::create_dir(fixture.0.join("Phone/gallery_view1700000000.mp4")).unwrap();
+    fixture.track("Call/audio1067067067.m4a");
+    fixture.file("Call/Audio Record", []);
+
+    let plan = fixture.plan(&["Phone/video1700000000.mp4", "Call/audio1067067067.m4a"]);
+    assert_eq!(plan["summary"]["pending_units"], 2);
+    assert_eq!(plan["summary"]["rejected_inputs"], 0);
+    let video = plan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| {
+            file["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("video1700000000.mp4")
+        })
+        .unwrap();
+    assert_eq!(video["zoom_recording"], false);
+}
+
+#[test]
+fn a_transcript_cannot_replace_its_input_manifest() {
+    let fixture = Fixture::new();
+    fixture.track("queue.wav");
+    let contents = r#"{"items":[{"input":"queue.wav"}]}"#;
+    fixture.file("queue.json", contents);
+    for options in [
+        &["--plan"][..],
+        &["--overwrite", "--offline"],
+        &["--skip-existing"],
+    ] {
+        let output = fixture
+            .command(&["--manifest", "queue.json"])
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("overlaps the input manifest"));
+        assert_eq!(
+            fs::read_to_string(fixture.0.join("queue.json")).unwrap(),
+            contents
+        );
+    }
 }

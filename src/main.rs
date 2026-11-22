@@ -2,6 +2,7 @@ mod audio_convert;
 mod bleed;
 mod merge;
 mod model_cache;
+mod serve;
 mod transcript;
 mod vad;
 use transcript::{
@@ -26,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
+use symphonia::core::audio::{AudioBufferRef, SampleBuffer, Signal};
 use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
@@ -196,6 +197,8 @@ struct Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 enum CliCommand {
+    /// Serve live single-stream and multi-track transcription over WebSocket.
+    Serve(serve::ServeArgs),
     /// Print available engines, model defaults, formats and automation options as JSON.
     Capabilities,
     /// Convert a transcript JSON without loading audio or models.
@@ -683,10 +686,10 @@ enum Unit {
 }
 
 impl Unit {
-    fn jobs(&self) -> Vec<&Job> {
+    fn jobs(&self) -> &[Job] {
         match self {
-            Self::Single(job) => vec![job],
-            Self::Session(session) => session.jobs.iter().collect(),
+            Self::Single(job) => std::slice::from_ref(job),
+            Self::Session(session) => &session.jobs,
         }
     }
 
@@ -890,6 +893,15 @@ impl ProgressLog {
 
     fn record(&mut self, mut event: ProgressEvent) -> Result<()> {
         normalize_event_output(&mut event);
+        let key = (event.input.clone(), event.output.clone());
+        if event.status == "skipped"
+            && event.warning.is_none()
+            && event.output.is_some()
+            && let Some(earlier) = self.earlier.get(&key)
+            && matches!(earlier.status.as_str(), "completed" | "skipped")
+        {
+            event.warning.clone_from(&earlier.warning);
+        }
         if let Some(writer) = self.writer.as_mut() {
             serde_json::to_writer(&mut *writer, &event)?;
             writer.write_all(b"\n")?;
@@ -902,8 +914,7 @@ impl ProgressLog {
             data["schema_version"] = CLI_SCHEMA_VERSION.into();
             write_json_line(&data)?;
         }
-        self.latest
-            .insert((event.input.clone(), event.output.clone()), event);
+        self.latest.insert(key, event);
         Ok(())
     }
 }
@@ -940,8 +951,10 @@ struct AlignedWord {
 }
 
 fn main() -> Result<()> {
-    install_cancel_handler();
     let cli = Cli::parse();
+    if !matches!(cli.command, Some(CliCommand::Serve(_))) {
+        install_cancel_handler();
+    }
     if cli.jsonl {
         write_json_line(&serde_json::json!({
             "schema_version": CLI_SCHEMA_VERSION, "event": "run_started",
@@ -1007,6 +1020,7 @@ fn print_capabilities() -> Result<()> {
             "default_model": default_asr(engine), "model_source": model_source,
             "model_tag": model_tag(engine, default_asr(engine)), "devices": devices,
             "diarization": !native && included && cfg!(feature = "diarization"),
+            "realtime": serve::engine_capabilities(engine),
             "minimum_macos": if native { "26.0" } else { "14.0" },
             "helper_present": native.then(|| apple_native_helper().is_some()),
         })
@@ -1017,6 +1031,7 @@ fn print_capabilities() -> Result<()> {
         "input_extensions": AUDIO_EXTENSIONS, "output_formats": ["json", "txt", "srt", "vtt"],
         "timestamps": ["words", "sentences", "none"],
         "automation": {
+            "serve": ["serve"], "realtime_endpoint": "/v1/realtime?intent=transcription",
             "plan": "--plan", "events": "--jsonl", "offline": "--offline", "manifest_stdin": ["--manifest", "-"],
             "cache_status": "--model-status", "check_model": "--cached-model", "model_tag": "--print-model-tag",
             "convert": ["convert", "--json"], "merge": ["merge", "--json"],
@@ -1026,6 +1041,7 @@ fn print_capabilities() -> Result<()> {
 
 fn run_command(mut cli: Cli) -> Result<()> {
     match cli.command.take() {
+        Some(CliCommand::Serve(args)) => return serve::run(args),
         Some(CliCommand::Capabilities) => return print_capabilities(),
         Some(CliCommand::Convert(args)) => return convert_transcript(args),
         Some(CliCommand::Merge(args)) => return merge_transcripts(args),
@@ -1075,7 +1091,7 @@ fn run_command(mut cli: Cli) -> Result<()> {
         .iter()
         .map(|job| {
             let plan = plan_inputs(job, inputs.clone())?;
-            protect_progress_files(job, &plan.0, &plan.1, &plan.2, &progress_paths)?;
+            protect_plan_files(job, &plan.0, &plan.1, &plan.2, &progress_paths)?;
             Ok(plan)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1160,15 +1176,15 @@ struct RunRequirements {
 }
 
 impl RunRequirements {
-    fn for_units(cli: &Cli, units: &[&Unit]) -> Self {
+    fn for_units<'a>(cli: &Cli, mut units: impl Iterator<Item = &'a Unit> + Clone) -> Self {
         let diarization = units
-            .iter()
+            .clone()
             .flat_map(|unit| unit.jobs())
             .any(|job| job.diarize);
         let aligner = matches!(cli.engine, EngineKind::Qwen3)
             && (effective_timestamps(cli) != TimestampGranularity::None
                 || diarization
-                || units.iter().any(|unit| matches!(unit, Unit::Session(_))));
+                || units.any(|unit| matches!(unit, Unit::Session(_))));
         Self {
             aligner,
             diarization,
@@ -1229,11 +1245,12 @@ impl RunRequirements {
 
 fn preview_cli(cli: &Cli, progress_paths: &[&Path]) -> Result<serde_json::Value> {
     let (units, skips, rejected) = prepare_plan(cli)?;
-    protect_progress_files(cli, &units, &skips, &rejected, progress_paths)?;
+    protect_plan_files(cli, &units, &skips, &rejected, progress_paths)?;
     queue_plan(cli, &units, &skips, &rejected)
 }
 
 fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Value>) -> Result<()> {
+    check_cancelled()?;
     if cli.forced_aligner.starts_with('~') {
         cli.forced_aligner = expand_home(Path::new(&cli.forced_aligner))
             .to_string_lossy()
@@ -1293,15 +1310,9 @@ fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Val
         bail!("no supported audio files were found");
     }
     let progress_paths = cli.progress_file.as_deref().into_iter().collect::<Vec<_>>();
-    protect_progress_files(&cli, &units, &skips, &rejected, &progress_paths)?;
+    protect_plan_files(&cli, &units, &skips, &rejected, &progress_paths)?;
     let mut progress = ProgressLog::open(cli.progress_file.as_deref(), cli.resume)?;
     progress.stream_pass = stream_pass;
-    let pending = units
-        .iter()
-        .filter(|unit| !unit_done(&cli, &progress, unit))
-        .collect::<Vec<_>>();
-    let requirements = RunRequirements::for_units(&cli, &pending);
-
     for (input, error) in &rejected {
         eprintln!("error processing {}: {error}", input.display());
         progress.record(ProgressEvent {
@@ -1326,15 +1337,25 @@ fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Val
     if !rejected.is_empty() && (cli.fail_fast || units.is_empty()) {
         bail!("{} input file(s) failed", rejected.len());
     }
-    if pending.is_empty() {
-        for unit in &units {
-            record_skipped(&cli, &mut progress, unit)?;
+    // Report reusable outputs before model setup, which may fail or take time. Only the
+    // remaining units can run afterward, so the loaded models cover every eligible job.
+    let mut pending = Vec::new();
+    for unit in units {
+        check_cancelled()?;
+        if unit_done(&cli, &progress, &unit) {
+            record_skipped(&cli, &mut progress, &unit)?;
+        } else {
+            pending.push(unit);
         }
+    }
+    if pending.is_empty() {
         if !rejected.is_empty() {
             bail!("{} input file(s) failed", rejected.len());
         }
         return Ok(());
     }
+    check_cancelled()?;
+    let requirements = RunRequirements::for_units(&cli, pending.iter());
     requirements.validate(&cli)?;
     if cli.offline {
         for (_, id) in requirements.models(&cli) {
@@ -1362,15 +1383,14 @@ fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Val
     } else {
         None
     };
-    // The native Apple engine runs in Speech.framework and does not need a Candle device.
-    // Avoid initializing Metal for that path so helper startup stays lightweight.
-    let device = if matches!(cli.engine, EngineKind::AppleNative) {
-        Device::Cpu
-    } else {
+    // Qwen uses Candle, while Parakeet and Sortformer initialize their own execution providers.
+    let device = if matches!(cli.engine, EngineKind::Qwen3) {
         match cli.device {
             DeviceKind::Metal => Device::new_metal(0)?,
             DeviceKind::Cpu | DeviceKind::Coreml => Device::Cpu,
         }
+    } else {
+        Device::Cpu
     };
     let mut asr: Option<Qwen3Asr> = None;
     let mut aligner: Option<Qwen3ForcedAligner> = None;
@@ -1451,7 +1471,7 @@ fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Val
         diarizer: &mut diarizer,
         model_label: &model_label,
     };
-    for unit in units {
+    for unit in pending {
         if cancel_requested() {
             // Caught between units, so no job recorded it: the app shows unrun rows as
             // canceled, rather than failed, only after a `canceled` event.
@@ -1660,14 +1680,21 @@ fn drop_clashes(cli: &Cli, units: &mut Vec<Unit>, rejected: &mut Vec<(PathBuf, S
     let mut clashes = if cli.inventory_only {
         Vec::new()
     } else {
-        output_clashes(
-            cli,
-            &units
-                .iter()
-                .filter(|unit| unit.writes_job_outputs())
-                .flat_map(Unit::jobs)
-                .collect::<Vec<_>>(),
-        )
+        output_clashes(units.iter().flat_map(|unit| {
+            let job_outputs = unit
+                .writes_job_outputs()
+                .then_some(unit.jobs())
+                .into_iter()
+                .flatten()
+                .map(|job| (job.input.as_path(), output_path(cli, job)));
+            let merged_output = match unit {
+                Unit::Session(session) => {
+                    Some((session.jobs[0].input.as_path(), session.output.clone()))
+                }
+                Unit::Single(_) => None,
+            };
+            job_outputs.chain(merged_output)
+        }))
     };
     for unit in units.iter().filter(|unit| !unit.writes_job_outputs()) {
         // Two encodings of the same participant export would duplicate its words.
@@ -1710,24 +1737,29 @@ fn drop_clashes(cli: &Cli, units: &mut Vec<Unit>, rejected: &mut Vec<(PathBuf, S
 /// Fail each skipped file whose replacements were all rejected before the run, which would
 /// otherwise leave it shown as covered while nothing of it is transcribed.
 fn reject_uncovered(skips: &mut Vec<Skip>, rejected: &mut Vec<(PathBuf, String)>) {
+    let mut gone = rejected
+        .iter()
+        .map(|(input, _)| input.clone())
+        .collect::<HashSet<_>>();
     loop {
-        let gone = rejected
-            .iter()
-            .map(|(input, _)| input)
-            .collect::<std::collections::HashSet<_>>();
-        let Some(index) = skips.iter().position(|skip| {
-            !skip.instead.is_empty() && skip.instead.iter().all(|input| gone.contains(input))
-        }) else {
+        let previous_count = skips.len();
+        skips.retain(|skip| {
+            if skip.instead.is_empty() || !skip.instead.iter().all(|input| gone.contains(input)) {
+                return true;
+            }
+            gone.insert(skip.job.input.clone());
+            rejected.push((
+                skip.job.input.clone(),
+                format!(
+                    "not transcribed: it was left out as {}, but those files cannot run",
+                    skip.reason
+                ),
+            ));
+            false
+        });
+        if skips.len() == previous_count {
             return;
-        };
-        let skip = skips.remove(index);
-        rejected.push((
-            skip.job.input,
-            format!(
-                "not transcribed: it was left out as {}, but those files cannot run",
-                skip.reason
-            ),
-        ));
+        }
     }
 }
 
@@ -1782,9 +1814,8 @@ fn plan_inputs(
         mut rejected,
     }: PlanInputs,
 ) -> Result<Plan> {
-    let (mut units, mut skips, unplanned) = plan_units(cli, jobs, &missing)?;
+    let (mut units, mut skips) = plan_units(cli, jobs, &missing)?;
     reject_missing_zoom_parts(&mut units, &missing, &mut rejected);
-    rejected.extend(unplanned);
     drop_clashes(cli, &mut units, &mut rejected);
     reject_uncovered(&mut skips, &mut rejected);
     Ok((units, skips, rejected))
@@ -1853,7 +1884,7 @@ fn reject_missing_zoom_parts(
         };
         rejected.extend(
             unit.jobs()
-                .into_iter()
+                .iter()
                 .map(|job| (job.input.clone(), reason.to_owned())),
         );
         false
@@ -1932,7 +1963,7 @@ fn queue_plan(
         issues.push("no supported audio files were found".to_owned());
     }
     if !pending.is_empty() && !cli.inventory_only {
-        let requirements = RunRequirements::for_units(cli, &pending);
+        let requirements = RunRequirements::for_units(cli, pending.iter().copied());
         if let Err(error) = requirements.validate(cli) {
             issues.push(error.to_string());
         }
@@ -1965,7 +1996,7 @@ fn queue_plan(
 /// Group Zoom files by canonical meeting folder and recording ID, and manually marked
 /// non-Zoom tracks by folder. Only associate an ID-less Zoom export when its folder
 /// identifies one meeting.
-fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
+fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<(Vec<Unit>, Vec<Skip>)> {
     let names = merge::parse_paths(jobs.iter().map(|job| job.input.as_path()));
     let folders = jobs
         .iter()
@@ -2266,20 +2297,13 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<Plan> {
         .map(|(_, unit)| unit)
         .collect::<Vec<_>>();
     let progress = ProgressLog::read(cli.progress_file.as_deref(), cli.resume)?;
-    let clashes = name_sessions(cli, &progress, &mut units);
-    let mut rejected = Vec::new();
-    for (index, error) in clashes.into_iter().rev() {
-        for job in units.remove(index).jobs() {
-            rejected.push((job.input.clone(), error.clone()));
-        }
-    }
-    Ok((units, skips, rejected))
+    name_sessions(cli, &progress, &mut units);
+    Ok((units, skips))
 }
 
 /// Name each session after its source folder. Zoom uses a fixed destination so later runs
 /// find the same transcript. Manual sessions keep their numbered collision handling.
-/// Returns the overlapping merged destinations by session index.
-fn name_sessions(cli: &Cli, progress: &ProgressLog, units: &mut [Unit]) -> Vec<(usize, String)> {
+fn name_sessions(cli: &Cli, progress: &ProgressLog, units: &mut [Unit]) {
     let base = |session: &IsoSession| {
         session_folder(&session.jobs[0].input)
             .file_name()
@@ -2297,14 +2321,7 @@ fn name_sessions(cli: &Cli, progress: &ProgressLog, units: &mut [Unit]) -> Vec<(
     };
     let key = |folder: &Path, name: &str| folded_path(&folder.join(name).to_string_lossy());
     let mut taken = std::collections::HashSet::new();
-    let mut outputs = units
-        .iter()
-        .filter(|unit| unit.writes_job_outputs())
-        .flat_map(Unit::jobs)
-        .map(|job| folded_path(&output_key(&output_path(cli, job))))
-        .collect::<std::collections::HashSet<_>>();
-    let mut clashes = Vec::new();
-    for (index, unit) in units.iter_mut().enumerate() {
+    for unit in units {
         let Unit::Session(session) = unit else {
             continue;
         };
@@ -2339,15 +2356,6 @@ fn name_sessions(cli: &Cli, progress: &ProgressLog, units: &mut [Unit]) -> Vec<(
             session.output = output(&candidate);
             label = candidate;
         }
-        if !cli.inventory_only && !outputs.insert(folded_path(&output_key(&session.output))) {
-            clashes.push((
-                index,
-                format!(
-                    "the merged transcript of {label} would replace another output: {}",
-                    session.output.display()
-                ),
-            ));
-        }
         session.speakers = merge::speaker_names(
             &session
                 .jobs
@@ -2357,7 +2365,6 @@ fn name_sessions(cli: &Cli, progress: &ProgressLog, units: &mut [Unit]) -> Vec<(
         );
         session.label = label;
     }
-    clashes
 }
 
 /// Whether `--resume` may replace a manual session's existing merged transcript: one whose
@@ -2766,15 +2773,27 @@ fn run_session(
             gate: mask,
             merged_only,
         };
-        if let Some(processed) = run_job(
+        match run_job(
             cli,
             job,
             models.reborrow(),
             progress,
             Some(member),
             failures,
-        )? {
-            docs.push(processed.words.context("speaker tracks keep their words")?);
+        ) {
+            Ok(Some(processed)) => {
+                docs.push(processed.words.context("speaker tracks keep their words")?);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                progress.record(ProgressEvent {
+                    error: Some(format!("{error:#}")),
+                    elapsed_seconds: Some(started.elapsed().as_secs_f32()),
+                    phase: Some("Failed".to_owned()),
+                    ..event("failed")
+                })?;
+                return Err(error);
+            }
         }
     }
     if cancel_requested() {
@@ -2788,6 +2807,8 @@ fn run_session(
         }
         return progress.record(ProgressEvent {
             error: Some(error),
+            elapsed_seconds: Some(started.elapsed().as_secs_f32()),
+            phase: Some("Failed".to_owned()),
             ..event("failed")
         });
     }
@@ -2869,15 +2890,17 @@ fn transcribe_qwen_chunks(
     let mut aligned = Vec::new();
     let mut skipped = 0;
     let detector = vad::VoiceDetector::new()?;
-    // Judge chunks on a CPU thread (~0.2 s per 30 s chunk) while the GPU transcribes, so voice
-    // detection adds no wall-clock time. The thread stops when the receiver is dropped.
-    let (sender, receiver) = std::sync::mpsc::channel();
+    // Judge chunks on a CPU thread (~0.2 s per 30 s chunk) while the GPU transcribes.
+    // Allow only one queued verdict so the detector cannot run far ahead of inference.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::scope(|scope| -> Result<()> {
-        scope.spawn(|| {
-            for range in &chunks {
-                if sender
-                    .send(detector.has_speech(&samples[range.clone()]))
-                    .is_err()
+        let ranges = &chunks;
+        scope.spawn(move || {
+            for range in ranges {
+                if cancel_requested()
+                    || sender
+                        .send(detector.has_speech(&samples[range.clone()]))
+                        .is_err()
                 {
                     break;
                 }
@@ -2886,7 +2909,9 @@ fn transcribe_qwen_chunks(
         let receiver = receiver;
         for (index, range) in chunks.iter().enumerate() {
             // Qwen3-ASR invents text ("I'm not sure.", "Okay.") for audio with no speech.
-            if !receiver.recv().unwrap_or(true) {
+            let has_speech = receiver.recv().unwrap_or(true);
+            check_cancelled()?;
+            if !has_speech {
                 skipped += 1;
                 report(
                     0.2 + 0.52 * (index + 1) as f32 / total as f32,
@@ -2906,7 +2931,9 @@ fn transcribe_qwen_chunks(
                 // ordinary speech (~4 tokens/s) well before 120 s. Allow a generous rate instead.
                 max_new_tokens: ((chunk_seconds * QWEN_TOKENS_PER_SECOND).ceil() as usize).max(256),
                 max_batch_size: 1,
-                chunk_max_sec: Some(chunk_seconds),
+                // We already cut at the requested length. Handing the same fractional limit
+                // to Qwen can split a rounded-up chunk again at a different boundary.
+                chunk_max_sec: None,
                 bucket_by_length: false,
             };
             let result = if let Some(aligner) = aligner {
@@ -3056,8 +3083,7 @@ fn process_one(
         bail!("output exists (use --overwrite): {}", destination.display());
     }
     if matches!(cli.engine, EngineKind::AppleNative) {
-        report(0.1, "Starting Apple SpeechTranscriber")?;
-        return process_apple_native(cli, job, gate, output, overwrite);
+        return process_apple_native(cli, job, gate, output, overwrite, report);
     }
     let started = Instant::now();
     report(0.05, "Decoding audio")?;
@@ -3087,7 +3113,6 @@ fn process_one(
         {
             let result = parakeet.transcribe_with_progress(
                 &audio.samples,
-                want_timestamps,
                 cli.chunk_seconds.unwrap_or(PARAKEET_DEFAULT_CHUNK_SECONDS),
                 report,
             )?;
@@ -3150,8 +3175,9 @@ fn process_one(
     normalize_word_timing(&mut words, audio.duration_seconds);
     // Speakers by the corrected timings: a word the aligner stretched over another speaker's
     // turn would otherwise take that speaker.
+    let speakers = SpeakerLookup::new(speaker_segments.as_deref());
     for word in &mut words {
-        word.speaker = speaker_at(&speaker_segments, word.start, word.end);
+        word.speaker = speakers.at(word.start, word.end);
     }
     preserve_word_text(&text, &mut words)?;
     if let Some(gate) = gate {
@@ -3247,6 +3273,7 @@ fn process_apple_native(
     gate: Option<&bleed::Mask>,
     output: Option<PathBuf>,
     overwrite: bool,
+    report: &mut dyn FnMut(f32, &str) -> Result<()>,
 ) -> Result<Processed> {
     if job.diarize || job.speakers.is_some() {
         bail!(
@@ -3266,6 +3293,7 @@ fn process_apple_native(
                 .iter()
                 .any(|format| extension.eq_ignore_ascii_case(format))
         }) {
+        report(0.05, "Decoding audio")?;
         let mut audio = decode_job(job)?;
         if audio.samples.is_empty() {
             bail!(
@@ -3277,7 +3305,7 @@ fn process_apple_native(
             gate.apply(&mut audio.samples);
         }
         decode_warning = audio.warning.take();
-        let wav = audio_convert::TempPath::new("wav");
+        let wav = audio_convert::TempPath::create("wav")?;
         audio_convert::write_float_wav(wav.path(), &audio.samples, TARGET_SAMPLE_RATE)?;
         Some(wav)
     } else {
@@ -3286,6 +3314,7 @@ fn process_apple_native(
     let helper_input = converted
         .as_ref()
         .map_or(job.input.as_path(), audio_convert::TempPath::path);
+    report(0.2, "Transcribing with Apple SpeechTranscriber")?;
     let mut command = Command::new(&helper);
     command.arg(helper_input);
     if cli.offline {
@@ -3376,7 +3405,10 @@ fn process_apple_native(
     .reduce(|first, second| format!("{first}; {second}"));
     let words = gate.is_some().then(|| doc.clone());
     if let Some(destination) = &output {
+        report(0.95, "Writing output")?;
         write_job_output(cli, doc, destination, overwrite)?;
+    } else {
+        check_cancelled()?;
     }
     Ok(Processed {
         output,
@@ -3405,11 +3437,11 @@ fn write_job_output(
 }
 
 fn apple_native_helper() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("TRANSCRIBERRR_NATIVE") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
+    if let Some(path) = std::env::var_os("TRANSCRIBERRR_NATIVE")
+        .and_then(|path| std::path::absolute(path).ok())
+        .filter(|path| path.is_file())
+    {
+        return Some(path);
     }
     let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
     // Bundled: the helper sits beside the CLI in Contents/Helpers. Development: a cargo build
@@ -3481,10 +3513,15 @@ fn zoom_folder_evidence(path: &Path, meeting: &str) -> bool {
         return false;
     };
     entries.flatten().any(|entry| {
+        let name = entry.file_name();
         let other = entry.path();
-        other.file_name() != path.file_name()
-            && zoom_media_by_name(&other, &merge::parse_path(&other))
-                .is_some_and(|media| media.meeting.as_deref() == Some(meeting))
+        (name.eq_ignore_ascii_case("Audio Record") && other.is_dir())
+            || (name.eq_ignore_ascii_case("playback.m3u") && other.is_file())
+            || (Some(name.as_os_str()) != path.file_name()
+                && is_audio_path(&other)
+                && other.is_file()
+                && zoom_media_by_name(&other, &merge::parse_path(&other))
+                    .is_some_and(|media| media.meeting.as_deref() == Some(meeting)))
     })
 }
 
@@ -3570,7 +3607,11 @@ fn input_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
                             .any(|suffix| name.to_ascii_lowercase().ends_with(suffix)))))
     }) {
         match entry {
-            Ok(entry) if entry.path().is_file() && is_audio_path(entry.path()) => {
+            Ok(entry)
+                if is_audio_path(entry.path())
+                    && (entry.file_type().is_file()
+                        || (entry.file_type().is_symlink() && entry.path().is_file())) =>
+            {
                 paths.push(entry.into_path())
             }
             Ok(entry)
@@ -3610,39 +3651,51 @@ fn zoom_inventory(folder: &Path) -> Result<ZoomInventory> {
             .with_context(|| format!("reading {}", path.display()))
     };
     let mut files = read(folder)?;
-    for directory in files.clone() {
+    let mut participant_files = Vec::new();
+    for directory in &files {
         if directory
             .file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("Audio Record"))
+            && directory.is_dir()
         {
-            files.extend(read(&directory)?);
+            participant_files.extend(read(directory)?);
         }
     }
-    let converting = files.iter().any(|path| {
-        path.extension()
+    files.extend(participant_files);
+    files.sort_unstable();
+
+    let mut converting = false;
+    let mut exports = Vec::new();
+    let mut mixed_audio = Vec::new();
+    let mut unknown_videos = Vec::new();
+    for path in files {
+        if path
+            .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zoom"))
             && path
                 .file_name()
                 .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
             && path.is_file()
-    });
-    files.sort_unstable();
-    let mut exports = files
-        .iter()
-        .filter(|path| path.is_file() && is_audio_path(path))
-        .filter_map(|path| zoom_candidate(path).map(|id| (path.clone(), id)))
-        .collect::<Vec<_>>();
-    let mixed_audio = exports
-        .iter()
-        .filter(|(path, _)| {
-            !is_video(path) && matches!(merge::parse_path(path), merge::TrackName::ZoomMixed { .. })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+        {
+            converting = true;
+        }
+        if !is_audio_path(&path) || !path.is_file() {
+            continue;
+        }
+        if let Some(id) = zoom_candidate(&path) {
+            if !is_video(&path)
+                && matches!(merge::parse_path(&path), merge::TrackName::ZoomMixed { .. })
+            {
+                mixed_audio.push((path.clone(), id.clone()));
+            }
+            exports.push((path, id));
+        } else if is_video(&path) {
+            unknown_videos.push(path);
+        }
+    }
+
     let mut audio_copies = HashMap::new();
-    for video in files.into_iter().filter(|path| {
-        is_video(path) && zoom_candidate(path).is_none() && path.is_file() && is_audio_path(path)
-    }) {
+    for video in unknown_videos {
         let mut candidates = mixed_audio.iter().filter(|(audio, _)| {
             without_panic(|| audio_convert::same_aac_audio(audio, &video)).unwrap_or(false)
         });
@@ -3951,9 +4004,10 @@ fn decode_audio(path: &Path) -> Result<Audio> {
         // (afconvert ADTS AAC: "end of stream"; μ-law/A-law WAV: "malformed fmt chunk"). Core
         // Audio reads all of them (see audio_convert), so try it on any failure.
         Err(error) if path.is_file() => {
-            let wav = without_panic(|| audio_convert::convert_with_core_audio(path))
+            let caf = without_panic(|| audio_convert::convert_with_core_audio(path))
                 .with_context(|| format!("{error:#}; the Core Audio fallback also failed"))?;
-            without_panic(|| decode_with_symphonia(wav.path()))
+            without_panic(|| decode_with_symphonia(caf.path()))
+                .with_context(|| format!("{error:#}; decoding the Core Audio conversion failed"))
         }
         result => result,
     }
@@ -4044,6 +4098,7 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
     // sample entry for every file; the true rate is in the codec config, which the decoder
     // uses. Trusting the container stretched 48 kHz Voice Memos by 9%.
     let mut section = Section::default();
+    let mut scratch = None;
     let mut decoded_packets = 0usize;
     let mut skipped_packets = 0usize;
     loop {
@@ -4067,13 +4122,16 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
         match decoder.decode(&packet) {
             Ok(buffer) => {
                 let rate = buffer.spec().rate;
+                if rate == 0 {
+                    bail!("audio stream has an invalid zero sample rate");
+                }
                 if rate != section.rate {
                     if !section.samples.is_empty() {
                         section.flush(&mut output);
                     }
                     section.rate = rate;
                 }
-                append_decoded(buffer, &mut section.samples);
+                append_decoded(buffer, &mut scratch, &mut section.samples);
                 decoded_packets += 1;
             }
             // A damaged frame (common in recovered MP3/AAC recordings) only loses that frame;
@@ -4085,10 +4143,10 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
     if decoded_packets == 0 {
         bail!("audio stream has no decodable packets");
     }
-    if section.rate == 0 {
-        bail!("audio stream has an invalid zero sample rate");
-    }
     section.flush(&mut output);
+    if output.is_empty() {
+        bail!("audio stream has no decodable samples");
+    }
     // Symphonia's MP3 decoder also rejects every frame after a change of sample rate or
     // channels (two files joined with `cat`), so many skipped packets mean lost speech.
     let warning = (skipped_packets > 0).then(|| {
@@ -4114,13 +4172,43 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
 /// (some AAC/M4A files), and the layout may change mid-stream, so a count taken from one buffer
 /// must not be applied to another. Mixing per buffer also avoids holding the full interleaved
 /// stream, which keeps peak RSS lower for long multichannel recordings.
-fn append_decoded(buffer: AudioBufferRef<'_>, output: &mut Vec<f32>) {
-    // Vorbis emits an empty first buffer; SampleBuffer panics copying zero frames of stereo.
-    if buffer.frames() == 0 {
+fn append_decoded(
+    buffer: AudioBufferRef<'_>,
+    scratch: &mut Option<SampleBuffer<f32>>,
+    output: &mut Vec<f32>,
+) {
+    let frames = buffer.frames();
+    let channels = buffer.spec().channels.count();
+    // Vorbis emits an empty first buffer. Symphonia's interleaver panics on zero frames.
+    if frames == 0 || channels == 0 {
         return;
     }
-    let channels = buffer.spec().channels.count().max(1);
-    let mut sample_buffer = SampleBuffer::<f32>::new(buffer.frames() as u64, *buffer.spec());
+    // AAC, MP3, Vorbis and float PCM already decode into planar floats.
+    if let AudioBufferRef::F32(ref planar) = buffer {
+        match channels {
+            1 => {
+                output.extend_from_slice(planar.chan(0));
+                return;
+            }
+            2 => {
+                output.extend(
+                    planar
+                        .chan(0)
+                        .iter()
+                        .zip(planar.chan(1))
+                        .map(|(left, right)| (left + right) * 0.5),
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+    // Conversion depends on the current buffer's shape. A scratch allocation can be reused
+    // whenever it has enough space for all of its samples.
+    let sample_buffer = match scratch {
+        Some(samples) if samples.capacity() >= frames * channels => samples,
+        _ => scratch.insert(SampleBuffer::new(buffer.capacity() as u64, *buffer.spec())),
+    };
     sample_buffer.copy_interleaved_ref(buffer);
     downmix_into(sample_buffer.samples(), channels, output);
 }
@@ -4235,22 +4323,55 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
-/// Assign the speaker whose span contains the word's midpoint, or else the nearest span.
-/// Aligner and diarizer boundaries rarely agree exactly, and a word that falls in a short gap
-/// between spans was still spoken by someone; leaving it unlabeled splits the segment.
-fn speaker_at(segments: &Option<Vec<SpeakerSpan>>, start: f32, end: f32) -> Option<usize> {
-    let midpoint = (start + end) * 0.5;
-    segments
-        .as_ref()?
-        .iter()
-        .map(|segment| {
-            let span_start = segment.start as f32 / TARGET_SAMPLE_RATE as f32;
-            let span_end = segment.end as f32 / TARGET_SAMPLE_RATE as f32;
-            let distance = (span_start - midpoint).max(midpoint - span_end).max(0.0);
-            (distance, segment.speaker_id)
-        })
-        .min_by(|left, right| left.0.total_cmp(&right.0))
-        .map(|(_, speaker)| speaker)
+/// Find the speaker containing a word's midpoint, or the nearest span in a gap.
+struct SpeakerLookup<'a> {
+    spans: &'a [SpeakerSpan],
+    chronological: bool,
+}
+
+impl<'a> SpeakerLookup<'a> {
+    fn new(spans: Option<&'a [SpeakerSpan]>) -> Self {
+        let spans = spans.unwrap_or_default();
+        let chronological = spans.iter().all(|span| span.start <= span.end)
+            && spans.windows(2).all(|pair| pair[0].end <= pair[1].start);
+        Self {
+            spans,
+            chronological,
+        }
+    }
+
+    fn at(&self, start: f32, end: f32) -> Option<usize> {
+        let midpoint = (start + end) * 0.5;
+        let seconds = |sample| sample as f32 / TARGET_SAMPLE_RATE as f32;
+        let distance = |span: &SpeakerSpan| {
+            (seconds(span.start) - midpoint)
+                .max(midpoint - seconds(span.end))
+                .max(0.0)
+        };
+        if self.chronological && midpoint.is_finite() {
+            let next = self
+                .spans
+                .partition_point(|span| seconds(span.end) < midpoint);
+            let (before, after) = self.spans.split_at(next);
+            if let Some(previous) = before.last() {
+                let previous_distance = distance(previous);
+                if after
+                    .first()
+                    .is_none_or(|span| previous_distance <= distance(span))
+                {
+                    // Distances can round to the same value. Keep the earliest equally near span.
+                    let nearest = before.partition_point(|span| distance(span) > previous_distance);
+                    return Some(before[nearest].speaker_id);
+                }
+            }
+            return after.first().map(|span| span.speaker_id);
+        }
+        self.spans
+            .iter()
+            .map(|span| (distance(span), span.speaker_id))
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, speaker)| speaker)
+    }
 }
 
 /// Keep the `max_speakers` speakers with the most speaking time. Filtering by ID instead would
@@ -4310,19 +4431,20 @@ fn run_diarization(
     Ok(diarizer
         .as_mut()
         .map(|model| {
-            model
-                .diarize(samples.to_vec(), TARGET_SAMPLE_RATE, 1)
-                .map(|segments| {
-                    let spans = segments
-                        .into_iter()
-                        .map(|segment| SpeakerSpan {
-                            start: segment.start,
-                            end: segment.end,
-                            speaker_id: segment.speaker_id,
-                        })
-                        .collect();
-                    limit_speakers(spans, max_speakers)
-                })
+            // A whole recording through the slice API uses the same mel extraction and
+            // post-processing as diarize(), with no second copy of the mono recording.
+            model.reset_state();
+            model.diarize_chunk(samples).map(|segments| {
+                let spans = segments
+                    .into_iter()
+                    .map(|segment| SpeakerSpan {
+                        start: segment.start,
+                        end: segment.end,
+                        speaker_id: segment.speaker_id,
+                    })
+                    .collect();
+                limit_speakers(spans, max_speakers)
+            })
         })
         .transpose()?)
 }
@@ -4477,27 +4599,33 @@ fn base_output_path(cli: &Cli, job: &Job) -> PathBuf {
 /// `talk.wav`), each with the reason. Without this check, the second job either fails late or,
 /// with `--overwrite`, silently replaces the first job's output. Both are rejected, and the
 /// rest of the queue runs.
-fn output_clashes(cli: &Cli, jobs: &[&Job]) -> Vec<(PathBuf, String)> {
-    let mut seen: HashMap<String, &Path> = HashMap::new();
-    let mut clashes = Vec::new();
-    for job in jobs {
+fn output_clashes<'a>(
+    outputs: impl IntoIterator<Item = (&'a Path, PathBuf)>,
+) -> Vec<(PathBuf, String)> {
+    let mut seen = HashMap::new();
+    let mut clashes = HashMap::new();
+    for (input, output) in outputs {
         // APFS is case-insensitive by default, so compare case-folded paths; canonical ones,
         // so `a/talk.json` and `./a/talk.json` meet.
-        let key = folded_path(&output_key(&output_path(cli, job)));
-        if let Some(previous) = seen.insert(key, &job.input) {
-            let error = format!(
-                "{} and {} would both write {}; use a manifest with explicit outputs",
-                previous.display(),
-                job.input.display(),
-                output_path(cli, job).display()
-            );
-            // A third file on the same output fails itself, not the first one again.
-            if !clashes.iter().any(|(input, _)| input == previous) {
-                clashes.push((previous.to_path_buf(), error.clone()));
-            }
-            clashes.push((job.input.clone(), error));
+        let key = folded_path(&output_key(&output));
+        if let Some(previous) = seen.insert(key, input) {
+            let error = || {
+                format!(
+                    "transcripts from {} and {} would both write {}",
+                    previous.display(),
+                    input.display(),
+                    output.display(),
+                )
+            };
+            clashes.entry(previous).or_insert_with(error);
+            clashes.entry(input).or_insert_with(error);
         }
     }
+    let mut clashes = clashes
+        .into_iter()
+        .map(|(input, error)| (input.to_path_buf(), error))
+        .collect::<Vec<_>>();
+    clashes.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
     clashes
 }
 
@@ -4511,7 +4639,7 @@ fn folded_path(path: &str) -> String {
 
 /// A progress log is appended to before transcription starts. It must be a different
 /// file from every source and destination, including through symlinks or hard links.
-fn protect_progress_files(
+fn protect_plan_files(
     cli: &Cli,
     units: &[Unit],
     skips: &[Skip],
@@ -4520,7 +4648,12 @@ fn protect_progress_files(
 ) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    if progress_paths.is_empty() {
+    let manifest = cli
+        .manifest
+        .as_deref()
+        .filter(|path| *path != Path::new("-"))
+        .map(expand_home);
+    if progress_paths.is_empty() && manifest.is_none() {
         return Ok(());
     }
     let inode = |path: &Path| fs::metadata(path).ok().map(|file| (file.dev(), file.ino()));
@@ -4538,6 +4671,9 @@ fn protect_progress_files(
         }
     }
     let check = |candidate: &Path| -> Result<()> {
+        if progress_paths.is_empty() {
+            return Ok(());
+        }
         if progress_keys.contains(&folded_path(&input_key(candidate)))
             || (!progress_inodes.is_empty()
                 && inode(candidate).is_some_and(|identity| progress_inodes.contains(&identity)))
@@ -4549,6 +4685,21 @@ fn protect_progress_files(
         }
         Ok(())
     };
+    let manifest_identity = manifest
+        .as_deref()
+        .map(|path| (folded_path(&input_key(path)), inode(path)));
+    let check_output = |path: &Path| -> Result<()> {
+        if let Some((key, identity)) = &manifest_identity
+            && (*key == folded_path(&input_key(path))
+                || identity.is_some() && *identity == inode(path))
+        {
+            bail!(
+                "transcript destination overlaps the input manifest: {}",
+                path.display()
+            );
+        }
+        check(path)
+    };
     for unit in units {
         for job in unit.jobs() {
             check(&job.input)?;
@@ -4556,11 +4707,11 @@ fn protect_progress_files(
                 check(part)?;
             }
             if unit.writes_job_outputs() {
-                check(&output_path(cli, job))?;
+                check_output(&output_path(cli, job))?;
             }
         }
         if let Unit::Session(session) = unit {
-            check(&session.output)?;
+            check_output(&session.output)?;
         }
     }
     for skip in skips {
@@ -4569,10 +4720,8 @@ fn protect_progress_files(
     for (input, _) in rejected {
         check(input)?;
     }
-    if let Some(manifest) = &cli.manifest
-        && manifest != Path::new("-")
-    {
-        check(&expand_home(manifest))?;
+    if let Some(manifest) = manifest {
+        check(&manifest)?;
     }
     Ok(())
 }
@@ -4691,6 +4840,35 @@ mod tests {
     }
 
     #[test]
+    fn downmixes_each_packet_with_its_own_layout() {
+        use symphonia::core::audio::{AsAudioBufferRef, AudioBuffer, Channels, SignalSpec};
+
+        let left = Channels::FRONT_LEFT;
+        let stereo = left | Channels::FRONT_RIGHT;
+        let mut mono = AudioBuffer::<i16>::new(2, SignalSpec::new(16_000, left));
+        mono.render_silence(None);
+        mono.chan_mut(0).copy_from_slice(&[16_384, -16_384]);
+
+        let mut scratch = None;
+        let mut samples = Vec::new();
+        append_decoded(mono.as_audio_buffer_ref(), &mut scratch, &mut samples);
+
+        let mut integer = AudioBuffer::<i16>::new(1, SignalSpec::new(16_000, stereo));
+        integer.render_silence(None);
+        integer.chan_mut(0)[0] = 16_384;
+        append_decoded(integer.as_audio_buffer_ref(), &mut scratch, &mut samples);
+        assert_eq!(scratch.as_ref().unwrap().capacity(), 2);
+
+        let mut float = AudioBuffer::<f32>::new(2, SignalSpec::new(16_000, stereo));
+        float.render_silence(None);
+        float.chan_mut(0).copy_from_slice(&[1.0, -1.0]);
+        float.chan_mut(1).copy_from_slice(&[0.0, 1.0]);
+        append_decoded(float.as_audio_buffer_ref(), &mut scratch, &mut samples);
+
+        assert_eq!(samples, [0.5, -0.5, 0.25, 0.5, 0.0]);
+    }
+
+    #[test]
     fn resampling_keeps_nonempty_short_audio() {
         assert_eq!(resample(vec![0.5], 192_000, TARGET_SAMPLE_RATE), vec![0.5]);
         assert!(resample(Vec::new(), 192_000, TARGET_SAMPLE_RATE).is_empty());
@@ -4754,12 +4932,26 @@ mod tests {
 
     #[test]
     fn words_between_diarization_spans_get_the_nearest_speaker() {
-        let spans = Some(vec![span(0.0, 2.0, 0), span(3.0, 5.0, 1)]);
-        assert_eq!(speaker_at(&spans, 1.0, 1.2), Some(0));
-        assert_eq!(speaker_at(&spans, 2.1, 2.3), Some(0));
-        assert_eq!(speaker_at(&spans, 2.7, 2.9), Some(1));
-        assert_eq!(speaker_at(&spans, 9.0, 9.5), Some(1));
-        assert_eq!(speaker_at(&None, 1.0, 1.2), None);
+        let spans = [span(0.0, 2.0, 0), span(3.0, 5.0, 1)];
+        let lookup = SpeakerLookup::new(Some(&spans));
+        assert_eq!(lookup.at(1.0, 1.2), Some(0));
+        assert_eq!(lookup.at(2.1, 2.3), Some(0));
+        assert_eq!(lookup.at(2.5, 2.5), Some(0));
+        assert_eq!(lookup.at(2.7, 2.9), Some(1));
+        assert_eq!(lookup.at(9.0, 9.5), Some(1));
+        assert_eq!(lookup.at(f32::MAX / 2.0, f32::MAX / 2.0), Some(0));
+        assert_eq!(SpeakerLookup::new(None).at(1.0, 1.2), None);
+    }
+
+    #[test]
+    fn overlapping_speakers_keep_the_diarizers_original_span_order() {
+        let spans = [span(3.0, 5.0, 1), span(0.0, 4.0, 0)];
+        let lookup = SpeakerLookup::new(Some(&spans));
+        assert_eq!(lookup.at(3.5, 3.5), Some(1));
+        assert_eq!(lookup.at(2.5, 2.5), Some(0));
+
+        let touching = [span(0.0, 3.0, 0), span(3.0, 4.0, 1)];
+        assert_eq!(SpeakerLookup::new(Some(&touching)).at(3.0, 3.0), Some(0));
     }
 
     #[test]
@@ -4851,7 +5043,7 @@ mod tests {
             "--output-dir".as_ref(),
             out.as_os_str(),
         ]);
-        let (units, skips, _) = plan_units(
+        let (units, skips) = plan_units(
             &cli,
             collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap(),
             &[],
@@ -4962,7 +5154,7 @@ mod tests {
             "--output-dir".as_ref(),
             out.as_os_str(),
         ]);
-        let (units, skips, _) = plan_units(
+        let (units, skips) = plan_units(
             &cli,
             collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap(),
             &[],
@@ -5087,13 +5279,14 @@ mod tests {
             "--output-dir".as_ref(),
             out.as_os_str(),
         ]);
-        let (mut units, mut skips, mut rejected) = plan_units(
+        let (mut units, mut skips) = plan_units(
             &cli,
             collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap(),
             &[],
         )
         .unwrap();
         assert_eq!(skips.len(), 2, "the mixed recording and the video");
+        let mut rejected = Vec::new();
         drop_clashes(&cli, &mut units, &mut rejected);
         reject_uncovered(&mut skips, &mut rejected);
         assert!(units.is_empty());
@@ -5130,7 +5323,7 @@ mod tests {
                 "--output-location".as_ref(),
                 "next-to-source".as_ref(),
             ]);
-            let (units, _, _) = plan_units(
+            let (units, _) = plan_units(
                 &cli,
                 collect_jobs(&cli, &mut Vec::new(), &mut Vec::new()).unwrap(),
                 &[],
@@ -5252,8 +5445,11 @@ mod tests {
             output_path(&cli, &job("rec/plain.m4a")),
             PathBuf::from("out/plain.txt")
         );
-        assert!(output_clashes(&cli, &[&job("a/call.1.m4a"), &job("a/call.2.m4a")]).is_empty());
-        let clashes = output_clashes(&cli, &[&job("a/Talk.m4a"), &job("b/talk.wav")]);
+        let clashes = |inputs: [&str; 2]| {
+            output_clashes(inputs.map(|input| (Path::new(input), output_path(&cli, &job(input)))))
+        };
+        assert!(clashes(["a/call.1.m4a", "a/call.2.m4a"]).is_empty());
+        let clashes = clashes(["a/Talk.m4a", "b/talk.wav"]);
         assert_eq!(clashes.len(), 2, "both files fail");
         assert!(clashes[1].1.contains("would both write"));
     }

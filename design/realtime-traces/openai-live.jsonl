@@ -1,0 +1,17 @@
+{"event_id":"event_9","session":{"audio":{"input":{"format":{"rate":24000,"type":"audio/pcm"},"transcription":{"model":"eschmidbauer/parakeet-unified-en-0.6b-onnx"},"turn_detection":null}},"id":"sess_8","object":"realtime.transcription_session","type":"transcription"},"type":"session.created"}
+{"event_id":"event_10","session":{"audio":{"input":{"format":{"rate":24000,"type":"audio/pcm"},"transcription":{"model":"gpt-live-transcribe"},"turn_detection":null}},"id":"sess_8","object":"realtime.transcription_session","type":"transcription"},"type":"session.updated"}
+{"error":{"code":"input_audio_buffer_commit_empty","event_id":"empty","message":"Cannot commit an empty audio buffer","param":"audio","type":"invalid_request_error"},"event_id":"event_11","type":"error"}
+{"event_id":"event_12","type":"input_audio_buffer.cleared"}
+{"event_id":"event_13","item_id":"item_8_2","previous_item_id":null,"type":"input_audio_buffer.committed"}
+{"event_id":"event_14","item":{"content":[{"transcript":null,"type":"input_audio"}],"id":"item_8_2","object":"realtime.item","role":"user","status":"completed","type":"message"},"previous_item_id":null,"type":"conversation.item.added"}
+{"content_index":0,"delta":"Meeting starts","event_id":"event_15","item_id":"item_8_2","type":"conversation.item.input_audio_transcription.delta"}
+{"content_index":0,"event_id":"event_16","item_id":"item_8_2","transcript":"Meeting starts on Monday morning","type":"conversation.item.input_audio_transcription.completed","usage":{"seconds":1.8,"type":"duration"}}
+{"event_id":"event_17","item_id":"item_8_3","previous_item_id":"item_8_2","type":"input_audio_buffer.committed"}
+{"event_id":"event_18","item":{"content":[{"transcript":null,"type":"input_audio"}],"id":"item_8_3","object":"realtime.item","role":"user","status":"completed","type":"message"},"previous_item_id":"item_8_2","type":"conversation.item.added"}
+{"content_index":0,"delta":"Meeting starts","event_id":"event_19","item_id":"item_8_3","type":"conversation.item.input_audio_transcription.delta"}
+{"content_index":0,"event_id":"event_20","item_id":"item_8_3","transcript":"Meeting starts on Monday morning","type":"conversation.item.input_audio_transcription.completed","usage":{"seconds":1.8,"type":"duration"}}
+{"content_index":0,"delta":"Grocery store","event_id":"event_21","item_id":"item_8_4","type":"conversation.item.input_audio_transcription.delta"}
+{"content_index":0,"delta":" closes","event_id":"event_22","item_id":"item_8_4","type":"conversation.item.input_audio_transcription.delta"}
+{"content_index":0,"error":{"code":"overload","message":"The recognition queue reached its hard limit","param":null,"type":"transcription_error"},"event_id":"event_23","item_id":"item_8_4","type":"conversation.item.input_audio_transcription.failed"}
+{"event_id":"event_24","item_id":"item_8_4","previous_item_id":"item_8_3","type":"input_audio_buffer.committed"}
+{"event_id":"event_25","item":{"content":[{"transcript":null,"type":"input_audio"}],"id":"item_8_4","object":"realtime.item","role":"user","status":"completed","type":"message"},"previous_item_id":"item_8_3","type":"conversation.item.added"}

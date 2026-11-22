@@ -50,35 +50,41 @@ struct QueueStatusBadge: View {
     let label: String
     var progress: Double? = nil
     var indeterminate = false
+    @Environment(\.backgroundProminence) private var backgroundProminence
 
     var body: some View {
+        // Red, green, and the accent tint are unreadable on a focused row's accent-colored
+        // selection, so follow the selection's own text colors there.
+        let onSelection = backgroundProminence == .increased
         if status == .running {
+            let value = indeterminate ? nil : progress.flatMap { $0.isFinite ? min(max($0, 0), 1) : nil }
             HStack(spacing: 6) {
                 Group {
-                    if indeterminate || progress == nil {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        ProgressView(value: min(max(progress ?? 0, 0), 1))
+                    if let value {
+                        ProgressView(value: value)
+                            .tint(onSelection ? Color.white : nil)
                             .frame(width: 54)
+                    } else {
+                        ProgressView().controlSize(.mini)
                     }
                 }
-                Text(progress.map { "\(Int(($0 * 100).rounded()))%" } ?? label)
+                Text(value?.formatted(.percent.precision(.fractionLength(0))) ?? label)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(label)
-            .accessibilityValue(progress.map { "\(Int(($0 * 100).rounded())) percent" } ?? "")
+            .accessibilityValue(value?.formatted(.percent.precision(.fractionLength(0))) ?? "")
         } else {
             HStack(spacing: 4) {
                 if let symbol = status.symbol {
                     Image(systemName: symbol)
-                        .foregroundStyle(status.tint)
+                        .foregroundStyle(onSelection ? AnyShapeStyle(.primary) : AnyShapeStyle(status.tint))
                         .imageScale(.small)
                         .accessibilityHidden(true)
                 }
                 Text(label)
-                    .foregroundStyle(status == .failed ? Color.red : Color.secondary)
+                    .foregroundStyle(status == .failed && !onSelection ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
             }
         }
     }
@@ -89,41 +95,13 @@ struct QueueScope: Equatable {
     var usesRegex = false
     var status: QueueStatusFilter = .all
 
-    private var expression: Result<NSRegularExpression, Error>? {
+    fileprivate var expression: Result<NSRegularExpression, Error>? {
         guard usesRegex, !query.isEmpty else { return nil }
         return Result { try NSRegularExpression(pattern: query, options: .caseInsensitive) }
     }
 
-    var filterError: String? {
-        guard case .failure(let error) = expression else { return nil }
-        return error.localizedDescription
-    }
-
     @MainActor
-    fileprivate func allRows(in state: AppState) -> [QueueRow] {
-        let meetings = Set(state.zoomMeetings.map(\.id))
-        let groups = Dictionary(grouping: state.items, by: \.zoomMeeting)
-        let meetingOutputs = Set(state.zoomMeetings.map(\.output))
-        let grouped = state.zoomMeetings.compactMap { meeting -> QueueRow? in
-            guard let tracks = groups[meeting.id] else { return nil }
-            return QueueRow(meeting: meeting, tracks: tracks, state: state)
-        }
-        let recordings = state.items
-            .filter { $0.zoomMeeting.map { !meetings.contains($0) } ?? true }
-            .map { QueueRow(recording: $0, state: state) }
-        let merges = state.mergedSessions.filter {
-            !meetingOutputs.contains($0.id) && !($0.meetingID.map(meetings.contains) ?? false)
-        }
-        return grouped + recordings + merges.map(QueueRow.init(session:))
-    }
-
-    @MainActor
-    fileprivate func visibleRows(in state: AppState) -> [QueueRow] {
-        filter(allRows(in: state))
-    }
-
-    @MainActor
-    fileprivate func filter(_ rows: [QueueRow]) -> [QueueRow] {
+    fileprivate func filter(_ rows: [QueueRow], expression: Result<NSRegularExpression, Error>?) -> [QueueRow] {
         let literal = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let regex: NSRegularExpression?
         switch expression {
@@ -141,10 +119,75 @@ struct QueueScope: Equatable {
             return literal.isEmpty || row.searchTerms.contains { $0.localizedCaseInsensitiveContains(literal) }
         }
     }
+}
 
-    @MainActor
-    func visibleSelections(in state: AppState) -> [QueueSelection] {
-        visibleRows(in: state).map(\.id)
+/// What a row's Status column shows. The inspector repeats it, so the two cannot disagree.
+struct QueueRowStatus: Equatable {
+    var filter: QueueStatusFilter
+    var label: String
+    var progress: Double?
+}
+
+/// The queue's rows for one render. Building a row reads every track (and, for meetings, the
+/// disk), and the window re-renders every second during a run, so `QueueWindow` builds the
+/// rows once and shares them with the list, the run bar, and the inspector.
+@MainActor
+struct QueueSnapshot {
+    /// Every row, ignoring filters.
+    fileprivate let rows: [QueueRow]
+    /// The rows that pass the search and status filters.
+    fileprivate let visible: [QueueRow]
+    let visibleIDs: [QueueSelection]
+    let filterError: String?
+
+    init(state: AppState, scope: QueueScope) {
+        let meetings = Set(state.zoomMeetings.map(\.id))
+        let groups = Dictionary(grouping: state.items, by: \.zoomMeeting)
+        let meetingOutputs = Set(state.zoomMeetings.map(\.output))
+        let grouped = state.zoomMeetings.compactMap { meeting -> QueueRow? in
+            guard let tracks = groups[meeting.id] else { return nil }
+            return QueueRow(meeting: meeting, tracks: tracks, state: state)
+        }
+        let recordings = state.items
+            .filter { $0.zoomMeeting.map { !meetings.contains($0) } ?? true }
+            .map { QueueRow(recording: $0, state: state) }
+        let merges = state.mergedSessions.filter {
+            !meetingOutputs.contains($0.id) && !($0.meetingID.map(meetings.contains) ?? false)
+        }
+        rows = grouped + recordings + merges.map(QueueRow.init(session:))
+        let expression = scope.expression
+        if case .failure(let error) = expression {
+            filterError = error.localizedDescription
+        } else {
+            filterError = nil
+        }
+        visible = scope.filter(rows, expression: expression)
+        visibleIDs = visible.map(\.id)
+    }
+
+    var isEmpty: Bool { rows.isEmpty }
+
+    /// "1 meeting · 3 recordings", for the window subtitle.
+    var counts: String {
+        var meetings = 0, recordings = 0, merges = 0
+        for row in rows {
+            switch row.id {
+            case .meeting: meetings += 1
+            case .recording: recordings += 1
+            case .merge: merges += 1
+            }
+        }
+        let parts = [
+            meetings > 0 ? "\(meetings) \(meetings == 1 ? "meeting" : "meetings")" : nil,
+            recordings > 0 ? "\(recordings) \(recordings == 1 ? "recording" : "recordings")" : nil,
+            merges > 0 ? "\(merges) \(merges == 1 ? "merged transcript" : "merged transcripts")" : nil,
+        ].compactMap { $0 }
+        return parts.isEmpty ? "Queue is empty" : parts.joined(separator: " · ")
+    }
+
+    func status(of selection: QueueSelection?) -> QueueRowStatus? {
+        guard let selection, let row = rows.first(where: { $0.id == selection }) else { return nil }
+        return QueueRowStatus(filter: row.status, label: row.statusLabel, progress: row.progress)
     }
 }
 
@@ -163,8 +206,9 @@ private struct QueueRow: Identifiable {
     var detailIsError = false
     var isChild = false
     var progress: Double?
-    /// A finished transcript to open on double-click.
-    var transcript: URL?
+    /// Candidate transcripts, preferred first; existence is checked only when acted on.
+    var transcripts: [URL] = []
+    var transcript: URL? { transcripts.first { FileManager.default.fileExists(atPath: $0.path) } }
     /// The source file or folder to reveal in Finder.
     var source: URL?
 
@@ -216,9 +260,8 @@ private struct QueueRow: Identifiable {
         children = []
         progress = item.state == .processing && !state.activePassUsesApple ? item.progress : nil
         if !isChild {
-            let saved = [item.outputURL].compactMap { $0 }
-                + state.modelOutputs(for: item).reversed().map { URL(fileURLWithPath: $0.path) }
-            transcript = saved.first { FileManager.default.fileExists(atPath: $0.path) }
+            transcripts = [item.outputURL].compactMap { $0 }
+                + item.modelOutputs.sorted { ($0.tag, $0.path) > ($1.tag, $1.path) }.map { URL(fileURLWithPath: $0.path) }
         }
     }
 
@@ -251,8 +294,8 @@ private struct QueueRow: Identifiable {
         if status == .running, !state.activePassUsesApple, !speakers.isEmpty {
             progress = speakers.reduce(0) { $0 + ($1.state == .done ? 1 : $1.progress) } / Double(speakers.count)
         }
-        if result?.state == "done", let path = result?.id, FileManager.default.fileExists(atPath: path) {
-            transcript = URL(fileURLWithPath: path)
+        if result?.state == "done", let path = result?.id {
+            transcripts = [URL(fileURLWithPath: path)]
         }
         if let folder = tracks.first?.url.deletingLastPathComponent() {
             source = folder.lastPathComponent.caseInsensitiveCompare("Audio Record") == .orderedSame
@@ -271,13 +314,13 @@ private struct QueueRow: Identifiable {
         case "canceled": status = .canceled
         default: status = .running
         }
-        statusLabel = status.rawValue
+        statusLabel = status == .running ? "Merging" : status.rawValue
         statusDetail = session.message
         duration = 0
         items = []
         children = []
-        if session.state == "done", FileManager.default.fileExists(atPath: session.id) {
-            transcript = URL(fileURLWithPath: session.id)
+        if session.state == "done" {
+            transcripts = [URL(fileURLWithPath: session.id)]
         }
     }
 
@@ -308,33 +351,33 @@ private struct QueueRow: Identifiable {
 @MainActor
 struct QueueView: View {
     @ObservedObject var state: AppState
+    let queue: QueueSnapshot
     @Binding var selection: QueueSelection?
     @Binding var scope: QueueScope
     var retry: (QueueSelection) -> Void
+    var remove: (QueueSelection) -> Void
     @State private var expandedMeetings: [String: Bool] = [:]
     @State private var dropTargeted = false
     @FocusState private var searchFocused: Bool
 
     var body: some View {
-        let rows = scope.allRows(in: state)
-        let visible = scope.filter(rows)
+        let rows = queue.rows
+        let visible = queue.visible
         return VStack(alignment: .leading, spacing: 10) {
             if rows.isEmpty {
                 emptyState
             } else {
                 filterBar(visible)
                     .padding(.top, 10)
-                if let filterError = scope.filterError {
-                    Label("Invalid regular expression", systemImage: "exclamationmark.triangle.fill")
-                        .font(.callout)
-                        .foregroundStyle(.red)
-                        .help(filterError)
-                        .accessibilityHint(filterError)
-                        .padding(.horizontal, 16)
-                }
                 if visible.isEmpty {
                     ContentUnavailableView {
-                        Label("No Matching Recordings", systemImage: "magnifyingglass")
+                        if queue.filterError != nil {
+                            Label("Invalid Regular Expression", systemImage: "exclamationmark.triangle")
+                        } else {
+                            Label("No Matching Recordings", systemImage: "magnifyingglass")
+                        }
+                    } description: {
+                        if let error = queue.filterError { Text(error) }
                     } actions: {
                         Button("Clear Filters") {
                             scope = QueueScope(usesRegex: scope.usesRegex)
@@ -397,6 +440,7 @@ struct QueueView: View {
         } actions: {
             if state.addOperations > 0 {
                 ProgressView().controlSize(.small)
+                    .accessibilityLabel("Finding recordings")
             } else {
                 Button("Add Recordings…", action: state.chooseFiles)
                     .disabled(state.isRunning)
@@ -496,7 +540,7 @@ struct QueueView: View {
             TableColumn("Recording") { row in
                 recordingCell(row)
             }
-            .width(min: 180, ideal: 380)
+            .width(min: 140, ideal: 220)
             TableColumn("Duration") { row in
                 if row.duration.isFinite, row.duration > 0 {
                     Text(Duration.seconds(row.duration).formatted(.time(pattern: row.duration >= 3600 ? .hourMinuteSecond : .minuteSecond)))
@@ -504,7 +548,7 @@ struct QueueView: View {
                         .foregroundStyle(row.isChild ? .secondary : .primary)
                 }
             }
-            .width(min: 60, ideal: 72, max: 100)
+            .width(min: 52, ideal: 72, max: 100)
             .alignment(.trailing)
             TableColumn("Status") { row in
                 QueueStatusBadge(status: row.status, label: row.statusLabel, progress: row.progress,
@@ -512,7 +556,7 @@ struct QueueView: View {
                     .font(row.isChild ? .callout : nil)
                     .help(row.statusDetail ?? row.statusLabel)
             }
-            .width(min: 96, ideal: 118, max: 150)
+            .width(min: 84, ideal: 118, max: 150)
             .alignment(.trailing)
         } rows: {
             ForEach(rows) { row in
@@ -532,11 +576,11 @@ struct QueueView: View {
         }
         .tableStyle(.inset(alternatesRowBackgrounds: false))
         .contextMenu(forSelectionType: QueueSelection.self) { ids in
-            if let row = rows.first(where: { ids.contains($0.id) }) {
+            if let row = target(of: ids, in: rows) {
                 rowActions(row)
             }
         } primaryAction: { ids in
-            guard let row = rows.first(where: { ids.contains($0.id) }) else { return }
+            guard let row = target(of: ids, in: rows) else { return }
             if let transcript = row.transcript {
                 NSWorkspace.shared.open(transcript)
             } else if let source = row.source {
@@ -544,9 +588,8 @@ struct QueueView: View {
             }
         }
         .onDeleteCommand {
-            guard !state.isRunning, let selected = selection,
-                  let row = rows.first(where: { $0.id == selected }) else { return }
-            remove(row)
+            guard !state.isRunning, let selected = selection, rows.contains(where: { $0.id == selected }) else { return }
+            remove(selected)
         }
         .onKeyPress(.space) {
             guard !state.isRunning, let selected = selection,
@@ -554,6 +597,13 @@ struct QueueView: View {
             state.selectAll(row.items, selected: !row.items.contains(where: \.selected))
             return .handled
         }
+    }
+
+    /// The row a click landed on. A meeting's speaker tracks cannot be selected, but they
+    /// can be double-clicked and have a (shorter) context menu.
+    private func target(of ids: Set<QueueSelection>, in rows: [QueueRow]) -> QueueRow? {
+        rows.first { ids.contains($0.id) }
+            ?? rows.lazy.flatMap(\.children).first { ids.contains($0.id) }
     }
 
     private func recordingCell(_ row: QueueRow) -> some View {
@@ -580,11 +630,7 @@ struct QueueView: View {
                     .truncationMode(.middle)
                     .foregroundStyle(row.status == .skipped ? .secondary : .primary)
                 if !row.detail.isEmpty {
-                    Text(row.detail)
-                        .font(.caption)
-                        .foregroundStyle(row.detailIsError ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                    QueueRowDetail(text: row.detail, isError: row.detailIsError)
                 }
             }
             .help(row.detail.isEmpty ? row.title : "\(row.title)\n\(row.statusDetail ?? row.detail)")
@@ -594,19 +640,20 @@ struct QueueView: View {
 
     @ViewBuilder
     private func rowActions(_ row: QueueRow) -> some View {
-        if let transcript = row.transcript {
+        let transcript = row.transcript
+        if let transcript {
             Button("Open Transcript") { NSWorkspace.shared.open(transcript) }
             Button("Show Transcript in Finder") { NSWorkspace.shared.activateFileViewerSelecting([transcript]) }
         }
         if let source = row.source {
-            Button(row.items.count > 1 ? "Show Meeting Folder in Finder" : "Show Recording in Finder") {
+            Button(row.children.isEmpty ? "Show Recording in Finder" : "Show Meeting Folder in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([source])
             }
         }
         if row.canRetry {
             Divider()
             Button("Retry") { retry(row.id) }
-                .disabled(state.isRunning || state.addOperations > 0 || state.downloadingLibraryModel != nil)
+                .disabled(!state.canStartBatch)
         }
         if !row.items.isEmpty {
             Divider()
@@ -615,19 +662,12 @@ struct QueueView: View {
                 state.selectAll(row.items, selected: !included)
             }
             .disabled(state.isRunning)
-            Button("Remove from Queue", role: .destructive) { remove(row) }
-                .disabled(state.isRunning)
         }
-    }
-
-    private func remove(_ row: QueueRow) {
-        switch row.id {
-        case .recording(let id):
-            if let item = state.items.first(where: { $0.id == id }) { state.remove(item) }
-        case .meeting(let id):
-            if let meeting = state.zoomMeetings.first(where: { $0.id == id }) { state.removeMeeting(meeting) }
-        case .merge:
-            break
+        if !row.isChild {
+            // A merged transcript has no Include item above; separate only when something is.
+            if row.items.isEmpty, transcript != nil { Divider() }
+            Button("Remove from Queue", role: .destructive) { remove(row.id) }
+                .disabled(state.isRunning)
         }
     }
 
@@ -649,6 +689,23 @@ struct QueueView: View {
             }
         }
         return true
+    }
+}
+
+/// A row's caption. An error is red, except on a focused row's accent-colored selection,
+/// where red is unreadable and the selection's own text color takes over.
+private struct QueueRowDetail: View {
+    let text: String
+    let isError: Bool
+    @Environment(\.backgroundProminence) private var backgroundProminence
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(isError && backgroundProminence != .increased
+                             ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
+            .lineLimit(1)
+            .truncationMode(.tail)
     }
 }
 

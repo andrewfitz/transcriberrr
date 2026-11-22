@@ -1,0 +1,10 @@
+{"event_id":"event_2","session":{"audio":{"input":{"format":{"rate":24000,"type":"audio/pcm"},"transcription":{"model":"Apple SpeechTranscriber"},"turn_detection":null}},"id":"sess_1","object":"realtime.transcription_session","type":"transcription"},"type":"session.created"}
+{"event_id":"event_3","session":{"audio":{"input":{"format":{"rate":24000,"type":"audio/pcm"},"transcription":{"model":"gpt-transcribe"},"turn_detection":null}},"id":"sess_1","object":"realtime.transcription_session","type":"transcription"},"type":"session.updated"}
+{"error":{"code":"input_audio_buffer_commit_empty","event_id":"empty","message":"Cannot commit an empty audio buffer","param":"audio","type":"invalid_request_error"},"event_id":"event_4","type":"error"}
+{"event_id":"event_5","type":"input_audio_buffer.cleared"}
+{"event_id":"event_6","item_id":"item_1_2","previous_item_id":null,"type":"input_audio_buffer.committed"}
+{"event_id":"event_7","item":{"content":[{"transcript":null,"type":"input_audio"}],"id":"item_1_2","object":"realtime.item","role":"user","status":"completed","type":"message"},"previous_item_id":null,"type":"conversation.item.added"}
+{"content_index":0,"event_id":"event_8","item_id":"item_1_2","languages":[],"transcript":"The meeting starts on Monday morning.","type":"conversation.item.input_audio_transcription.completed","usage":{"seconds":1.8,"type":"duration"}}
+{"event_id":"event_9","item_id":"item_1_3","previous_item_id":"item_1_2","type":"input_audio_buffer.committed"}
+{"event_id":"event_10","item":{"content":[{"transcript":null,"type":"input_audio"}],"id":"item_1_3","object":"realtime.item","role":"user","status":"completed","type":"message"},"previous_item_id":"item_1_2","type":"conversation.item.added"}
+{"content_index":0,"event_id":"event_11","item_id":"item_1_3","languages":[],"transcript":"The meeting starts on Monday morning.","type":"conversation.item.input_audio_transcription.completed","usage":{"seconds":1.8,"type":"duration"}}

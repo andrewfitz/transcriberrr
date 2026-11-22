@@ -253,3 +253,12 @@ fn blank_lines_in_transcript_do_not_split_subtitle_cues() {
     success(f.run(&["--format", "txt", "--timestamps", "none", "-o", "plain.txt"]));
     assert_eq!(f.read("plain.txt"), "“Hello,\n\nworld!”\nYes—it's me.\n");
 }
+
+#[test]
+fn preserves_existing_destination_whose_name_starts_like_a_temp_file() {
+    let f = Fixture::new();
+    let output = "./.transcriberrr-2147483647.txt";
+    fs::write(f.0.join(output), "keep").unwrap();
+    assert!(!f.run(&["-o", output]).status.success());
+    assert_eq!(f.read(output), "keep");
+}

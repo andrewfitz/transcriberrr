@@ -278,3 +278,69 @@ fn refuses_existing_output() {
     assert!(!again.status.success());
     assert!(String::from_utf8_lossy(&again.stderr).contains("--overwrite"));
 }
+
+#[test]
+fn folder_merge_ignores_legacy_mixed_audio_when_the_session_is_ambiguous() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("hana.json"),
+        f.read("hana.json")
+            .replace("audioHana31067067067", "audioSam12062062062"),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("mixed.json"),
+        f.read("hana.json")
+            .replace("audioSam12062062062", "audio_only"),
+    )
+    .unwrap();
+
+    let output = f.run(&[".", "--session", "067067067", "-o", "talk.json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("need at least 2"));
+    assert!(!f.0.join("talk.json").exists());
+}
+
+#[test]
+fn folder_merge_uses_only_the_first_recording_segments_mixed_audio() {
+    let f = Fixture::new();
+    let other = f.read("hana.json");
+    fs::write(
+        f.0.join("hana.json"),
+        other.replace("audioHana31067067067", "audioAndrewDaniel32067067067"),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("a-later-mixed.json"),
+        other
+            .replace("audioHana31067067067", "audio2067067067")
+            .replace("Yeah.", "Later mixed audio."),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("z-first-mixed.json"),
+        other
+            .replace("audioHana31067067067", "audio1067067067")
+            .replace("\"start\":0.6", "\"start\":2.5")
+            .replace("\"end\":1.2", "\"end\":3.0")
+            .replace("Yeah.", "First mixed audio."),
+    )
+    .unwrap();
+
+    let output = f.run(&[".", "-o", "talk.json"]);
+    success(&output);
+    let doc: serde_json::Value = serde_json::from_str(&f.read("talk.json")).unwrap();
+    assert!(
+        doc["metadata"]["merged_from"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|track| {
+                track["source"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/audio1067067067.m4a"))
+            })
+    );
+    assert!(f.read("talk.json").contains("First mixed audio."));
+    assert!(!f.read("talk.json").contains("Later mixed audio."));
+}

@@ -73,21 +73,15 @@ impl ParakeetEngine {
 
     /// Transcribe 16 kHz mono samples.  Parakeet's word grouping is performed
     /// by `parakeet-rs`; no secondary aligner model is necessary.
-    pub fn transcribe(&mut self, samples: &[f32], timestamps: bool) -> Result<ParakeetTranscript> {
-        let mode = if timestamps {
-            TimestampMode::Words
-        } else {
-            // The decoder still needs a mode to produce a coherent text result;
-            // dropping the returned timing objects keeps the CLI output shape
-            // consistent with Qwen's no-timestamp path.
-            TimestampMode::Words
-        };
+    fn transcribe(&mut self, samples: &[f32]) -> Result<ParakeetTranscript> {
+        // Keep word grouping for sentence segmentation even when the output omits timestamps.
+        let mode = Some(TimestampMode::Words);
         let result = match &mut self.model {
             ParakeetBackend::Unified(model) => {
-                model.transcribe_samples(samples.to_vec(), 16_000, 1, Some(mode))
+                model.transcribe_samples(samples.to_vec(), 16_000, 1, mode)
             }
             ParakeetBackend::Tdt(model) => {
-                model.transcribe_samples(samples.to_vec(), 16_000, 1, Some(mode))
+                model.transcribe_samples(samples.to_vec(), 16_000, 1, mode)
             }
         }
         .context("Parakeet transcription failed")?;
@@ -112,7 +106,6 @@ impl ParakeetEngine {
     pub fn transcribe_with_progress(
         &mut self,
         samples: &[f32],
-        timestamps: bool,
         chunk_seconds: f32,
         report: &mut dyn FnMut(f32, &str) -> Result<()>,
     ) -> Result<ParakeetTranscript> {
@@ -126,6 +119,7 @@ impl ParakeetEngine {
         let mut text_parts = Vec::with_capacity(chunks.len());
         let mut words = Vec::new();
         for (index, range) in chunks.iter().enumerate() {
+            crate::check_cancelled()?;
             let progress = 0.2 + 0.52 * (index + 1) as f32 / total as f32;
             // Exact silence: Zoom pads a participant's track before they join and after they
             // leave, and bleed muting zeroes long stretches of a listener's track. Qwen's
@@ -137,7 +131,7 @@ impl ParakeetEngine {
                 )?;
                 continue;
             }
-            let mut result = self.transcribe(&samples[range.clone()], timestamps)?;
+            let mut result = self.transcribe(&samples[range.clone()])?;
             let offset = range.start as f32 / 16_000.0;
             for word in &mut result.words {
                 word.start += offset;

@@ -6,8 +6,8 @@ VERSION="$(awk -F '"' '/^version = / { print $2; exit }' "$ROOT_DIR/Cargo.toml")
 ARCH="$(uname -m)"
 DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/Transcriberrr.app"
-STAGING_DIR="$DIST_DIR/.dmg-staging"
-DMG_PATH="$DIST_DIR/Transcriberrr-${VERSION}-macos-${ARCH}.dmg"
+DMG_NAME="Transcriberrr-${VERSION}-macos-${ARCH}.dmg"
+DMG_PATH="$DIST_DIR/$DMG_NAME"
 SHA_PATH="$DMG_PATH.sha256"
 
 if [[ -z "$VERSION" ]]; then
@@ -41,46 +41,90 @@ notarize() {
     fi
 }
 
-"$ROOT_DIR/scripts/build-macos-app.sh"
+# Hold the same lock used by standalone app builds until the DMG and checksum are published.
+mkdir -p "$DIST_DIR"
+exec 9>>"$DIST_DIR/.build.lock"
+/usr/bin/lockf 9
 
-rm -rf "$STAGING_DIR" "$DMG_PATH" "$SHA_PATH"
-trap 'rm -rf "$STAGING_DIR"' EXIT
-mkdir -p "$STAGING_DIR"
+WORK_DIR="$(mktemp -d "$DIST_DIR/.dmg-build.XXXXXX")"
+STAGING_DIR="$WORK_DIR/volume"
+STAGED_APP="$STAGING_DIR/Transcriberrr.app"
+STAGED_DMG="$WORK_DIR/$DMG_NAME"
+OUTPUTS=("$APP_DIR" "$DMG_PATH" "$SHA_PATH")
+STAGED_OUTPUTS=("$STAGED_APP" "$STAGED_DMG" "$STAGED_DMG.sha256")
+publishing=false
+cleanup() {
+    local index output backup restored=true
+    if [[ "$publishing" == true ]]; then
+        for index in "${!OUTPUTS[@]}"; do
+            output="${OUTPUTS[$index]}"
+            backup="$WORK_DIR/previous-${output##*/}"
+            # A staged path disappears when it has been moved to its final destination.
+            if [[ ! -e "${STAGED_OUTPUTS[$index]}" ]] && ! rm -rf "$output"; then
+                restored=false
+                continue
+            fi
+            if [[ -e "$backup" || -L "$backup" ]] && ! mv "$backup" "$output"; then
+                restored=false
+            fi
+        done
+    fi
+    if [[ "$restored" == false ]]; then
+        echo "Previous release files left in $WORK_DIR" >&2
+        return
+    fi
+    rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir "$STAGING_DIR"
+TRANSCRIBERRR_LOCKED_DIST="$DIST_DIR" TRANSCRIBERRR_STAGED_APP="$STAGED_APP" \
+    "$ROOT_DIR/scripts/build-macos-app.sh"
 
 # Notarize and staple the app itself, not only the disk image: once copied to /Applications the
 # app no longer carries the DMG's ticket, and an offline first launch would need its own.
 if [[ -n "${NOTARY_PROFILE:-}" ]]; then
-    ditto -c -k --keepParent "$APP_DIR" "$STAGING_DIR/Transcriberrr.zip"
-    notarize "$STAGING_DIR/Transcriberrr.zip"
-    rm "$STAGING_DIR/Transcriberrr.zip"
-    xcrun stapler staple "$APP_DIR"
+    ditto -c -k --keepParent "$STAGED_APP" "$WORK_DIR/Transcriberrr.zip"
+    notarize "$WORK_DIR/Transcriberrr.zip"
+    xcrun stapler staple "$STAGED_APP"
 fi
 
-# ditto preserves the signature and stapled ticket exactly.
-ditto "$APP_DIR" "$STAGING_DIR/Transcriberrr.app"
 ln -s /Applications "$STAGING_DIR/Applications"
 
 hdiutil create \
     -volname "Transcriberrr ${VERSION}" \
     -srcfolder "$STAGING_DIR" \
-    -ov \
     -format UDZO \
     -imagekey zlib-level=9 \
-    "$DMG_PATH"
+    "$STAGED_DMG"
 
 # With a Developer ID identity, sign the disk image too, and notarize and staple it when
 # NOTARY_PROFILE is set.
 if [[ "${CODESIGN_IDENTITY:--}" != "-" ]]; then
-    codesign --force --sign "$CODESIGN_IDENTITY" --timestamp "$DMG_PATH"
+    codesign --force --sign "$CODESIGN_IDENTITY" --timestamp "$STAGED_DMG"
     if [[ -n "${NOTARY_PROFILE:-}" ]]; then
-        notarize "$DMG_PATH"
-        xcrun stapler staple "$DMG_PATH"
+        notarize "$STAGED_DMG"
+        xcrun stapler staple "$STAGED_DMG"
     fi
 fi
 (
-    cd "$DIST_DIR"
-    shasum -a 256 "$(basename "$DMG_PATH")" > "$(basename "$SHA_PATH")"
+    cd "$WORK_DIR"
+    shasum -a 256 "$DMG_NAME" > "$DMG_NAME.sha256"
 )
 
+# Keep the previous release until the new app, disk image and checksum are ready to publish.
+publishing=true
+for output in "${OUTPUTS[@]}"; do
+    if [[ -e "$output" || -L "$output" ]]; then
+        mv "$output" "$WORK_DIR/previous-${output##*/}"
+    fi
+done
+for index in "${!OUTPUTS[@]}"; do
+    mv "${STAGED_OUTPUTS[$index]}" "${OUTPUTS[$index]}"
+done
+publishing=false
+
+echo "Built $APP_DIR (signed: ${CODESIGN_IDENTITY:--})"
 echo "Built $DMG_PATH"
 echo "Wrote $SHA_PATH"

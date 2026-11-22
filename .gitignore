@@ -3,6 +3,7 @@
 
 # Swift Package Manager build output
 /ui/.build/
+/ui/.swiftpm/xcode/xcuserdata/
 
 # Local release bundles and archives
 /dist/
@@ -21,12 +22,23 @@
 *.aiff
 *.aif
 *.caf
+*.aac
 *.m4a
+*.m4b
+*.m4v
+*.mov
 *.mp3
+*.mp4
 *.flac
 *.ogg
+*.opus
+*.qta
 *.webm
 *.jsonl
+!design/realtime-traces/*.jsonl
+
+# Python reference client and acceptance fixtures
+__pycache__/
 
 # macOS and local environment files
 .DS_Store

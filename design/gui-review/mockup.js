@@ -88,7 +88,8 @@ function planOutputs(job) {
     });
 }
 
-const sameOutput = (a, b) => a.name === b.name && a.location === b.location && a.tag === b.tag;
+const samePath = (a, b) => a.name === b.name && a.location === b.location;
+const sameOutput = (a, b) => samePath(a, b) && a.tag === b.tag;
 const savedOutput = (job, expected) => job.outputs.find(output => output.state === "Complete" && sameOutput(output, expected));
 const outstanding = job => !planOutputs(job).every(expected => savedOutput(job, expected));
 
@@ -267,7 +268,8 @@ function drawRecording(job) {
         ? section("Speaker tracks", line("Participants", job.tracks.length) + line("Bleed reduction", "Automatic") + line("Merge order", "By timestamp"))
         : section("Track settings", checkField("speakerTrack", "Speaker track", job.track)
             + checkField("speakerDiarize", "Diarize track", job.diarize, Boolean(run) || !supportsDiarization() || job.track)
-            + (job.diarize ? field("speakers", "Speakers", picker("speakers", ["Auto", "1", "2", "3", "4", "5", "6", "7", "8"], job.speakers)) : "")
+            + (job.diarize && supportsDiarization() ? field("speakers", "Speakers",
+                picker("speakers", ["Auto", "1", "2", "3", "4", "5", "6", "7", "8"], job.speakers)) : "")
             + (job.track ? "<p>Speaker tracks from the same folder are merged.</p>" : ""));
     const previous = outputs.some(output => output.state);
     const oldOutputs = job.outputs.filter(output => output.state === "Complete" && !outputs.includes(output));
@@ -334,13 +336,13 @@ function drawRunbar(visible) {
     start.classList.toggle("running-action", Boolean(run));
 }
 
-function repaint({ followFilter = false } = {}) {
+function repaint({ followFilter = false, keepInspector = false } = {}) {
     const visible = matchingJobs();
     if (followFilter && !visible.some(job => job.id === inspected)) inspected = visible[0]?.id ?? null;
     el("regex").setAttribute("aria-pressed", regex);
     el("add").disabled = Boolean(run);
     drawQueue(visible);
-    drawInspector(visible);
+    if (!keepInspector) drawInspector(visible);
     drawRunbar(visible);
 }
 
@@ -410,7 +412,9 @@ function tick() {
         if (bar) bar.value = run.stepElapsed;
         return;
     }
-    run.steps[run.index].output.state = "Complete";
+    const { job, output } = run.steps[run.index];
+    output.state = "Complete";
+    job.outputs = job.outputs.filter(previous => previous === output || !samePath(previous, output));
     run.stepElapsed = 0;
     run.index += 1;
     if (run.index === run.steps.length) finish(false);
@@ -551,6 +555,7 @@ el("ins").onclick = event => {
 
 el("ins").onchange = event => {
     const input = event.target;
+    if (input.type === "text") return;
     const job = jobs.find(item => item.id === inspected);
     const value = input.type === "checkbox" ? input.checked : input.value;
     if (input.id === "speakerTrack") {
@@ -568,6 +573,13 @@ el("ins").onchange = event => {
         }
     }
     repaint({ followFilter: true });
+};
+
+el("ins").oninput = event => {
+    const input = event.target;
+    if (input.type !== "text") return;
+    settings[input.id] = input.value;
+    repaint({ followFilter: true, keepInspector: true });
 };
 
 el("sheetBody").onchange = event => {
@@ -628,8 +640,15 @@ el("sheetBody").onclick = event => {
         el("sheet").close();
         break;
     case "newPass": {
-        const unused = Object.keys(engines).find(engine => !passes.some(pass => pass.engine === engine));
-        const pass = unused ? makePass(unused) : makePass("qwen", "qwen3-asr-0.6b");
+        const used = new Set(passes.map(modelTag));
+        const choices = [
+            ...Object.entries(engines).map(([engine, { model, tag }]) => ({ engine, model, tag })),
+            { engine: "qwen", model: "qwen3-asr-0.6b", tag: "qw06" },
+            { engine: "parakeet", model: "parakeet-tdt-v3", tag: "pkt" }
+        ];
+        const { engine, model } = choices.find(choice => !used.has(choice.tag))
+            ?? { engine: "qwen", model: "" };
+        const pass = makePass(engine, model);
         passes.push(pass);
         passEditor("engine-" + pass.id);
         repaint();

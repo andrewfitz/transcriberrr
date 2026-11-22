@@ -1,0 +1,47 @@
+name: Realtime transcription tests
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  realtime:
+    name: ${{ matrix.check }}
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [tests, bundle]
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install required Rust toolchain
+        run: |
+          rust_version="$(awk -F '"' '/^rust-version = / { print $2; exit }' Cargo.toml)"
+          rustup toolchain install --profile minimal "$rust_version"
+          rustup override set "$rust_version"
+      - name: Run Rust tests
+        if: matrix.check == 'tests'
+        run: cargo test --locked --all-features
+      - name: Exercise reference client reconnect and audio replay
+        if: matrix.check == 'tests'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/realtime-client"
+          "$RUNNER_TEMP/realtime-client/bin/pip" install websockets==15.0.1
+          "$RUNNER_TEMP/realtime-client/bin/python" tests/realtime/reference_client.py -v
+      - name: Build and verify the macOS bundle
+        if: matrix.check == 'bundle'
+        run: |
+          ./scripts/build-macos-app.sh
+          cli="dist/Transcriberrr.app/Contents/Helpers/transcriberrr"
+          "$cli" serve --help
+          "$cli" capabilities | jq -e '
+            .automation.serve == ["serve"] and
+            any(.engines[]; .name == "qwen3" and .realtime.included) and
+            any(.engines[]; .name == "parakeet-v3" and .realtime.included and .diarization) and
+            any(.engines[]; .name == "apple-native" and .helper_present)
+          '

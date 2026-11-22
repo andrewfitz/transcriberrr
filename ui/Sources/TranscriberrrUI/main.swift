@@ -1,5 +1,7 @@
 import AVFoundation
 import AppKit
+import Combine
+import Darwin
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -14,7 +16,7 @@ struct TranscriberrrUIApp: App {
     var body: some Scene {
         WindowGroup("Transcriberrr") {
             QueueWindow(state: state)
-                .frame(minWidth: 660, minHeight: 460)
+                .frame(minWidth: 780, minHeight: 460)
         }
         .defaultSize(width: 1050, height: 720)
         .windowResizability(.contentSize)
@@ -22,11 +24,27 @@ struct TranscriberrrUIApp: App {
             // A second window would only mirror the same queue. The group must not be empty
             // (that removes the whole File menu, including Close / Cmd-W).
             CommandGroup(replacing: .newItem) {
-                Button("Add Files…") { state.chooseFiles() }
+                Button("Add Recordings…") { state.chooseFiles() }
                     .keyboardShortcut("o")
                     .disabled(state.isRunning)
             }
+            QueueCommands()
         }
+        // Dock feedback belongs to the app, not the window: a run continues with the window
+        // closed, and a badge driven by the window's view would freeze and never clear.
+        .onChange(of: dockBadge) { _, badge in
+            NSApp.dockTile.badgeLabel = badge
+        }
+        .onChange(of: state.isRunning) { _, running in
+            guard !running, state.lastRunSummary != nil, !NSApp.isActive else { return }
+            NSApp.requestUserAttention(.informationalRequest)
+        }
+    }
+
+    /// Long runs happen in the background; mirror progress on the Dock icon.
+    private var dockBadge: String? {
+        guard state.isRunning, !state.activePassUsesApple else { return nil }
+        return state.queueProgress.formatted(.percent.precision(.fractionLength(0)))
     }
 }
 
@@ -104,7 +122,7 @@ enum OutputDestination: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .folder: "Destination folder"
+        case .folder: "Folder"
         case .besideOriginal: "Next to original"
         }
     }
@@ -300,34 +318,38 @@ private final class ProgressReader {
     // silently discard that partial event.
     private var remainder = Data()
     private(set) var events: [String: ProgressEvent] = [:]
+    private let decoder = JSONDecoder()
 
-    func read(from url: URL) -> [String: ProgressEvent] {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return events }
+    func readChanges(from url: URL) -> [String: ProgressEvent] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [:] }
         defer { try? handle.close() }
-        try? handle.seek(toOffset: offset)
-        let data = handle.readDataToEndOfFile()
-        offset = handle.offsetInFile
-        guard !data.isEmpty else { return events }
+        guard (try? handle.seek(toOffset: offset)) != nil,
+              let data = try? handle.readToEnd(), !data.isEmpty else { return [:] }
+        offset += UInt64(data.count)
 
         let combined = remainder + data
         var lineStart = combined.startIndex
+        var changes: [String: ProgressEvent] = [:]
         for index in combined.indices where combined[index] == 0x0A {
             let line = combined[lineStart..<index]
             lineStart = combined.index(after: index)
-            guard let event = try? JSONDecoder().decode(ProgressEvent.self, from: line) else { continue }
-            events[canonicalPath(event.input)] = event
+            guard let event = try? decoder.decode(ProgressEvent.self, from: line) else { continue }
+            let key = canonicalPath(event.input)
+            events[key] = event
+            changes[key] = event
         }
         remainder = Data(combined[lineStart...])
-        return events
+        return changes
     }
 }
 
 /// Drains a child process pipe while it runs. A pipe holds only ~64 KB; the CLI
 /// writes a line per finished track, so reading only after exit deadlocks a large
 /// queue (the CLI blocks on write and never exits). Keeps a bounded tail for errors.
-private final class PipeCollector: @unchecked Sendable {
+final class PipeCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
+    private var finished = false
     private let limit: Int?
     private let onData: (@Sendable (Data) -> Void)?
     let pipe = Pipe()
@@ -341,6 +363,7 @@ private final class PipeCollector: @unchecked Sendable {
             guard let self else { return }
             self.lock.lock()
             defer { self.lock.unlock() }
+            guard !self.finished else { return }
             let chunk = handle.availableData
             // Empty data means EOF; without clearing, the handler is re-invoked in a busy loop.
             if chunk.isEmpty {
@@ -360,19 +383,44 @@ private final class PipeCollector: @unchecked Sendable {
 
     /// Call from the termination handler (or after a failed launch): stops the reader and
     /// collects anything left.
-    func finish() -> String {
-        pipe.fileHandleForReading.readabilityHandler = nil
+    func finishData(waitForEOF: Bool = true) -> Data {
+        let reader = pipe.fileHandleForReading
+        reader.readabilityHandler = nil
         // A process that never started leaves this the only write end, and reading to EOF
         // would wait forever; after a launch, closing this copy changes nothing.
         try? pipe.fileHandleForWriting.close()
         lock.lock()
         defer { lock.unlock() }
-        let rest = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard !finished else { return data }
+        finished = true
+        defer { try? reader.close() }
+        let rest = waitForEOF ? reader.readDataToEndOfFile() : bufferedData(from: reader)
         if !rest.isEmpty {
             append(rest)
             onData?(rest)
         }
-        return String(decoding: data, as: UTF8.self)
+        return data
+    }
+
+    // A descendant can keep the pipe open even after the managed process exits.
+    // Read the pending bytes without waiting for that descendant to close its copy.
+    private func bufferedData(from reader: FileHandle) -> Data {
+        let descriptor = reader.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else { return Data() }
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 32 * 1024)
+        while result.count < 256 * 1024 {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count < 0, errno == EINTR { continue }
+            guard count > 0 else { break }
+            result.append(contentsOf: buffer.prefix(count))
+        }
+        return result
+    }
+
+    func finish(waitForEOF: Bool = true) -> String {
+        String(decoding: finishData(waitForEOF: waitForEOF), as: UTF8.self)
     }
 }
 
@@ -408,6 +456,12 @@ extension AppState {
 
 @MainActor
 final class AppState: ObservableObject {
+    let server = RealtimeServer()
+    var batchPausedForServer: Bool { server.phase.isActive }
+    var canStartRealtimeServer: Bool { !batchPausedForServer && !isRunning && downloadingLibraryModel == nil }
+    var canStartBatch: Bool {
+        !isRunning && !batchPausedForServer && downloadingLibraryModel == nil && addOperations == 0
+    }
     @Published var items: [AudioItem] = []
     @Published var outputFolder = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Transcripts")
     @Published var outputDestination: OutputDestination = .folder
@@ -447,11 +501,10 @@ final class AppState: ObservableObject {
     @Published private(set) var addOperations = 0
 
     private var pendingSave: Task<Void, Never>?
+    private var serverActivity: AnyCancellable?
     private var activeProcess: Process?
-    private var queueStartedAt: Date?
+    private var queueStartedAt: TimeInterval?
     private var storedQueueElapsedSeconds: TimeInterval = 0
-    @Published private var clock = Date()
-    private var clockTask: Task<Void, Never>?
 
     private var queueFile: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -461,16 +514,27 @@ final class AppState: ObservableObject {
 
     init() {
         loadQueue()
+        serverActivity = server.$phase.map(\.isActive).removeDuplicates().dropFirst().sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         // saveQueue() is debounced, so flush on quit. Child processes also outlive the
         // app; stop the CLI rather than leave it holding the GPU with nobody watching.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.pendingSave?.cancel()
-                self.activeProcess?.terminate()
+                self.server.stop()
+                if let process = self.activeProcess, process.isRunning { process.terminate() }
                 self.writeQueue()
             }
         }
+    }
+
+    func startRealtimeServer(bind: String, port: String, engine: ServerEngine, model: String,
+                             offline: Bool, apiKey: String, options: ServerOptions) {
+        guard canStartRealtimeServer else { return }
+        server.start(cliURL: cliURL, nativeURL: nativeURL, bind: bind, portText: port, engine: engine,
+                     model: model, offline: offline, apiKey: apiKey, options: options)
     }
 
     var selectedItems: [AudioItem] { items.filter(\.selected) }
@@ -560,14 +624,7 @@ final class AppState: ObservableObject {
 
     var queueElapsedSeconds: TimeInterval {
         guard let queueStartedAt else { return storedQueueElapsedSeconds }
-        return max(0, clock.timeIntervalSince(queueStartedAt))
-    }
-
-    var queueEstimatedRemainingSeconds: TimeInterval? {
-        let progress = queueProgress
-        let elapsed = queueElapsedSeconds
-        guard isRunning, progress > 0.01, elapsed > 0 else { return nil }
-        return max(0, elapsed * (1 / progress - 1))
+        return ProcessInfo.processInfo.systemUptime - queueStartedAt
     }
 
     /// Model families, so switching engines swaps any model of the other family (sizes,
@@ -579,7 +636,7 @@ final class AppState: ObservableObject {
     private func isParakeetModel(_ id: String) -> Bool { !isLocalModelPath(id) && id.lowercased().contains("parakeet") }
 
     func add(urls: [URL]) {
-        guard !urls.isEmpty else { return }
+        guard !isRunning, !urls.isEmpty else { return }
         let addFormat = format
         let manifest = JobManifest(items: urls.map {
             ManifestItem(input: $0.standardizedFileURL.path, diarize: diarize, outputDir: outputFolder.path,
@@ -634,18 +691,26 @@ final class AppState: ObservableObject {
         process.standardOutput = stdout.pipe
         process.standardError = stderr.pipe
         let tracked = trackProcess && !inventoryOnly
-        let result: (Int32, String, String) = try await withCheckedThrowingContinuation { continuation in
+        return try await withCheckedThrowingContinuation { continuation in
             process.terminationHandler = { process in
                 if tracked {
                     Task { @MainActor in
                         if self.activeProcess === process { self.activeProcess = nil }
                     }
                 }
-                continuation.resume(returning: (process.terminationStatus, stdout.finish(), stderr.finish()))
+                let data = stdout.finishData()
+                let errors = stderr.finish().trimmingCharacters(in: .whitespacesAndNewlines)
+                guard process.terminationStatus == 0 else {
+                    let message = errors.isEmpty ? "Transcriber could not plan the queue (exit \(process.terminationStatus))." : errors
+                    continuation.resume(throwing: PlanningFailure(message: message))
+                    return
+                }
+                continuation.resume(with: Result { try JSONDecoder().decode(QueuePlan.self, from: data) })
             }
             let failedToLaunch: (Error) -> Void = { error in
-                _ = stdout.finish()
-                _ = stderr.finish()
+                process.terminationHandler = nil
+                _ = stdout.finishData()
+                _ = stderr.finishData()
                 continuation.resume(throwing: error)
             }
             if !tracked {
@@ -655,10 +720,6 @@ final class AppState: ObservableObject {
                 launch(process, onFailure: failedToLaunch)
             }
         }
-        guard result.0 == 0 else {
-            throw PlanningFailure(message: result.2.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return try JSONDecoder().decode(QueuePlan.self, from: Data(result.1.utf8))
     }
 
     private struct PlanningFailure: LocalizedError {
@@ -709,6 +770,14 @@ final class AppState: ObservableObject {
                 mergeResults[meeting.output] = MergedSession(
                     id: meeting.output, label: meeting.label, state: "done", message: "Transcript already exists",
                     meetingID: meeting.id, modelTag: tag)
+            }
+        }
+        if selectingMeetings {
+            let unfinishedMerges = Set(plan.files.compactMap { file in
+                file.done == false ? file.mergeOutput : nil
+            })
+            for path in unfinishedMerges {
+                mergeResults.removeValue(forKey: path)
             }
         }
         zoomMeetings.removeAll { updates[$0.id] != nil }
@@ -828,6 +897,7 @@ final class AppState: ObservableObject {
     }
 
     func remove(_ item: AudioItem) {
+        guard !isRunning else { return }
         if item.zoomRecording { removedZoomInputs.insert(canonicalPath(item.url.path)) }
         items.removeAll { $0.id == item.id }
         pruneOutcomes()
@@ -835,10 +905,18 @@ final class AppState: ObservableObject {
     }
 
     func removeMeeting(_ meeting: ZoomMeeting) {
+        guard !isRunning else { return }
         items.removeAll { $0.zoomMeeting == meeting.id }
         zoomMeetings.removeAll { $0.id == meeting.id }
         mergeResults = mergeResults.filter { $0.key != meeting.output && $0.value.meetingID != meeting.id }
         pruneOutcomes()
+        saveQueue()
+    }
+
+    /// Drops a merged transcript's queue row. Clear Completed only takes finished ones, so a
+    /// failed or canceled merge whose tracks are gone would otherwise stay forever.
+    func removeMergedSession(_ id: String) {
+        guard !isRunning, mergeResults.removeValue(forKey: id) != nil else { return }
         saveQueue()
     }
 
@@ -862,6 +940,7 @@ final class AppState: ObservableObject {
     }
 
     func clearCompleted() {
+        guard !isRunning else { return }
         let completed = completedMeetingIDs
         items.removeAll { item in
             item.zoomMeeting.map(completed.contains) ?? (item.state == .done)
@@ -1008,15 +1087,20 @@ final class AppState: ObservableObject {
         guard isRunning, !isCancelling else { return }
         isCancelling = true
         modelActivityMessage = "Stopping safely and cleaning temporary queue files…"
-        guard let process = activeProcess else { return }
+        stopActiveProcess()
+    }
+
+    private func stopActiveProcess() {
+        guard let process = activeProcess, process.isRunning else { return }
         // SIGTERM lets the CLI stop at the next chunk, stop its helper, and remove temp
         // files; before its first job (model loading) it exits at once. A long step without a
         // checkpoint (decoding hours of audio, diarizing) can take a while, and killing it
         // then orphans the helper, so force-stop only a CLI that seems stuck.
         process.terminate()
-        Task { @MainActor in
+        Task { @MainActor [weak self, weak process] in
             try? await Task.sleep(for: .seconds(120))
-            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            guard let process, self?.activeProcess === process, process.isRunning else { return }
+            kill(process.processIdentifier, SIGKILL)
         }
     }
 
@@ -1045,7 +1129,7 @@ final class AppState: ObservableObject {
     }
 
     private func startRun(_ targets: Set<RunTarget>, scopedRetry: Bool) {
-        guard !isRunning, downloadingLibraryModel == nil, addOperations == 0, !targets.isEmpty else { return }
+        guard canStartBatch, !targets.isEmpty else { return }
         runScopeIDs = Set(items.filter { targets.contains(runTarget(for: $0)) }.map(\.id))
         guard !runScopeIDs.isEmpty else { return }
         runTargets = targets
@@ -1074,7 +1158,7 @@ final class AppState: ObservableObject {
             }
             let tags: [String?]
             do {
-                tags = try await validateModelPasses(passes)
+                tags = try await validateModelPasses(passes, trackProcess: true)
             } catch {
                 if !isCancelling { planningError = error.localizedDescription }
                 lastRunSummary = isCancelling ? "Run canceled" : "Couldn’t start transcription"
@@ -1099,7 +1183,12 @@ final class AppState: ObservableObject {
                 runItemIDs = []
                 activeModelTag = tag
                 activePassUsesApple = pass.usesApple
-                activePassLabel = "Pass \(index + 1) of \(passes.count) · \(pendingOutcomes[index].label)"
+                // Name the engine; add the model only when two passes share an engine.
+                var name = pass.displayName
+                if passes.filter({ $0.engine == pass.engine }).count > 1, !pass.usesApple {
+                    name += " (\(pass.modelArgument.split(separator: "/").last.map(String.init) ?? pass.modelArgument))"
+                }
+                activePassLabel = passes.count == 1 ? "Transcribing with \(name)" : "Pass \(index + 1) of \(passes.count) · \(name)"
                 await transcribePass(pass, tag: tag, scopedRetry: scopedRetry, pendingOutcomes: pendingOutcomes)
                 if runTargets.contains(where: { outcomes[$0]?[index].phase == .canceled }) { break }
             }
@@ -1314,11 +1403,11 @@ final class AppState: ObservableObject {
     }
 
     @discardableResult
-    private func updatePassOutcomes(ending: Bool = false) -> Bool {
+    private func updatePassOutcomes(ending: Bool = false, targets: Set<RunTarget>? = nil) -> Bool {
         var next = outcomes
         var finished = false
-        for (target, work) in currentPassWork {
-            guard var outcome = next[target]?[passIndex] else { continue }
+        for target in targets.map(Array.init) ?? Array(currentPassWork.keys) {
+            guard let work = currentPassWork[target], var outcome = next[target]?[passIndex] else { continue }
             let prior = outcome
             let merge = work.mergePath.flatMap { mergeResults[$0] }
             let failure = work.items.compactMap { item -> String? in
@@ -1416,25 +1505,13 @@ final class AppState: ObservableObject {
     }
 
     private func startQueueClock() {
-        clockTask?.cancel()
-        let now = Date()
-        clock = now
-        queueStartedAt = now
+        queueStartedAt = ProcessInfo.processInfo.systemUptime
         storedQueueElapsedSeconds = 0
-        clockTask = Task { @MainActor [weak self] in
-            while let self, !Task.isCancelled, self.isRunning {
-                self.clock = Date()
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
     }
 
     private func finishQueueClock() {
-        clock = Date()
         storedQueueElapsedSeconds = queueElapsedSeconds
         queueStartedAt = nil
-        clockTask?.cancel()
-        clockTask = nil
     }
 
     private func requiredModelDownloads(for pending: [AudioItem], pass: TranscriptionPass) async -> [String] {
@@ -1461,27 +1538,27 @@ final class AppState: ObservableObject {
         guard !candidates.isEmpty else { return [] }
         // If the query fails, let the download step decide; it is a no-op for
         // files already in the cache.
-        guard let cached = await cachedModels(candidates) else { return candidates }
+        guard let cached = await cachedModels(candidates, trackProcess: true) else { return candidates }
         return candidates.filter { cached[$0] != true }
     }
 
     /// Asks the CLI (`--cached-model`) which models are usable offline, so the
     /// app never re-implements aliases, completeness markers, or snapshot rules.
-    private func cachedModels(_ ids: [String]) async -> [String: Bool]? {
+    private func cachedModels(_ ids: [String], trackProcess: Bool = false) async -> [String: Bool]? {
         struct Entry: Decodable { var id: String; var cached: Bool }
-        guard let result = await readCLI(ids.flatMap({ ["--cached-model", $0] })),
+        guard let result = await readCLI(ids.flatMap({ ["--cached-model", $0] }), trackProcess: trackProcess),
               let entries = try? JSONDecoder().decode([Entry].self, from: Data(result.utf8)) else { return nil }
         return Dictionary(entries.map { ($0.id, $0.cached) }, uniquingKeysWith: { first, _ in first })
     }
 
-    private func readModelTag(_ pass: TranscriptionPass) async -> String? {
-        guard let result = await readCLI(["--print-model-tag"] + pass.arguments) else { return nil }
+    private func readModelTag(_ pass: TranscriptionPass, trackProcess: Bool) async -> String? {
+        guard let result = await readCLI(["--print-model-tag"] + pass.arguments, trackProcess: trackProcess) else { return nil }
         let tag = result.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !tag.isEmpty, tag.utf8.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) }) else { return nil }
         return tag
     }
 
-    private func readCLI(_ arguments: [String]) async -> String? {
+    private func readCLI(_ arguments: [String], trackProcess: Bool = false) async -> String? {
         guard let executableURL = cliURL else { return nil }
         let process = Process()
         process.executableURL = executableURL
@@ -1493,14 +1570,19 @@ final class AppState: ObservableObject {
             process.terminationHandler = { process in
                 continuation.resume(returning: (process.terminationStatus, output.finish()))
             }
-            do {
-                try process.run()
-            } catch {
+            let failedToLaunch: (Error) -> Void = { _ in
                 process.terminationHandler = nil
                 _ = output.finish()
                 continuation.resume(returning: nil)
             }
+            if trackProcess {
+                launch(process, onFailure: failedToLaunch)
+            } else {
+                do { try process.run() }
+                catch { failedToLaunch(error) }
+            }
         }
+        if activeProcess === process { activeProcess = nil }
         guard let result, result.0 == 0 else { return nil }
         return result.1
     }
@@ -1528,7 +1610,7 @@ final class AppState: ObservableObject {
         if modelActivityLog.count > 160 {
             modelActivityLog.removeFirst(modelActivityLog.count - 160)
         }
-        if let last = lines.last, !last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !isCancelling, let last = lines.last, !last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             modelActivityMessage = last.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         // No trailing \b: after "%" it requires a word character, so "45% " never matched.
@@ -1548,9 +1630,12 @@ final class AppState: ObservableObject {
         let process = Process()
         process.executableURL = executableURL
         process.arguments = ids.flatMap { ["--download-model", $0] }
-        let output = PipeCollector { [weak self] data in
+        let output = PipeCollector { [weak self, weak process] data in
             let text = String(decoding: data, as: UTF8.self)
-            Task { @MainActor in self?.appendModelActivity(text) }
+            Task { @MainActor in
+                guard let self, let process, self.activeProcess === process else { return }
+                self.appendModelActivity(text)
+            }
         }
         process.standardOutput = output.pipe
         process.standardError = output.pipe
@@ -1578,7 +1663,7 @@ final class AppState: ObservableObject {
         do {
             activeProcess = process
             try process.run()
-            if isCancelling { process.terminate() }
+            if isCancelling { stopActiveProcess() }
         } catch {
             process.terminationHandler = nil
             activeProcess = nil
@@ -1854,26 +1939,37 @@ final class AppState: ObservableObject {
             process.environment = environment
             let errors = PipeCollector()
             process.standardError = errors.pipe
+            process.standardOutput = FileHandle.nullDevice
             let qwenEngine = pass.engine == "qwen"
             let progressReader = ProgressReader()
             // Resolve once: realpath for every row every poll is thousands of syscalls
             // per second on the main actor for a large queue.
-            let keys = items.map { progressKey($0.url.path) }
+            let itemsByKey = Dictionary(items.map { (progressKey($0.url.path), $0) },
+                                        uniquingKeysWith: { first, _ in first })
+            let targetsByMerge = Dictionary(grouping: currentPassWork.keys.compactMap { target in
+                currentPassWork[target]?.mergePath.map { ($0, target) }
+            }, by: { $0.0 }).mapValues { $0.map(\.1) }
             let progressPoller = Task { @MainActor [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .milliseconds(500))
-                    guard !Task.isCancelled else { break }
-                    let events = progressReader.read(from: progressURL)
-                    guard let self else { break }
+                    guard !Task.isCancelled, let self else { break }
+                    let events = progressReader.readChanges(from: progressURL)
+                    guard !events.isEmpty else { continue }
                     var finished = false
-                    for (item, key) in zip(items, keys) {
-                        guard let event = events[key] else { continue }
+                    var targets = Set<RunTarget>()
+                    for (key, event) in events {
+                        if event.kind == "merge" {
+                            self.applyMerge(event)
+                            targets.formUnion(targetsByMerge[event.input] ?? [])
+                            continue
+                        }
+                        guard let item = itemsByKey[key] else { continue }
+                        targets.insert(self.runTarget(for: item))
                         let wasDone = item.state == .done
                         self.apply(event, to: item)
                         finished = finished || (!wasDone && item.state == .done)
                     }
-                    self.applyMerges(events)
-                    finished = self.updatePassOutcomes() || finished
+                    finished = self.updatePassOutcomes(targets: targets) || finished
                     self.objectWillChange.send()
                     // Persist finished rows now: after a crash or force quit they would
                     // otherwise reload as queued and be transcribed again as `name-2`.
@@ -1901,11 +1997,11 @@ final class AppState: ObservableObject {
             }
             progressPoller.cancel()
             await progressPoller.value
-            let events = progressReader.read(from: progressURL)
+            _ = progressReader.readChanges(from: progressURL)
             // The parent is shared by other app instances; remove only this
             // job's directory so their active manifests remain intact.
             try? FileManager.default.removeItem(at: temporaryRoot)
-            return BulkResult(status: result.0, message: result.1, progress: events, outputs: outputs)
+            return BulkResult(status: result.0, message: result.1, progress: progressReader.events, outputs: outputs)
         } catch {
             try? FileManager.default.removeItem(at: temporaryRoot)
             return BulkResult(status: 1, message: error.localizedDescription, progress: [:])
@@ -2112,12 +2208,14 @@ extension AppState {
         saveQueue()
     }
 
-    func validateModelPasses(_ passes: [TranscriptionPass], appendSuffix: Bool? = nil) async throws -> [String?] {
+    func validateModelPasses(_ passes: [TranscriptionPass], appendSuffix: Bool? = nil,
+                             trackProcess: Bool = false) async throws -> [String?] {
         let tagged = passes.count > 1 || (appendSuffix ?? appendModelID)
         var tags: [String?] = []
         var used: [String: Int] = [:]
         for (index, pass) in passes.enumerated() {
             try Task.checkCancellation()
+            if trackProcess && isCancelling { throw CancellationError() }
             if pass.usesApple {
                 guard #available(macOS 26, *) else {
                     throw PlanningFailure(message: "Apple SpeechTranscriber requires macOS 26 or later.")
@@ -2131,7 +2229,7 @@ extension AppState {
                 tags.append(nil)
                 continue
             }
-            guard let tag = await readModelTag(pass) else {
+            guard let tag = await readModelTag(pass, trackProcess: trackProcess) else {
                 throw PlanningFailure(message: "Couldn’t determine the model identifier for pass \(index + 1).")
             }
             if let previous = used.updateValue(index + 1, forKey: tag) {
@@ -2228,7 +2326,7 @@ extension AppState {
         guard downloadingLibraryModel != nil, !isCancelling else { return }
         isCancelling = true
         modelActivityMessage = "Stopping download…"
-        activeProcess?.terminate()
+        stopActiveProcess()
     }
 }
 

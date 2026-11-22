@@ -36,6 +36,7 @@ struct ModelPassEditor: View {
         VStack(spacing: 0) {
             Text("Model Passes")
                 .font(.headline)
+                .accessibilityAddTraits(.isHeader)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding([.horizontal, .top])
             Form {
@@ -68,16 +69,19 @@ struct ModelPassEditor: View {
                                     Label("Move Pass \(index + 1) Up", systemImage: "chevron.up")
                                 }
                                 .disabled(index == 0)
+                                .help("Run this pass earlier")
                                 Button { move(id, by: 1) } label: {
                                     Label("Move Pass \(index + 1) Down", systemImage: "chevron.down")
                                 }
                                 .disabled(index == passes.count - 1)
+                                .help("Run this pass later")
                                 Button {
                                     passes.removeAll { $0.id == id }
                                 } label: {
                                     Label("Remove Pass \(index + 1)", systemImage: "minus")
                                 }
                                 .disabled(passes.count == 1)
+                                .help(passes.count == 1 ? "A run needs at least one pass" : "Remove this pass")
                             }
                             .labelStyle(.iconOnly)
                             .buttonStyle(.borderless)
@@ -90,6 +94,7 @@ struct ModelPassEditor: View {
                         set: { appendSuffix = $0 }
                     ))
                     .disabled(passes.count > 1)
+                    .help(passes.count > 1 ? "Runs with multiple passes always append model IDs" : "Include the model ID in the output filename")
                     if !isChecking, let message = validation?.message {
                         Label(message, systemImage: "exclamationmark.circle")
                             .foregroundStyle(.red)
@@ -170,6 +175,7 @@ struct ModelLibrarySheet: View {
         VStack(spacing: 0) {
             Text("Model Library")
                 .font(.headline)
+                .accessibilityAddTraits(.isHeader)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding([.horizontal, .top])
             Form {
@@ -206,6 +212,11 @@ struct ModelLibrarySheet: View {
             .padding()
         }
         .frame(width: 540)
+        // A finished download or failed model setup stays up until it has been seen. Nothing
+        // else clears it, so without this the run bar would offer "Model Details…" forever.
+        .onDisappear {
+            if state.modelActivityCanDismiss { state.showModelActivity = false }
+        }
         .task(id: key) {
             do {
                 let models = try await state.modelLibrary()
@@ -224,11 +235,14 @@ struct ModelLibrarySheet: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
             if !state.modelActivityCanDismiss {
-                if let progress = state.modelActivityProgress {
-                    ProgressView(value: progress)
-                } else {
-                    ProgressView()
+                Group {
+                    if let progress = state.modelActivityProgress {
+                        ProgressView(value: progress)
+                    } else {
+                        ProgressView()
+                    }
                 }
+                .accessibilityLabel(state.modelActivityTitle)
                 if state.downloadingLibraryModel != nil {
                     Button(state.isCancelling ? "Stopping…" : "Cancel Download") {
                         state.cancelLibraryDownload()

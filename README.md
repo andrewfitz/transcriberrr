@@ -1,6 +1,6 @@
 # Transcriberrr
 
-Offline English transcription for Apple Silicon Macs. Transcriberrr ships a native Rust CLI and a small SwiftUI drag-and-drop app. Audio stays on the Mac; model weights are downloaded to a user-owned cache on first use.
+Offline English transcription for Apple Silicon Macs. Transcriberrr ships a native Rust CLI and a small SwiftUI drag-and-drop app. Inference runs on the Mac. Model weights are downloaded to a user-owned cache on first use.
 
 ## Features
 
@@ -11,7 +11,8 @@ Offline English transcription for Apple Silicon Macs. Transcriberrr ships a nati
 - Optional Sortformer speaker diarization, including a per-job speaker limit.
 - Per-speaker tracks (Zoom participant files and other iso tracks): transcribed together with other speakers' bleed muted, then merged into one transcript with named speakers. Hand over a whole Zoom library folder to get one transcript per meeting. Reruns pick up only missing transcripts.
 - Single files, recursive folders, JSON manifests, resumable JSONL progress, and output beside the source or in one destination folder. The CLI can preview jobs without writes and stream machine-readable results.
-- Native SwiftUI queue with folder drop, regex filtering, visible Check all/None, per-track diarization, saved queue results, elapsed time and ETA per track and selected queue, and a visible model setup/download activity window.
+- Native SwiftUI queue with folder drop, regex filtering, Include Visible and Exclude Visible actions, per-track diarization, saved queue results, elapsed time and ETA per track and selected queue, and a visible model setup/download activity window.
+- Realtime WebSocket transcription for clients that capture their own audio, with headless and macOS app launch controls.
 
 ## Install a GitHub release
 
@@ -23,7 +24,7 @@ Release archives should be built on an Apple Silicon Mac and distributed with a 
 
 ## Build from source
 
-Requirements: Apple Silicon macOS, Xcode Command Line Tools, Swift 6, and Rust 1.99 or newer. `rust-toolchain.toml` selects the stable Rust toolchain.
+Building requires Apple Silicon, Swift 6, a macOS 26 or newer SDK (for the Apple SpeechTranscriber helper), and Rust 1.99 or newer. The app runs on macOS 14 or newer, and the Apple SpeechTranscriber engine requires macOS 26 or newer. `rust-toolchain.toml` selects the stable Rust toolchain.
 
 ```bash
 # CLI with Parakeet Unified and Sortformer support
@@ -85,13 +86,73 @@ printf '%s\n' '{"items":[{"input":"Voice Memo.qta","output":"notes.json","diariz
   | "$TRANSCRIBERRR" --manifest - --plan
 ```
 
-- `capabilities` reports the binary version, engine names and aliases, compiled features, model defaults, supported file extensions, output formats and automation flags. Use `--model-status` for the known model catalog and `--cached-model ID` for explicit Hub IDs, aliases or local paths. `--print-model-tag --engine ENGINE [--model MODEL]` prints the identifier used in filenames.
+- `capabilities` reports the binary version, engine names and aliases, realtime server support, compiled features, model defaults, supported file extensions, output formats and automation flags. Use `--model-status` for the known model catalog and `--cached-model ID` for explicit Hub IDs, aliases or local paths. `--print-model-tag --engine ENGINE [--model MODEL]` prints the identifier used in filenames.
 - `--plan` emits one JSON object on stdout and does not run inference, fetch assets, or write files. With `--pass`, the object contains `passes` in execution order. Check each plan’s `issues`, `summary.rejected_inputs` and `files[].error` before running. `files[].skip` gives the reason an input was left out, `done` marks reused outputs, and `meetings[].output` contains the single merged destination for a Zoom meeting with separate speaker tracks. `required_models` lists the Rust assets needed by pending jobs and whether each resolves locally. Apple checks its speech assets when the helper runs.
 - `--jsonl` streams `run_started`, `pass_started`, `progress`, `pass_finished` and `run_finished` events on stdout. Each line has `schema_version: 1`. A `progress` event has `input`, `status` and a `pass` with its one-based `index`, `engine`, `model` and `model_tag`. A `completed` or `skipped` progress event with an `output` names a saved or reused transcript. `kind: "merge"` identifies a merged result. Check `warning` for details such as no speech or partial participant coverage, and `error` for failures. Terminal events report `completed`, `failed` or `canceled`. Use the process exit status as well. Argument errors and abrupt termination can end a process before a terminal event, and nonzero exit can still leave usable outputs from successful jobs. Diagnostics go to stderr.
 - `--offline` prevents automatic model downloads and cache repairs. Prefetch Rust assets with `--download-model` in a separate invocation. Apple SpeechTranscriber requires an installed speech asset when running offline. A pass that can reuse every destination needs no inference assets.
 - For recurring scans, `--skip-existing` reuses existing ordinary transcript files. Zoom and `--pass` runs already reuse existing destinations by default. `--progress-file PATH --resume` also reuses completed outputs at the path recorded in the log when the file is still present. With `--pass`, `logs/zoom.jsonl` becomes `logs/zoom.qw.jsonl`, `logs/zoom.pk.jsonl`, and so on. Keep one writer per progress log. Use `--overwrite` to reprocess existing destinations.
 - A manifest accepts `items` plus optional `discover_zoom` and `excluded_inputs`. Set `discover_zoom` to `false` to prevent adding unlisted Zoom companions. `excluded_inputs` blocks those paths from automatic companion discovery. An item accepts `input` and optional `diarize`, `speakers`, `iso_track`, `output`, `output_dir`, and `output_location` (`folder` or `next-to-source`). Relative paths in a manifest file resolve beside that file. Paths in a manifest from stdin resolve from the working directory. The same manifest can be sent with several model passes.
 - `convert --json` and `merge --json` return a JSON object with the saved absolute `output` path. For a folder of per-track transcripts from multiple passes, add `merge --model-tag qw` to select only the `.qw.json` files.
+
+## Realtime server
+
+In the macOS app, click **Server** to open **Realtime Server**. Select an engine, configure the bind address and port, and click **Start Server**. The panel shows the actual endpoint and model readiness. The server stays running when you close the panel. Reopen it and click **Stop Server** to shut down. The app stores the bearer key in the macOS Keychain. Expand **Advanced** to allow specific browser origins, change admission limits, configure mixed-track speaker detection, or enable Qwen final word alignment.
+
+Finish or stop a running batch before starting the server from the app. The app pauses new batch work and retries while its server is running, through the end of shutdown.
+
+Run the CLI from a source build or use `Contents/Helpers/transcriberrr` inside the app bundle. Add `--offline` to use locally cached models and disable downloads during startup.
+
+```bash
+./target/release/transcriberrr serve --bind 127.0.0.1 --port 8080 --offline
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/v1/models
+```
+
+Use `serve --help` for model and device selection, capacity limits, and authentication options. The bundled CLI defaults to Parakeet Unified. For live Qwen, the server defaults to Qwen3-ASR-0.6B. A build without the `parakeet` feature starts with this Qwen model. Use `--model qwen3-asr-1.7b` to select the larger checkpoint. Port `0` selects an available port. Read the listening and readiness JSON events on stdout and connect when the model is ready. `GET /healthz` reports readiness, occupied session slots, and backlog without requiring a key. `GET /v1/models` lists the configured model, available compatibility aliases, and active backend capabilities. It requires the configured key when authentication is enabled. `SIGINT` and `SIGTERM` start graceful shutdown with a 10-second deadline. For a process you supervise with a pipe, pass `--exit-on-stdin-eof` to trigger the same shutdown by closing the write end.
+
+The default admission limits are two sessions and two tracks per native session. A disconnected native session holds its slot while it remains eligible to resume. The listener allows up to twice `--max-sessions` plus two upgraded or pending sockets to leave room for reconnects. It returns HTTP `429` when those socket slots are full.
+
+Use `ws://127.0.0.1:8080/v1/realtime?intent=transcription` for the OpenAI-compatible transcription subset. Send JSON text messages with base64-encoded 24 kHz mono signed little-endian PCM16. Configure the session with `session.update`, append audio with `input_audio_buffer.append`, and send `input_audio_buffer.commit` to finalize each turn. `input_audio_buffer.clear` discards an uncommitted turn. Match transcript events to committed turns using `item_id` and treat the completed transcript as authoritative. A client owns audio capture and consumes captions from the socket.
+
+```json
+{"type":"session.update","session":{"type":"transcription","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":null,"transcription":{"model":"gpt-transcribe"}}}}}
+```
+
+| Client event | Server events and behavior |
+| --- | --- |
+| Connect, `session.update` | `session.created`, then `session.updated` after a valid update. Set `turn_detection` to `null` or omit it. `languages` accepts the active engine's supported language codes. Qwen accepts `prompt`. |
+| `input_audio_buffer.append` | No acknowledgment. A streaming model can emit `conversation.item.input_audio_transcription.delta` before commit. |
+| `input_audio_buffer.commit` | `input_audio_buffer.committed` identifies the item. The server sends `conversation.item.added` for a new committed item, and `conversation.item.input_audio_transcription.completed` or `.failed` carries its result. Committing an empty buffer returns an `error`. |
+| `input_audio_buffer.clear` | `input_audio_buffer.cleared`. The discarded turn is not finalized. |
+
+Use `gpt-transcribe` to request recognition after commit. The `gpt-live-transcribe` alias appears in `/v1/models` only when the active engine supports stable pre-commit text. You can also use the advertised local model ID. Each standard connection has a 60-second uncommitted-audio limit. The WebSocket accepts messages up to 256 KiB. Slow readers can be disconnected with close code `4008`.
+
+| Engine | OpenAI-compatible aliases | Native word timing | Languages and hints |
+| --- | --- | --- | --- |
+| `qwen3` | `gpt-transcribe` | Final words with `--forced-aligner` | Qwen languages and optional `prompt` |
+| `parakeet-v3` with Parakeet Unified | `gpt-transcribe`, `gpt-live-transcribe` | Yes | English |
+| `apple-native` on macOS 26+ | `gpt-transcribe` | Yes, from SpeechTranscriber audio time ranges | US English |
+
+For a native two-microphone client on macOS, Apple Speech delivered pre-commit drafts for all 606 annotated utterances in a 30-minute capture with a 1.23 s first-text p95. For a standard OpenAI client that needs text before commit, use Parakeet with `gpt-live-transcribe`. Its repeated two-mic test reached a 1.84 s first-text p95, and extended runs under heavy host load reported audio loss. [Measurements and test conditions](design/realtime-server-validation.md)
+
+With a build that includes diarization, use `--diarization-model ID_OR_PATH` to load Sortformer for native mixed tracks and request `diarization: true` when registering the track. Qwen and Apple can send revisable native drafts. The native session announcement identifies the capabilities and limits of the running server.
+
+Add `&transcriberrr=1` to opt into the native multi-track protocol. It uses one shared 24 kHz frame clock across tracks. Register each track with `transcriberrr.track.register` and a role of `isolated_mic` or `mixed_audio`, then send `transcriberrr.track.append` with `track_id`, `start_frame`, and base64 `audio`. Set `speaker` at registration to attach a name. Each append can carry up to one second of audio. The server can wait up to 250 ms for missing frames, with a pending limit of 48,000 frames or 128 packets per track. `transcriberrr.track.commit` flushes one track and `transcriberrr.session.end` flushes them all. Replace a draft with any higher revision for the same item. A final or retraction closes the item. An item is capped at 30 seconds. For continuous speech, the server looks for a confirmed word boundary in the final 2.4 seconds with a timed streaming backend, or cuts at a quiet point in the final second with an untimed backend.
+
+After a timed Parakeet cut, up to 1.44 seconds of preceding audio can seed the next decoder while the preceding caption retains its words.
+
+When native recognition falls behind, the server sends `transcriberrr.track.backlog` with the affected track and queued frame count. It retains audio in order and pauses socket reads if capture buffers fill. A paused connection can delay every track multiplexed on that socket. Live clients should keep microphone capture independent of WebSocket writes and retain unsent audio for the duration of a stall. A client that loses captured frames can report the exact range with `transcriberrr.track.gap`.
+
+For a reconnect, add `&resume=1` to the native WebSocket URL. This lets the server wait for the resume message when a client is slow to send it, including when all session slots are occupied. Send `transcriberrr.session.resume` as the first message with `session_id`, `resume_credential`, and `last_sequence`. Use the returned `next_expected_frames` to continue sending audio and process replayed events in sequence order. A disconnected session can resume for up to 30 seconds. The replay buffer holds up to 256 events or 4 MiB. If the server reports `replay_unavailable`, retry with `accept_loss: true` to take over and receive the exact `lost_range` followed by the retained events. A successful takeover closes the previous connection with code `4009`.
+
+The reference client streams 24 kHz mono PCM16 WAV files at capture speed. In native mode, stdout carries the wire events and stderr reports capture time, drain time, the longest send, backlog, replay loss and unexpected frame gaps. A reported unexpected audio gap makes the run exit unsuccessfully after draining. Once capture ends, the client waits up to 30 seconds between recognition progress events. It requires Python 3.11+ and `websockets==15.0.1`. [Reference client](scripts/realtime-client.py) · [Captured wire examples](design/realtime-traces/README.md) · [Measured performance and validation](design/realtime-server-validation.md)
+
+```bash
+python scripts/realtime-client.py --url ws://127.0.0.1:8080 --model gpt-transcribe alice.wav
+python scripts/realtime-client.py --url ws://127.0.0.1:8080 --native --reconnect-at 2 alice.wav bob.wav
+```
+
+The default listener is on loopback. Set `TRANSCRIBERRR_API_KEY` or pass `--api-key-file PATH` to require a bearer key. A non-loopback bind requires a key. Send it with `Authorization: Bearer <key>` or the browser WebSocket subprotocols `realtime` and `openai-insecure-api-key.<key>`. To permit a browser origin, pass `--allow-origin` with the exact origin, including its scheme and port if applicable. Repeat the flag for multiple origins. Deploy a TLS-terminating reverse proxy for remote clients and connect over `wss://`.
 
 ## Model passes
 
@@ -181,7 +242,7 @@ Tracks must share a timeline (all recorded from the same moment). Words from all
 
 Speakers are named from the audio file names recorded in the transcripts. Zoom participant files (`audioAndrewDaniel21067067067.m4a`, `audio_jordan_k.41864297531.m4a`, `audio_only_13572468_Dana_Reyes.m4a`) give the participant's name; other names drop track numbers and words like `iso`, `mic`, and `track` (`1-alice.flac` is "Alice"). `--name` overrides the guesses in the order the files are listed (so it needs listed files, not a folder). A Zoom file name ends with a file number, a segment digit, and a 9-digit meeting ID; each connection starts a new file with the meeting's next number, covering the whole segment, so a speaker's files share the timeline. Zoom's mixed recording (`audio1067067067.m4a`) is not a speaker track and is refused when listed.
 
-Listed files are merged as given, with a warning if they come from different Zoom sessions or differ in length. A folder, or a single Zoom track (or the mixed recording's transcript), merges that folder's transcripts from the same meeting, matched on the meeting ID whatever the file number and segment digit. A folder holding several meetings lists them; pick one with `--session ID` (the 9-digit meeting ID, or the 10 digits after the file number). When only one participant has tracks, the mixed recording's transcript supplies "Other speakers" as above. Earlier merges, other mixed recordings, other meetings, and unreadable JSON in the folder are skipped with a note. Without Zoom tracks, a folder merges all of its transcripts.
+Listed files are merged as given, with a warning if they come from different Zoom sessions or differ in length. A folder, or a single Zoom track (or the mixed recording's transcript), merges that folder's transcripts from the same meeting, matched on the meeting ID whatever the file number and segment digit. A folder holding several meetings lists them; pick one with `--session ID` (the 9-digit meeting ID, or the 10 digits after the file number). When only one participant has tracks, the merge can use a matching mixed transcript to label speech outside that participant’s turns as "Other speakers". Earlier merges, other mixed recordings, other meetings, and unreadable JSON in the folder are skipped with a note. Without Zoom tracks, a folder merges all of its transcripts.
 
 The merged JSON lists `speaker_names` by speaker ID and records each track's source, speaker, and offset in `metadata.merged_from`. TXT/SRT/VTT label speakers by name, and `convert` reads merged transcripts like any other. Mic bleed transcribed into these tracks stays; transcribe the audio as speaker tracks (above) to remove it.
 

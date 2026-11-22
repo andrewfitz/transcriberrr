@@ -10,12 +10,15 @@ enum InspectorPane: String, CaseIterable {
 struct RecordingInspector: View {
     @ObservedObject var state: AppState
     var selection: QueueSelection?
+    /// The selected row's status exactly as the queue shows it.
+    var status: QueueRowStatus?
     @Binding var pane: InspectorPane
     var editPasses: () -> Void
     var plannedOutputs: [PlannedTranscript]
     var planningOutputs: Bool
     var planError: String? = nil
     var retry: (QueueSelection) -> Void
+    var remove: (QueueSelection) -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,9 +49,7 @@ struct RecordingInspector: View {
                     recordingOverview(item)
                     transcriptSections(resolvedOutputs(for: item))
                     if item.skipReason == nil { trackSettings(item) }
-                    recordingActions(.recording(item.id), canRetry: isIncomplete(item.state)) {
-                        state.remove(item)
-                    }
+                    removeSection(.recording(id))
                 }
             } else {
                 noSelection
@@ -59,30 +60,33 @@ struct RecordingInspector: View {
                 let tracks = items.filter { $0.skipReason == nil }
                 let history = state.meetingResults(meeting, previous: state.mergedSessions.filter { $0.meetingID == id })
                 let outcomes = state.passOutcomes(for: .meeting(id))
-                let status = meetingStatus(tracks: tracks, latest: state.meetingResult(meeting), outcomes: outcomes)
                 inspectorForm {
                     Section {
-                        LabeledContent("Status", value: status)
+                        statusRow
                         if let duration = tracks.map(\.duration).max() {
                             durationRow(duration)
                         }
                         if let source = tracks.first?.url.deletingLastPathComponent() {
                             let folder = source.lastPathComponent.caseInsensitiveCompare("Audio Record") == .orderedSame
                                 ? source.deletingLastPathComponent() : source
-                            LabeledContent("Location") { locationLabel(folder) }
+                            LabeledContent("Location") { locationLabel(folder, reveal: folder) }
                         }
-                        if tracks.contains(where: { $0.state == .processing }) {
-                            ProgressView(value: tracks.reduce(0) { $0 + $1.progress } / Double(max(1, tracks.count)))
-                                .accessibilityLabel("Meeting transcription progress")
+                        if let issue {
+                            let trackFailure = tracks.lazy.compactMap { track -> String? in
+                                if case .failed(let error) = track.state { return error }
+                                return nil
+                            }.first
+                            let failure = outcomes.first { $0.phase == .failed }?.message
+                                ?? trackFailure ?? history.last { $0.state == "failed" }?.message
+                            issueCallout(issue == .failed ? failure : nil, failed: issue == .failed,
+                                         retry: .meeting(id))
                         }
                     } header: {
                         Label(meeting.label, systemImage: "video")
                     }
                     speakerTracks(meeting, items: items)
                     transcriptSections(resultRows(outcomes) + mergeRows(history, excluding: outcomePaths(outcomes)))
-                    recordingActions(.meeting(id), canRetry: status == "Failed" || status == "Canceled") {
-                        state.removeMeeting(meeting)
-                    }
+                    removeSection(.meeting(id))
                 }
             } else {
                 noSelection
@@ -91,14 +95,16 @@ struct RecordingInspector: View {
             if let session = state.mergedSessions.first(where: { $0.id == id }) {
                 inspectorForm {
                     Section {
-                        LabeledContent("Status", value: mergeStatus(session.state))
+                        statusRow
                         LabeledContent("Location") {
-                            locationLabel(URL(fileURLWithPath: session.id).deletingLastPathComponent())
+                            locationLabel(URL(fileURLWithPath: session.id).deletingLastPathComponent(),
+                                          reveal: URL(fileURLWithPath: session.id))
                         }
                     } header: {
                         Label(session.label, systemImage: "doc.on.doc")
                     }
                     transcriptSections(mergeRows([session], excluding: []), showPlans: false)
+                    removeSection(.merge(id))
                 }
             } else {
                 noSelection
@@ -125,23 +131,17 @@ struct RecordingInspector: View {
 
     private func recordingOverview(_ item: AudioItem) -> some View {
         Section {
-            LabeledContent("Status", value: item.skipReason == nil ? itemStatus(item.state) : "Skipped")
+            statusRow
             durationRow(item.duration)
-            LabeledContent("Location") { locationLabel(item.url.deletingLastPathComponent()) }
-            if let skipReason = item.skipReason {
+            LabeledContent("Location") { locationLabel(item.url.deletingLastPathComponent(), reveal: item.url) }
+            if item.skipReason == nil, let issue {
+                issueCallout(failureMessage(item), failed: issue == .failed, retry: .recording(item.id))
+            } else if let skipReason = item.skipReason {
                 Text(skipReason)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else if item.state == .processing {
-                Group {
-                    if state.activePassUsesApple {
-                        ProgressView()
-                    } else {
-                        ProgressView(value: item.progress)
-                    }
-                }
-                .accessibilityLabel("Recording transcription progress")
-                if !item.resultSummary.isEmpty {
+                if !item.resultSummary.isEmpty, item.resultSummary != itemStatus(item.state) {
                     Text(item.resultSummary).font(.callout).foregroundStyle(.secondary)
                 }
             } else if let note = recordingNote(item), !note.isEmpty {
@@ -163,6 +163,11 @@ struct RecordingInspector: View {
         }
     }
 
+    private func failureMessage(_ item: AudioItem) -> String? {
+        if case .failed(let error) = item.state { return error }
+        return nil
+    }
+
     private func recordingNote(_ item: AudioItem) -> String? {
         if case .failed(let error) = item.state {
             return state.passOutcomes(for: .recording(item.id)).isEmpty ? error : nil
@@ -172,6 +177,10 @@ struct RecordingInspector: View {
             return String(item.resultSummary[..<range.lowerBound])
         }
         if item.resultSummary.hasPrefix("Saved to ") || item.resultSummary == itemStatus(item.state) {
+            return nil
+        }
+        // "Waiting…" under a Waiting status says nothing new.
+        if item.resultSummary.trimmingCharacters(in: CharacterSet(charactersIn: "…. ")) == status?.label {
             return nil
         }
         return item.resultSummary
@@ -228,19 +237,46 @@ struct RecordingInspector: View {
         .disabled(state.isRunning)
     }
 
-    private func recordingActions(
-        _ selection: QueueSelection,
-        canRetry: Bool,
-        remove: @escaping () -> Void
-    ) -> some View {
+    private func removeSection(_ target: QueueSelection) -> some View {
         Section {
-            if canRetry {
-                Button("Retry This Recording") { retry(selection) }
-                    .disabled(state.addOperations > 0 || state.downloadingLibraryModel != nil)
-            }
-            Button("Remove from Queue", action: remove)
+            Button("Remove from Queue", role: .destructive) { remove(target) }
+                .disabled(state.isRunning)
         }
-        .disabled(state.isRunning)
+    }
+
+    /// Failed or canceled: the statuses that lead with a callout and offer a retry.
+    private var issue: QueueStatusFilter? {
+        guard let filter = status?.filter, filter == .failed || filter == .canceled else { return nil }
+        return filter
+    }
+
+    /// Leads a failed or canceled recording or meeting with what went wrong and how to recover.
+    private func issueCallout(_ message: String?, failed: Bool, retry target: QueueSelection) -> some View {
+        let noun = if case .meeting = target { "meeting" } else { "recording" }
+        return VStack(alignment: .leading, spacing: 8) {
+            Label {
+                Text(failed ? (message.flatMap { $0.isEmpty ? nil : $0 } ?? "Transcription failed.")
+                     : "The run stopped before this \(noun) finished.")
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: failed ? "exclamationmark.triangle.fill" : "stop.circle.fill")
+                    .foregroundStyle(failed ? .red : .orange)
+            }
+            .font(.callout)
+            Button("Retry This \(noun.capitalized)") { retry(target) }
+                .disabled(!state.canStartBatch)
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private var statusRow: some View {
+        if let status {
+            LabeledContent("Status") {
+                QueueStatusBadge(status: status.filter, label: status.label, progress: status.progress)
+            }
+        }
     }
 
     @ViewBuilder
@@ -299,15 +335,28 @@ struct RecordingInspector: View {
             }
             if let output = row.output {
                 if row.canReveal {
-                    Button {
-                        NSWorkspace.shared.activateFileViewerSelecting([output])
-                    } label: {
-                        Label(output.lastPathComponent, systemImage: "arrow.up.forward.app")
-                            .lineLimit(2)
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Button {
+                            NSWorkspace.shared.open(output)
+                        } label: {
+                            Label(output.lastPathComponent, systemImage: "doc.text")
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                        }
+                        .buttonStyle(.link)
+                        .accessibilityLabel("Open \(output.lastPathComponent)")
+                        .help("Open \(output.path)")
+                        Spacer(minLength: 4)
+                        Button {
+                            NSWorkspace.shared.activateFileViewerSelecting([output])
+                        } label: {
+                            Label("Show in Finder", systemImage: "folder")
+                                .labelStyle(.iconOnly)
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("Show \(output.lastPathComponent) in Finder")
+                        .help("Show in Finder")
                     }
-                    .buttonStyle(.link)
-                    .accessibilityLabel("Show \(output.lastPathComponent) in Finder")
-                    .help(output.path)
                 } else {
                     Text(output.lastPathComponent)
                         .font(.system(.caption, design: .monospaced))
@@ -368,7 +417,8 @@ struct RecordingInspector: View {
             case .failed: "Failed"
             case .canceled: "Canceled"
             }
-            let message = outcome.phase == .completed ? completionNote(outcome.message) : outcome.message
+            var message = outcome.phase == .completed ? completionNote(outcome.message) : outcome.message
+            if message == status { message = nil }
             return TranscriptRow(id: "pass-\(outcome.id)", title: modelTitle(outcome.modelTag, identifier: outcome.label), status: status,
                                  message: message, output: outcome.output,
                                  canReveal: outcome.output.map(isAvailable) == true, modelIdentifier: outcome.label)
@@ -418,9 +468,8 @@ struct RecordingInspector: View {
                 }
                 if state.outputDestination == .folder {
                     LabeledContent("Folder") {
-                        VStack(alignment: .trailing, spacing: 5) {
-                            pathLabel(state.outputFolder.lastPathComponent)
-                                .help(state.outputFolder.path)
+                        HStack(spacing: 8) {
+                            locationLabel(state.outputFolder, reveal: state.outputFolder)
                             Button("Choose…") {
                                 state.chooseFolder(state.outputFolder) {
                                     state.outputFolder = $0
@@ -515,9 +564,24 @@ struct RecordingInspector: View {
             .help(path)
     }
 
-    private func locationLabel(_ url: URL) -> some View {
-        pathLabel(url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent)
-            .help(url.path)
+    private func locationLabel(_ url: URL, reveal: URL? = nil) -> some View {
+        let name = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+        return Group {
+            if let reveal {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([reveal])
+                } label: {
+                    Label(name, systemImage: "folder")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .buttonStyle(.link)
+                .accessibilityLabel("Show \(name) in Finder")
+                .help("Show in Finder: \(url.path)")
+            } else {
+                pathLabel(name).help(url.path)
+            }
+        }
     }
 
     private func completionNote(_ message: String?) -> String? {
@@ -536,33 +600,6 @@ struct RecordingInspector: View {
         }
     }
 
-    private func isIncomplete(_ status: ItemState) -> Bool {
-        switch status {
-        case .failed, .canceled: true
-        default: false
-        }
-    }
-
-    private func meetingStatus(
-        tracks: [AudioItem],
-        latest: MergedSession?,
-        outcomes: [AppState.PassOutcome]
-    ) -> String {
-        if tracks.contains(where: { $0.state == .processing }) || outcomes.contains(where: { $0.phase == .running })
-            || latest?.state == "running" {
-            return "Transcribing"
-        }
-        if outcomes.contains(where: { $0.phase == .failed }) || tracks.contains(where: {
-            if case .failed = $0.state { return true }
-            return false
-        }) || (outcomes.isEmpty && latest?.state == "failed") { return "Failed" }
-        if outcomes.contains(where: { $0.phase == .canceled }) || tracks.contains(where: { $0.state == .canceled })
-            || (outcomes.isEmpty && latest?.state == "canceled") { return "Canceled" }
-        if outcomes.contains(where: { $0.phase == .waiting }) { return "Waiting" }
-        if latest?.state == "done" { return "Complete" }
-        return "Ready"
-    }
-
     private func mergeStatus(_ status: String) -> String {
         switch status {
         case "done": "Complete"
@@ -579,9 +616,15 @@ struct RecordingInspector: View {
         case "pk": "Parakeet"
         case "pkt": "Parakeet TDT"
         case "ap": "Apple SpeechTranscriber"
-        case let tag?: identifier ?? "Model \(tag)"
-        case nil: identifier ?? "Transcript"
+        case let tag?: friendlyName(identifier) ?? identifier ?? "Model \(tag)"
+        case nil: friendlyName(identifier) ?? identifier ?? "Transcript"
         }
+    }
+
+    /// A configured pass's engine name for a raw model identifier.
+    private func friendlyName(_ identifier: String?) -> String? {
+        guard let identifier else { return nil }
+        return state.configuredPasses.first { $0.modelArgument == identifier || $0.displayName == identifier }?.displayName
     }
 
     private func isAvailable(_ output: URL) -> Bool {

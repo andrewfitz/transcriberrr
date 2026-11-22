@@ -2,7 +2,10 @@
 use crate::{OutputFormat, TimestampGranularity};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Word {
@@ -87,10 +90,6 @@ impl Segment {
 }
 
 impl TranscriptDocument {
-    pub(crate) fn content(&self) -> String {
-        self.segments.iter().map(Segment::content).collect()
-    }
-
     pub(crate) fn speaker_label(&self, id: usize) -> String {
         match self.speaker_names.get(id) {
             Some(name) if !name.is_empty() => name.clone(),
@@ -327,10 +326,6 @@ pub(crate) fn drop_unplaced_words(words: &mut Vec<Word>) -> usize {
     before - words.len()
 }
 
-/// Write via a temporary sibling and rename so a crash or cancellation never leaves a
-/// truncated transcript at the final path (which `--resume` would then refuse to replace).
-/// Without `overwrite`, the file is published with a hard link, which fails if the path exists,
-/// so two processes cannot both pass an earlier existence check and replace each other's output.
 /// How a transcript is rendered to a file.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RenderOptions {
@@ -341,42 +336,78 @@ pub(crate) struct RenderOptions {
     pub(crate) speaker_turns: bool,
 }
 
+/// Publish a completed temporary sibling atomically. Without `overwrite`, publication
+/// must fail if another process has already created the destination.
 pub(crate) fn write_output(
     doc: &TranscriptDocument,
     path: &Path,
     options: RenderOptions,
     overwrite: bool,
 ) -> Result<()> {
-    let content = render_output(doc, options)?;
-    if path.file_name().is_none() {
+    doc.validate()?;
+    let Some(destination_name) = path.file_name() else {
         bail!("output path has no file name: {}", path.display());
-    }
-    // Fixed-length name: deriving it from a near-255-byte file name would exceed NAME_MAX.
-    // One process writes one output at a time, so the PID keeps it unique.
-    let temporary = path.with_file_name(format!(".transcriberrr-{}.tmp", std::process::id()));
-    // A killed run (the app force-quits after 20 s) leaves its own beside the transcripts.
+    };
+    let names_destination = |name: &str| {
+        destination_name
+            .to_str()
+            .is_some_and(|destination| name.eq_ignore_ascii_case(destination))
+    };
+    static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
     static SWEPT: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
-    if let Some(folder) = temporary.parent()
+    if let Some(folder) = path.parent()
         && let Ok(mut swept) = SWEPT.lock()
         && !swept.iter().any(|done| done == folder)
     {
-        crate::audio_convert::remove_stale_files(folder, ".transcriberrr-", '.');
+        let directory = if folder.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            folder
+        };
+        crate::audio_convert::remove_stale_files(directory, |name| {
+            if names_destination(name) {
+                return None;
+            }
+            let owner = name.strip_prefix(".transcriberrr-")?.strip_suffix(".tmp")?;
+            let pid = match owner.split_once('.') {
+                Some((pid, serial)) => {
+                    serial.parse::<usize>().ok()?;
+                    pid
+                }
+                None => owner, // Older temporary names contained only the PID.
+            };
+            pid.parse().ok()
+        });
         swept.push(folder.to_path_buf());
     }
-    let result = std::fs::write(&temporary, content).and_then(|()| {
+    let (temporary, file) = loop {
+        // Keep the name short even when the destination is near the file name length limit.
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temporary_name = format!(".transcriberrr-{}.{serial}.tmp", std::process::id());
+        if names_destination(&temporary_name) {
+            continue;
+        }
+        let temporary = path.with_file_name(temporary_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("creating {}", temporary.display()));
+            }
+        }
+    };
+    let mut writer = BufWriter::new(file);
+    let result = render_output_to(&mut writer, doc, options).and_then(|()| writer.flush());
+    drop(writer);
+    let result = result.and_then(|()| {
         if overwrite {
             std::fs::rename(&temporary, path)
         } else {
-            // exFAT and some network volumes have no hard links; fall back to check-then-rename.
-            std::fs::hard_link(&temporary, path).or_else(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    Err(error)
-                } else if path.exists() {
-                    Err(std::io::ErrorKind::AlreadyExists.into())
-                } else {
-                    std::fs::rename(&temporary, path)
-                }
-            })
+            publish_without_overwrite(&temporary, path)
         }
     });
     let _ = std::fs::remove_file(&temporary);
@@ -388,80 +419,131 @@ pub(crate) fn write_output(
     }
 }
 
+fn publish_without_overwrite(temporary: &Path, path: &Path) -> io::Result<()> {
+    let result = std::fs::hard_link(temporary, path);
+    #[cfg(target_os = "macos")]
+    if let Err(error) = &result
+        && error.kind() != io::ErrorKind::AlreadyExists
+    {
+        // Some volumes do not support hard links. Ask macOS for an exclusive rename.
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = CString::new(temporary.as_os_str().as_bytes())?;
+        let destination = CString::new(path.as_os_str().as_bytes())?;
+        // Both C strings live through the call. Their paths are relative to the same cwd.
+        let status = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        return if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+    result
+}
+
+#[cfg(test)]
 pub(crate) fn render_output(doc: &TranscriptDocument, options: RenderOptions) -> Result<String> {
+    doc.validate()?;
+    let mut bytes = Vec::new();
+    render_output_to(&mut bytes, doc, options)?;
+    Ok(String::from_utf8(bytes)?)
+}
+
+fn render_output_to(
+    output: &mut impl Write,
+    doc: &TranscriptDocument,
+    options: RenderOptions,
+) -> io::Result<()> {
     let RenderOptions {
         format,
         timestamps,
         speaker_turns,
     } = options;
-    doc.validate()?;
     if matches!(format, OutputFormat::Json) {
-        return Ok(serde_json::to_string_pretty(doc)? + "\n");
+        serde_json::to_writer_pretty(&mut *output, doc)?;
+        return output.write_all(b"\n");
     }
-    let plain_text =
-        matches!(format, OutputFormat::Txt) && timestamps == TimestampGranularity::None;
-    if plain_text && speaker_turns && doc.segments.iter().any(|segment| segment.speaker.is_some()) {
-        return Ok(speaker_turn_text(doc));
-    }
-    if plain_text {
-        let text = doc.content();
-        return Ok(if text.ends_with('\n') {
-            text
-        } else {
-            text + "\n"
-        });
-    }
-    let vtt = matches!(format, OutputFormat::Vtt);
-    let mut output = if vtt {
-        "WEBVTT\n\n".to_owned()
-    } else {
-        String::new()
-    };
-    let mut index = 0;
-    for segment in &doc.segments {
-        let cues = if timestamps == TimestampGranularity::Words && !segment.words.is_empty() {
+    if matches!(format, OutputFormat::Txt) && timestamps == TimestampGranularity::None {
+        if speaker_turns && doc.segments.iter().any(|segment| segment.speaker.is_some()) {
+            return output.write_all(speaker_turn_text(doc).as_bytes());
+        }
+        let mut ends_with_newline = false;
+        for text in doc.segments.iter().flat_map(|segment| {
             segment
-                .words
-                .iter()
-                .map(|word| (word.start, word.end, word.text.clone(), word.speaker))
-                .collect::<Vec<_>>()
-        } else {
-            vec![(
-                segment.start,
-                segment.end,
-                segment.content(),
-                segment.speaker,
-            )]
-        };
-        for (start, end, text, speaker) in cues {
-            index += 1;
-            let speaker = speaker
-                .map(|id| format!("[{}] ", doc.speaker_label(id)))
-                .unwrap_or_default();
-            match format {
-                OutputFormat::Txt => output.push_str(&format!(
-                    "[{} --> {}] {}{}\n",
-                    timestamp(start, true),
-                    timestamp(end, true),
-                    speaker,
-                    text.split_whitespace().collect::<Vec<_>>().join(" ")
-                )),
-                OutputFormat::Srt | OutputFormat::Vtt => {
-                    if !vtt {
-                        output.push_str(&format!("{index}\n"));
-                    }
-                    output.push_str(&format!(
-                        "{} --> {}\n{}\n\n",
-                        timestamp(start, vtt),
-                        timestamp(end, vtt),
-                        cue_text(&format!("{speaker}{text}"), vtt)
-                    ));
-                }
-                OutputFormat::Json => unreachable!(),
+                .text
+                .as_deref()
+                .into_iter()
+                .chain(segment.words.iter().map(|word| word.text.as_str()))
+        }) {
+            output.write_all(text.as_bytes())?;
+            if !text.is_empty() {
+                ends_with_newline = text.ends_with('\n');
             }
         }
+        return if ends_with_newline {
+            Ok(())
+        } else {
+            output.write_all(b"\n")
+        };
     }
-    Ok(output)
+    let vtt = matches!(format, OutputFormat::Vtt);
+    if vtt {
+        output.write_all(b"WEBVTT\n\n")?;
+    }
+    let mut index = 0;
+    let mut emit_cue = |start, end, text: &str, speaker: Option<usize>| {
+        index += 1;
+        let speaker = speaker
+            .map(|id| format!("[{}] ", doc.speaker_label(id)))
+            .unwrap_or_default();
+        match format {
+            OutputFormat::Txt => writeln!(
+                output,
+                "[{} --> {}] {}{}",
+                timestamp(start, true),
+                timestamp(end, true),
+                speaker,
+                text.split_whitespace().collect::<Vec<_>>().join(" ")
+            ),
+            OutputFormat::Srt | OutputFormat::Vtt => {
+                if !vtt {
+                    writeln!(output, "{index}")?;
+                }
+                writeln!(
+                    output,
+                    "{} --> {}\n{}\n",
+                    timestamp(start, vtt),
+                    timestamp(end, vtt),
+                    cue_text(&format!("{speaker}{text}"), vtt)
+                )
+            }
+            OutputFormat::Json => unreachable!(),
+        }
+    };
+    for segment in &doc.segments {
+        if timestamps == TimestampGranularity::Words && !segment.words.is_empty() {
+            for word in &segment.words {
+                emit_cue(word.start, word.end, &word.text, word.speaker)?;
+            }
+        } else {
+            emit_cue(
+                segment.start,
+                segment.end,
+                &segment.content(),
+                segment.speaker,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// A subtitle cue's text. Blank lines delimit cues in SRT/WebVTT, so it is one line (JSON and
@@ -668,8 +750,12 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("out.txt");
         std::fs::write(&path, "stale").unwrap();
+        let occupied = directory.join(format!(".transcriberrr-{}.tmp", std::process::id()));
+        std::fs::write(&occupied, "unrelated").unwrap();
         write_output(&doc, &path, PLAIN, true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd\n");
+        assert_eq!(std::fs::read_to_string(&occupied).unwrap(), "unrelated");
+        std::fs::remove_file(&occupied).unwrap();
         let error = write_output(&doc, &path, PLAIN, false)
             .expect_err("must not replace an existing output without overwrite");
         assert!(error.to_string().contains("output exists"));

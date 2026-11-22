@@ -7,7 +7,7 @@ use crate::transcript::{
     DiarizationMetadata, MergedTrack, TranscriptDocument, TranscriptMetadata, Word, build_segments,
 };
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 /// Tracks of one session share a timeline, so their lengths should agree to within a few
@@ -249,19 +249,19 @@ pub(crate) fn track_starts(names: &[TrackName], durations: &[f32]) -> Vec<f32> {
         TrackName::Zoom { segment, .. } => Some(*segment),
         _ => None,
     };
-    let mut segments = names.iter().filter_map(segment_of).collect::<Vec<_>>();
-    segments.sort_unstable();
-    segments.dedup();
-    let mut starts = HashMap::new();
+    let mut longest = BTreeMap::<_, f32>::new();
+    for (index, name) in names.iter().enumerate() {
+        let duration = durations.get(index).copied().unwrap_or_default();
+        if let Some(segment) = segment_of(name) {
+            let length = longest.entry(segment).or_default();
+            *length = length.max(duration);
+        }
+    }
+    let mut starts = HashMap::with_capacity(longest.len());
     let mut at = 0.0f32;
-    for segment in segments {
+    for (segment, duration) in longest {
         starts.insert(segment, at);
-        at += names
-            .iter()
-            .zip(durations)
-            .filter(|(name, _)| segment_of(name) == Some(segment))
-            .map(|(_, &duration)| duration)
-            .fold(0.0, f32::max);
+        at += duration;
     }
     names
         .iter()
@@ -373,8 +373,8 @@ pub(crate) fn select_session(
     session: Option<&str>,
 ) -> Result<(Vec<TrackInput>, Vec<String>)> {
     let mut notes = Vec::new();
-    let mut zoom: Vec<(String, String, TrackInput)> = Vec::new();
-    let mut mixed: Vec<(Option<String>, TrackInput)> = Vec::new();
+    let mut zoom = Vec::new();
+    let mut mixed = Vec::new();
     let mut others = Vec::new();
     let mut anchor_meeting = None;
     let mut names = candidates
@@ -407,15 +407,30 @@ pub(crate) fn select_session(
             continue;
         }
         match name {
-            TrackName::ZoomMixed { meeting, .. } => mixed.push((meeting, input)),
+            TrackName::ZoomMixed { meeting, segment } => mixed.push((meeting, segment, input)),
             TrackName::Zoom {
-                speaker, meeting, ..
-            } => zoom.push((meeting, speaker, input)),
+                speaker,
+                meeting,
+                segment,
+                ..
+            } => zoom.push((meeting, speaker, segment, input)),
             TrackName::Other(_) => others.push((input.path.clone(), input)),
         }
     }
-    let mut speakers = std::collections::HashSet::new();
+    let one_known_meeting = zoom
+        .iter()
+        .map(|(meeting, _, _, _)| meeting.as_str())
+        .chain(
+            mixed
+                .iter()
+                .filter_map(|(meeting, _, _)| meeting.as_deref()),
+        )
+        .collect::<HashSet<_>>()
+        .len()
+        == 1;
+    let mut speakers = HashSet::new();
     let mut selected = Vec::new();
+    let mut selected_segments = BTreeSet::new();
     let mut wanted_meeting = None;
     if zoom.is_empty() {
         if let Some(session) = session {
@@ -427,7 +442,7 @@ pub(crate) fn select_session(
         }
     } else {
         let mut meetings: Vec<(String, Vec<String>)> = Vec::new();
-        for (meeting, speaker, _) in &zoom {
+        for (meeting, speaker, _, _) in &zoom {
             match meetings.iter_mut().find(|(id, _)| id == meeting) {
                 Some((_, speakers)) if speakers.contains(speaker) => {}
                 Some((_, speakers)) => speakers.push(speaker.clone()),
@@ -456,9 +471,10 @@ pub(crate) fn select_session(
                 listing()
             ),
         };
-        for (meeting, speaker, input) in zoom {
+        for (meeting, speaker, segment, input) in zoom {
             if meeting == wanted {
                 speakers.insert(speaker);
+                selected_segments.insert(segment);
                 selected.push(input);
             } else {
                 notes.push(format!("skipping {}: Zoom session {meeting}", input.path));
@@ -469,18 +485,36 @@ pub(crate) fn select_session(
         }
         wanted_meeting = Some(wanted);
     }
-    // One speaker's tracks alone are no conversation; the mixed recording has the rest.
-    for (meeting, mut input) in mixed {
-        let matches = wanted_meeting.is_some()
-            && (meeting.is_none() || meeting == wanted_meeting)
-            && speakers.len() == 1;
-        if matches && !selected.iter().any(|input| input.mixed) {
+    // The mixed fallback is placed at time zero, so use the first participant segment.
+    // An undated legacy recording can only be associated with a single meeting and segment.
+    let first_segment = selected_segments.first().copied();
+    let mut mixed_index = None;
+    if let Some(wanted) = &wanted_meeting
+        && speakers.len() == 1
+    {
+        mixed_index = mixed
+            .iter()
+            .position(|(meeting, segment, _)| {
+                meeting.as_ref() == Some(wanted) && Some(*segment) == first_segment
+            })
+            .or_else(|| {
+                if one_known_meeting && selected_segments.len() == 1 {
+                    mixed.iter().position(|(meeting, _, _)| meeting.is_none())
+                } else {
+                    None
+                }
+            });
+    }
+    for (index, (meeting, segment, mut input)) in mixed.into_iter().enumerate() {
+        if Some(index) == mixed_index {
             input.mixed = true;
             input.name.get_or_insert_with(|| OTHER_SPEAKERS.to_owned());
             selected.push(input);
-        } else if matches {
-            // Its transcript starts at 0 wherever its segment falls; transcribing the
-            // meeting folder joins the segments first.
+        } else if let Some(meeting) = meeting
+            && wanted_meeting.as_ref() == Some(&meeting)
+            && first_segment.is_some_and(|first| segment > first)
+            && speakers.len() == 1
+        {
             notes.push(format!(
                 "skipping {}: a later part of Zoom's mixed recording; transcribe the meeting \
                  folder to join its parts",
@@ -507,7 +541,9 @@ struct Speaker {
 
 /// Merge per-speaker tracks of one session. Returns the merged transcript and warnings about
 /// inputs that look inconsistent but may be intended.
-pub(crate) fn merge_tracks(inputs: Vec<TrackInput>) -> Result<(TranscriptDocument, Vec<String>)> {
+pub(crate) fn merge_tracks(
+    mut inputs: Vec<TrackInput>,
+) -> Result<(TranscriptDocument, Vec<String>)> {
     if inputs.is_empty() {
         bail!("nothing to merge");
     }
@@ -647,7 +683,7 @@ pub(crate) fn merge_tracks(inputs: Vec<TrackInput>) -> Result<(TranscriptDocumen
             TrackName::Zoom { segment, .. } => Some(*segment),
             _ => None,
         })
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     if segments.len() > 1 {
         warnings.push(format!(
             "the recording was stopped and started again: joining its {} parts end to end",
@@ -677,7 +713,7 @@ pub(crate) fn merge_tracks(inputs: Vec<TrackInput>) -> Result<(TranscriptDocumen
         speaker.parts.sort_unstable();
         let mut length = 0.0f32;
         for (part, &(_, index)) in speaker.parts.iter().enumerate() {
-            let input = &inputs[index];
+            let input = &mut inputs[index];
             let offset = starts[index];
             merged_from.push(MergedTrack {
                 source: input.doc.source.clone(),
@@ -690,13 +726,14 @@ pub(crate) fn merge_tracks(inputs: Vec<TrackInput>) -> Result<(TranscriptDocumen
                 &mut words
             };
             let first = target.len();
-            for word in input.doc.segments.iter().flat_map(|segment| &segment.words) {
-                target.push(Word {
-                    text: word.text.clone(),
-                    start: word.start + offset,
-                    end: word.end + offset,
-                    speaker: Some(id),
-                });
+            for mut word in std::mem::take(&mut input.doc.segments)
+                .into_iter()
+                .flat_map(|segment| segment.words)
+            {
+                word.start += offset;
+                word.end += offset;
+                word.speaker = Some(id);
+                target.push(word);
             }
             // Like a speaker change: a later file's first word may have no space before it.
             if part > 0
@@ -728,19 +765,20 @@ pub(crate) fn merge_tracks(inputs: Vec<TrackInput>) -> Result<(TranscriptDocumen
     }
     separate_speakers(&mut words);
     // Like Sortformer's count: speakers who said something.
-    let speaker_count = (0..speakers.len())
-        .filter(|&id| words.iter().any(|word| word.speaker == Some(id)))
-        .count();
+    let mut spoken = vec![false; speakers.len()];
+    for id in words.iter().filter_map(|word| word.speaker) {
+        spoken[id] = true;
+    }
+    let speaker_count = spoken.iter().filter(|&&present| present).count();
 
     let docs = inputs.iter().map(|input| &input.doc).collect::<Vec<_>>();
     let distinct = |field: fn(&TranscriptDocument) -> &str| {
-        let mut values: Vec<&str> = Vec::new();
-        for doc in &docs {
-            if !values.contains(&field(doc)) {
-                values.push(field(doc));
-            }
-        }
-        values.join(", ")
+        let mut seen = HashSet::new();
+        docs.iter()
+            .map(|doc| field(doc))
+            .filter(|value| seen.insert(*value))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let model = distinct(|doc| &doc.model);
     let doc = TranscriptDocument {

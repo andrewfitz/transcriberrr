@@ -1,6 +1,47 @@
 import AppKit
 import SwiftUI
 
+/// Run actions the focused window publishes to the menu bar.
+struct QueueActions {
+    var transcribe: (() -> Void)?
+    var cancel: (() -> Void)?
+    var showRunSettings: () -> Void
+    var showModelLibrary: () -> Void
+}
+
+private struct QueueActionsKey: FocusedValueKey {
+    typealias Value = QueueActions
+}
+
+extension FocusedValues {
+    var queueActions: QueueActions? {
+        get { self[QueueActionsKey.self] }
+        set { self[QueueActionsKey.self] = newValue }
+    }
+}
+
+struct QueueCommands: Commands {
+    @FocusedValue(\.queueActions) private var actions
+
+    var body: some Commands {
+        CommandMenu("Queue") {
+            Button("Transcribe") { actions?.transcribe?() }
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(actions?.transcribe == nil)
+            Button("Cancel Run") { actions?.cancel?() }
+                .keyboardShortcut(".", modifiers: .command)
+                .disabled(actions?.cancel == nil)
+            Divider()
+            Button("Run Settings") { actions?.showRunSettings() }
+                .keyboardShortcut(",", modifiers: [.command, .shift])
+                .disabled(actions == nil)
+            Button("Model Library…") { actions?.showModelLibrary() }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+                .disabled(actions == nil)
+        }
+    }
+}
+
 @MainActor
 struct QueueWindow: View {
     @ObservedObject var state: AppState
@@ -10,12 +51,11 @@ struct QueueWindow: View {
     @State private var showsInspector = true
     @State private var sheet: WindowSheet?
     @State private var validation: PassValidation?
-    @State private var plannedOutputs: [PlannedTranscript] = []
-    @State private var completedPreview: PreviewRequest?
-    @State private var planError: String?
+    @State private var completedPreview: PreviewResult?
+    @State private var meetingToRemove: ZoomMeeting?
 
     private enum WindowSheet: String, Identifiable {
-        case passes, library
+        case passes, library, server
         var id: String { rawValue }
     }
 
@@ -59,6 +99,12 @@ struct QueueWindow: View {
         let inputs: [InputOptions]
     }
 
+    private struct PreviewResult {
+        let request: PreviewRequest
+        let outputs: [PlannedTranscript]
+        let error: String?
+    }
+
     private var passOptions: PassOptions {
         PassOptions(arguments: state.configuredPasses.map(\.arguments), suffix: state.appendModelID)
     }
@@ -86,33 +132,52 @@ struct QueueWindow: View {
     }
 
     private var canStart: Bool {
-        state.selectedCount > 0 && state.addOperations == 0 && state.downloadingLibraryModel == nil
+        state.canStartBatch && state.selectedCount > 0
             && currentValidation?.error == nil && currentValidation != nil
     }
 
     var body: some View {
         let request = previewRequest
+        let preview = completedPreview.flatMap { $0.request == request ? $0 : nil }
         let passes = passOptions
+        let queue = QueueSnapshot(state: state, scope: scope)
+        // The menu bar stays live under a sheet or alert. ⌘↩ must not start a run behind
+        // the pass editor, ⇧⌘L must not swap it for the library and drop its draft, and
+        // ⌘. belongs to the sheet (it is also the system's Cancel key).
+        let modal = sheet != nil || meetingToRemove != nil || state.planningError != nil
         VStack(spacing: 0) {
-            QueueView(state: state, selection: $selection, scope: $scope, retry: retry)
+            QueueView(state: state, queue: queue, selection: $selection, scope: $scope,
+                      retry: retry, remove: remove)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .inspector(isPresented: $showsInspector) {
-                    RecordingInspector(state: state, selection: selection, pane: $inspectorPane,
+                    RecordingInspector(state: state, selection: selection, status: queue.status(of: selection),
+                                       pane: $inspectorPane,
                                        editPasses: { sheet = .passes },
-                                       plannedOutputs: completedPreview == request && request != nil ? plannedOutputs : [],
-                                       planningOutputs: request != nil && completedPreview != request,
-                                       planError: completedPreview == request && request != nil ? planError : nil,
-                                       retry: retry)
+                                       plannedOutputs: preview?.outputs ?? [],
+                                       planningOutputs: request != nil && preview == nil,
+                                       planError: preview?.error,
+                                       retry: retry, remove: remove)
                         .inspectorColumnWidth(min: 250, ideal: 325, max: 460)
                 }
             Divider()
-            runBar
+            runBar(queue)
         }
-        .navigationSubtitle(queueCounts)
+        .navigationSubtitle(queue.counts)
+        .focusedSceneValue(\.queueActions, modal ? nil : QueueActions(
+            transcribe: canStart ? { state.transcribe() } : nil,
+            cancel: state.isRunning && !state.isCancelling ? { state.cancelTranscription() } : nil,
+            showRunSettings: {
+                inspectorPane = .runSettings
+                showsInspector = true
+            },
+            showModelLibrary: { sheet = .library }
+        ))
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button("Server", systemImage: "dot.radiowaves.left.and.right") { sheet = .server }
+                    .help("Manage the realtime transcription server")
                 Button("Model Library", systemImage: "square.stack.3d.up") { sheet = .library }
-                    .help("Download and manage transcription models")
+                    .help("Download and manage transcription models (⇧⌘L)")
                 Button("Add Recordings", systemImage: "plus") { state.chooseFiles() }
                     .labelStyle(.titleAndIcon)
                     .help("Add recordings, folders, or a Zoom library (⌘O)")
@@ -129,6 +194,7 @@ struct QueueWindow: View {
             switch item {
             case .passes: ModelPassEditor(state: state)
             case .library: ModelLibrarySheet(state: state)
+            case .server: ServerPanel(server: state.server, state: state)
             }
         }
         .alert("Couldn’t Plan the Queue", isPresented: Binding(
@@ -139,51 +205,73 @@ struct QueueWindow: View {
         } message: {
             Text(state.planningError ?? "")
         }
-        .onChange(of: scope.visibleSelections(in: state), initial: true) { _, visible in
-            if let selection, visible.contains(selection) { return }
-            selection = visible.first
+        .confirmationDialog(
+            "Remove “\(meetingToRemove?.label ?? "")” from the queue?",
+            isPresented: Binding(get: { meetingToRemove != nil }, set: { if !$0 { meetingToRemove = nil } }),
+            presenting: meetingToRemove
+        ) { meeting in
+            Button("Remove Meeting", role: .destructive) { state.removeMeeting(meeting) }
+            Button("Cancel", role: .cancel) {}
+        } message: { meeting in
+            let files = state.items.filter { $0.zoomMeeting == meeting.id }.count
+            Text("This removes the meeting and its \(files == 1 ? "file" : "\(files) files") from the queue. The audio and any saved transcripts stay on disk.")
         }
-        .onChange(of: selection) { _, _ in inspectorPane = .recording }
+        .onChange(of: queue.visibleIDs, initial: true) { previous, visible in
+            keepSelectionVisible(previous: previous, visible: visible)
+        }
+        // Emptying the queue also clears the selection, one update after the handler below
+        // has shown Run Settings; switching panes for a nil selection would undo that.
+        .onChange(of: selection) { _, selected in
+            if selected != nil { inspectorPane = .recording }
+        }
         // An empty queue has nothing to inspect; show what the next run will use.
-        .onChange(of: state.items.isEmpty, initial: true) { _, empty in
+        .onChange(of: queue.isEmpty, initial: true) { _, empty in
             if empty { inspectorPane = .runSettings }
         }
-        .onChange(of: state.isRunning) { _, running in
-            if !running { finishDockFeedback() }
-        }
-        .onChange(of: dockBadge) { _, badge in
-            NSApp.dockTile.badgeLabel = badge
-        }
-        .onChange(of: outputOptions) { _, _ in state.saveQueue() }
         .task(id: passes) { await validate(passes) }
         .task(id: request) { await loadPreview(request) }
     }
 
-    private var runBar: some View {
-        HStack(spacing: 16) {
+    private func runBar(_ queue: QueueSnapshot) -> some View {
+        let progress = state.isRunning ? state.queueProgress : 0
+        return HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
                 if state.isRunning {
                     HStack(spacing: 6) {
                         Text(state.isCancelling ? "Stopping…" : (state.activePassLabel ?? "Transcribing"))
                         if !state.isCancelling, !state.activePassUsesApple {
-                            Text(state.queueProgress.formatted(.percent.precision(.fractionLength(0))))
+                            Text(progress.formatted(.percent.precision(.fractionLength(0))))
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
                         }
                     }
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                     HStack(spacing: 8) {
-                        ProgressView(value: state.queueProgress)
-                            .frame(maxWidth: 180)
-                            .accessibilityLabel("Overall transcription progress")
+                        Group {
+                            if state.activePassUsesApple {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                ProgressView(value: progress)
+                                    .frame(maxWidth: 180)
+                            }
+                        }
+                        .accessibilityLabel("Overall transcription progress")
                         if let recording = state.activeRecordingLabel {
                             Text(recording).lineLimit(1).truncationMode(.middle)
                         }
-                        Text(runTiming).monospacedDigit().lineLimit(1)
+                        TimelineView(.periodic(from: Date(timeIntervalSinceReferenceDate: 0), by: 1)) { _ in
+                            Text(runTiming(progress: state.activePassUsesApple ? nil : progress))
+                                .monospacedDigit()
+                                .lineLimit(1)
+                        }
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                } else if state.batchPausedForServer {
+                    Label("Queue paused while the server is running", systemImage: "pause.circle")
+                        .font(.subheadline.weight(.semibold))
                 } else {
                     HStack(spacing: 5) {
                         if let outcome = lastRunOutcome {
@@ -191,11 +279,11 @@ struct QueueWindow: View {
                                 .foregroundStyle(outcome.tint)
                                 .accessibilityHidden(true)
                         }
-                        Text(state.lastRunSummary ?? scopeSummary)
+                        Text(state.lastRunSummary ?? (queue.isEmpty ? "Add recordings to begin" : scopeSummary(queue)))
                     }
                     .font(.subheadline.weight(.semibold))
                     HStack(spacing: 8) {
-                        if state.lastRunSummary != nil { Text(scopeSummary) }
+                        if state.lastRunSummary != nil { Text(scopeSummary(queue)) }
                         let invalid = currentValidation?.error != nil
                         Button {
                             if invalid { sheet = .passes }
@@ -212,7 +300,9 @@ struct QueueWindow: View {
                             }
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel(invalid ? "Review Model Passes" : "Open Run Settings")
+                        // VoiceOver reads the summary itself; "Open Run Settings" alone hid it.
+                        .accessibilityLabel(invalid ? "Review Model Passes" : settingsSummary)
+                        .accessibilityHint(invalid ? "" : "Opens Run Settings")
                         .help(currentValidation?.error ?? "Open run settings")
                     }
                     .font(.caption)
@@ -221,10 +311,9 @@ struct QueueWindow: View {
             }
             Spacer()
             if !state.isRunning, state.lastRunSummary != nil, state.outputDestination == .folder {
-                Button("Show Transcripts") {
-                    NSWorkspace.shared.activateFileViewerSelecting([state.outputFolder])
-                }
-                .help(state.outputFolder.path)
+                Button("Show Transcripts") { NSWorkspace.shared.open(state.outputFolder) }
+                    .help(state.outputFolder.path)
+                    .disabled(!FileManager.default.fileExists(atPath: state.outputFolder.path))
             }
             if state.showModelActivity || state.downloadingLibraryModel != nil {
                 Button(state.modelActivityCanDismiss ? "Model Details…" : "Model Activity…") { sheet = .library }
@@ -235,12 +324,10 @@ struct QueueWindow: View {
                     .controlSize(.large)
                     .disabled(state.isCancelling)
                     .help("Stop after saving finished work (⌘.)")
-                    .keyboardShortcut(".", modifiers: .command)
             } else {
                 Button("Transcribe") { state.transcribe() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .keyboardShortcut(.return, modifiers: .command)
                     .disabled(!canStart)
                     .help(startHelp)
             }
@@ -251,8 +338,8 @@ struct QueueWindow: View {
         .background(.bar)
     }
 
-    private var scopeSummary: String {
-        let visible = Set(scope.visibleSelections(in: state))
+    private func scopeSummary(_ queue: QueueSnapshot) -> String {
+        let visible = Set(queue.visibleIDs)
         var included: Set<QueueSelection> = []
         var includedDuration: [QueueSelection: TimeInterval] = [:]
         for item in state.selectedItems {
@@ -270,21 +357,13 @@ struct QueueWindow: View {
         return parts.joined(separator: " · ")
     }
 
-    private var queueCounts: String {
-        let meetings = Set(state.items.compactMap(\.zoomMeeting)).count
-        let recordings = state.items.filter { $0.zoomMeeting == nil }.count
-        let parts = [
-            meetings > 0 ? "\(meetings) \(meetings == 1 ? "meeting" : "meetings")" : nil,
-            recordings > 0 ? "\(recordings) \(recordings == 1 ? "recording" : "recordings")" : nil,
-        ].compactMap { $0 }
-        return parts.isEmpty ? "Queue is empty" : parts.joined(separator: " · ")
-    }
-
     private var startHelp: String {
+        if state.batchPausedForServer { return "Stop the realtime server to start batch transcription" }
         if state.selectedCount == 0 { return "Include at least one recording to transcribe" }
         if state.addOperations > 0 { return "Waiting for recordings to finish loading" }
         if state.downloadingLibraryModel != nil { return "Waiting for the model download to finish" }
         if let error = currentValidation?.error { return error }
+        if currentValidation == nil { return "Checking model passes" }
         return "Transcribe included recordings (⌘↩)"
     }
 
@@ -295,42 +374,65 @@ struct QueueWindow: View {
         return ("exclamationmark.triangle.fill", .red)
     }
 
-    /// Long runs happen in the background; mirror progress on the Dock icon.
-    private var dockBadge: String? {
-        guard state.isRunning, !state.activePassUsesApple else { return nil }
-        return state.queueProgress.formatted(.percent.precision(.fractionLength(0)))
-    }
-
-    private func finishDockFeedback() {
-        NSApp.dockTile.badgeLabel = nil
-        guard state.lastRunSummary != nil, !NSApp.isActive else { return }
-        NSApp.requestUserAttention(.informationalRequest)
-    }
-
     private var settingsSummary: String {
         let passes = state.configuredPasses.count
         let passLabel = passes == 1 ? "1 model pass" : "\(passes) model passes"
         let format = state.format == "txt" ? "Text" : state.format.uppercased()
-        return "\(passLabel) · \(format) · \(state.outputDestination.title)"
+        let destination = state.outputDestination == .folder
+            ? "Saving to “\(state.outputFolder.lastPathComponent)”" : "Saving next to originals"
+        return "\(passLabel) · \(format) · \(destination)"
     }
 
-    private var runTiming: String {
-        let elapsed = "\(formatElapsed(state.queueElapsedSeconds)) elapsed"
-        guard let remaining = state.queueEstimatedRemainingSeconds else { return elapsed }
-        return "\(elapsed) · ~\(formatElapsed(remaining)) remaining"
+    private func runTiming(progress: Double?) -> String {
+        let elapsed = state.queueElapsedSeconds
+        let label = "\(formatElapsed(elapsed)) elapsed"
+        guard let progress, progress > 0.01, elapsed > 0 else { return label }
+        let remaining = max(0, elapsed * (1 / progress - 1))
+        return "\(label) · ~\(formatElapsed(remaining)) remaining"
+    }
+
+    /// The inspector follows the visible list. When the selected row goes away (removed or
+    /// filtered out), select the row that took its place rather than jumping to the top:
+    /// a second Delete would otherwise remove an unrelated row.
+    private func keepSelectionVisible(previous: [QueueSelection], visible: [QueueSelection]) {
+        if let selection, visible.contains(selection) { return }
+        guard let selection, let index = previous.firstIndex(of: selection) else {
+            selection = visible.first
+            return
+        }
+        let remaining = Set(visible)
+        let next = previous[index...].first { remaining.contains($0) }
+        let before = previous[..<index].last { remaining.contains($0) }
+        self.selection = next ?? before ?? visible.first
+    }
+
+    /// One removal path for the Delete key, the context menu, and the inspector. Nothing is
+    /// deleted from disk and a recording is easily added back, so only a meeting, which
+    /// takes all of its tracks and results with it, asks first.
+    private func remove(_ selection: QueueSelection) {
+        guard !state.isRunning else { return }
+        switch selection {
+        case .recording(let id):
+            if let item = state.items.first(where: { $0.id == id }) { state.remove(item) }
+        case .meeting(let id):
+            meetingToRemove = state.zoomMeetings.first { $0.id == id }
+        case .merge(let id):
+            state.removeMergedSession(id)
+        }
     }
 
     private func retry(_ selection: QueueSelection) {
-        guard let target = selection.runTarget, !state.isRunning, state.downloadingLibraryModel == nil else { return }
+        guard let target = selection.runTarget, state.canStartBatch else { return }
         if currentValidation?.error != nil { sheet = .passes; return }
         state.retry(target)
     }
 
     private func validate(_ options: PassOptions) async {
+        guard options == passOptions else { return }
         let passes = state.configuredPasses
         do {
             try await Task.sleep(for: .milliseconds(150))
-            let tags = try await state.validateModelPasses(passes)
+            let tags = try await state.validateModelPasses(passes, appendSuffix: options.suffix)
             try Task.checkCancellation()
             validation = PassValidation(options: options, tags: tags, error: nil)
         } catch {
@@ -340,20 +442,18 @@ struct QueueWindow: View {
     }
 
     private func loadPreview(_ request: PreviewRequest?) async {
+        guard !Task.isCancelled else { return }
+        completedPreview = nil
         guard let request, let validation = currentValidation, validation.options == request.passes else { return }
         let passes = state.configuredPasses
-        plannedOutputs = []
-        planError = nil
         do {
             try await Task.sleep(for: .milliseconds(200))
             let outputs = try await state.previewOutputs(for: request.selection, passes: passes, tags: validation.tags)
             try Task.checkCancellation()
-            plannedOutputs = outputs
-            completedPreview = request
+            completedPreview = PreviewResult(request: request, outputs: outputs, error: nil)
         } catch {
             guard !Task.isCancelled else { return }
-            planError = error.localizedDescription
-            completedPreview = request
+            completedPreview = PreviewResult(request: request, outputs: [], error: error.localizedDescription)
         }
     }
 }

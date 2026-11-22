@@ -10,10 +10,11 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+use symphonia::core::checksum::Crc32;
 use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_NULL, CODEC_TYPE_OPUS};
 use symphonia::core::errors::Error as FormatError;
 use symphonia::core::formats::{FormatOptions, FormatReader, Packet};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSourceStream, Monitor};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::default::get_probe;
@@ -24,14 +25,34 @@ const AFCONVERT: &str = "/usr/bin/afconvert";
 pub(crate) struct TempPath(PathBuf);
 
 impl TempPath {
-    pub(crate) fn new(extension: &str) -> Self {
+    fn next_path(extension: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let name = format!(
             "transcriberrr-{}-{}.{extension}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
-        Self(std::env::temp_dir().join(name))
+        std::env::temp_dir().join(name)
+    }
+
+    /// Reserve the temporary pathname before handing it to an encoder. Only remove files
+    /// created by this process, including when a PID from an earlier run has been reused.
+    pub(crate) fn create(extension: &str) -> Result<Self> {
+        loop {
+            let path = Self::next_path(extension);
+            match File::create_new(&path) {
+                Ok(_) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("creating {}", path.display()));
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(extension: &str) -> Self {
+        Self(Self::next_path(extension))
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -48,22 +69,24 @@ impl Drop for TempPath {
 /// Remove temporary files left by CLI processes that were force-killed (SIGKILL skips `Drop`).
 /// Names carry the owning PID; files whose process no longer exists are stale.
 pub(crate) fn remove_stale_temp_files() {
-    remove_stale_files(&std::env::temp_dir(), "transcriberrr-", '-');
+    remove_stale_files(&std::env::temp_dir(), |name| {
+        let (pid, tail) = name.strip_prefix("transcriberrr-")?.split_once('-')?;
+        let (serial, extension) = tail.split_once('.')?;
+        if !matches!(extension, "caf" | "ogg" | "wav") || serial.parse::<u32>().is_err() {
+            return None;
+        }
+        pid.parse().ok()
+    });
 }
 
-/// Remove the files in `folder` named `{prefix}{pid}{separator}…` whose process is gone.
-pub(crate) fn remove_stale_files(folder: &Path, prefix: &str, separator: char) {
+/// Remove only files the caller recognizes as temporary and whose owner process is gone.
+pub(crate) fn remove_stale_files(folder: &Path, owner_pid: impl Fn(&str) -> Option<libc::pid_t>) {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(prefix))
-            .and_then(|rest| rest.split(separator).next())
-            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
-        else {
+        let Some(pid) = name.to_str().and_then(&owner_pid).filter(|&pid| pid > 0) else {
             continue;
         };
         // kill(pid, 0) checks for existence without sending a signal.
@@ -86,7 +109,7 @@ pub(crate) fn convert_with_core_audio(input: &Path) -> Result<TempPath> {
     let source = remuxed.as_ref().map_or(input, TempPath::path);
     // CAF has 64-bit sizes; WAV caps at 4 GB, which 48 kHz stereo float passes after ~3 h.
     // Converting to the model's 16 kHz here also cuts the temporary file to a third.
-    let converted = TempPath::new("caf");
+    let converted = TempPath::create("caf")?;
     let output = Command::new(AFCONVERT)
         .args(["-f", "caff", "-d", "LEF32@16000"])
         .arg(source)
@@ -217,7 +240,7 @@ fn remux_opus_to_ogg(input: &Path) -> Result<Option<TempPath>> {
         Some(head) if head.starts_with(b"OpusHead") => head.to_vec(),
         _ => opus_head(channels.max(1)),
     };
-    let output = TempPath::new("ogg");
+    let output = TempPath::create("ogg")?;
     let mut writer = OggWriter::new(BufWriter::new(
         File::create(output.path())
             .with_context(|| format!("creating {}", output.path().display()))?,
@@ -225,7 +248,7 @@ fn remux_opus_to_ogg(input: &Path) -> Result<Option<TempPath>> {
     writer.page(&head, 0, PAGE_FIRST)?;
     writer.page(&opus_tags(), 0, 0)?;
     let mut granule = 0u64;
-    let mut pending: Option<Vec<u8>> = None;
+    let mut pending: Option<Box<[u8]>> = None;
     loop {
         let packet = match format.next_packet() {
             Ok(packet) if packet.track_id() == track_id => packet,
@@ -248,7 +271,7 @@ fn remux_opus_to_ogg(input: &Path) -> Result<Option<TempPath>> {
             Err(error) => return Err(error.into()),
         };
         // Hold one packet back so the final page can carry the end-of-stream flag.
-        if let Some(previous) = pending.replace(packet.data.to_vec()) {
+        if let Some(previous) = pending.replace(packet.data) {
             granule += opus_packet_samples(&previous);
             writer.page(&previous, granule, 0)?;
         }
@@ -310,11 +333,16 @@ const PAGE_LAST: u8 = 0x04;
 struct OggWriter<W: Write> {
     out: W,
     sequence: u32,
+    page: Vec<u8>,
 }
 
 impl<W: Write> OggWriter<W> {
     fn new(out: W) -> Self {
-        Self { out, sequence: 0 }
+        Self {
+            out,
+            sequence: 0,
+            page: Vec::new(),
+        }
     }
 
     fn page(&mut self, packet: &[u8], granule: u64, flags: u8) -> Result<()> {
@@ -324,9 +352,9 @@ impl<W: Write> OggWriter<W> {
                 packet.len()
             );
         }
-        let mut lacing = vec![255u8; packet.len() / 255];
-        lacing.push((packet.len() % 255) as u8);
-        let mut page = Vec::with_capacity(27 + lacing.len() + packet.len());
+        let full_segments = packet.len() / 255;
+        let page = &mut self.page;
+        page.clear();
         page.extend(b"OggS");
         page.push(0); // stream structure version
         page.push(flags);
@@ -334,12 +362,15 @@ impl<W: Write> OggWriter<W> {
         page.extend(1u32.to_le_bytes()); // bitstream serial number
         page.extend(self.sequence.to_le_bytes());
         page.extend([0u8; 4]); // CRC, filled below
-        page.push(lacing.len() as u8);
-        page.extend(&lacing);
+        page.push((full_segments + 1) as u8);
+        page.resize(27 + full_segments, 255);
+        page.push((packet.len() % 255) as u8);
         page.extend(packet);
-        let crc = ogg_crc(&page);
-        page[22..26].copy_from_slice(&crc.to_le_bytes());
-        self.out.write_all(&page)?;
+        // Ogg uses an initial CRC state of zero and includes the zeroed checksum field.
+        let mut crc = Crc32::new(0);
+        crc.process_buf_bytes(page);
+        page[22..26].copy_from_slice(&crc.crc().to_le_bytes());
+        self.out.write_all(page)?;
         self.sequence += 1;
         Ok(())
     }
@@ -348,21 +379,6 @@ impl<W: Write> OggWriter<W> {
         self.out.flush()?;
         Ok(())
     }
-}
-
-/// Ogg's CRC-32: polynomial 0x04C11DB7, zero initial value, no reflection or final XOR.
-fn ogg_crc(data: &[u8]) -> u32 {
-    data.iter().fold(0u32, |mut crc, &byte| {
-        crc ^= u32::from(byte) << 24;
-        for _ in 0..8 {
-            crc = if crc & 0x8000_0000 != 0 {
-                (crc << 1) ^ 0x04C1_1DB7
-            } else {
-                crc << 1
-            };
-        }
-        crc
-    })
 }
 
 /// Write 32-bit float mono WAV, used to hand already-decoded audio to the Apple helper.
@@ -412,10 +428,12 @@ mod tests {
         let mut writer = OggWriter::new(File::create(path.path()).unwrap());
         writer.page(&opus_head(1), 0, PAGE_FIRST).unwrap();
         writer.page(&opus_tags(), 0, 0).unwrap();
-        // 300-byte packets exercise multi-segment lacing.
-        let packets = (0..5u8)
-            .map(|index| {
-                let mut packet = vec![index; 300];
+        // Include a packet whose length is exactly one lacing segment.
+        let packets = [255, 300, 120, 510, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(index, size)| {
+                let mut packet = vec![index as u8; size];
                 packet[0] = 31 << 3;
                 packet
             })

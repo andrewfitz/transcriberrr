@@ -9,21 +9,18 @@ import CoreMedia
 import Foundation
 import Speech
 
-private struct NativeWord: Codable {
+struct NativeWord: Encodable {
     var text: String
     let start: Double
     let end: Double
-    var speaker: Int?
-
-    private enum CodingKeys: String, CodingKey { case text, start, end }
 }
 
 private struct NativeSegment: Encodable {
-    let text: String
     let start: Double
     let end: Double
-    var speaker: Int?
-    var words: [NativeWord]
+    let words: [NativeWord]
+
+    var text: String { words.lazy.map(\.text).joined() }
 
     private enum CodingKeys: String, CodingKey { case text, start, end, words }
 
@@ -31,12 +28,16 @@ private struct NativeSegment: Encodable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(start, forKey: .start)
         try container.encode(end, forKey: .end)
-        if words.isEmpty {
+        if encoder.userInfo[.omitWords] as? Bool == true {
             try container.encode(text, forKey: .text)
         } else {
             try container.encode(words, forKey: .words)
         }
     }
+}
+
+private extension CodingUserInfoKey {
+    static let omitWords = CodingUserInfoKey(rawValue: "omitWords")!
 }
 
 private struct NativeTranscript: Encodable {
@@ -45,13 +46,8 @@ private struct NativeTranscript: Encodable {
     let device: String
     let language: String
     let duration_seconds: Double
-    let text: String
-    var segments: [NativeSegment]
+    let segments: [NativeSegment]
     let metadata: NativeMetadata
-
-    private enum CodingKeys: String, CodingKey {
-        case source, model, device, language, duration_seconds, segments, metadata
-    }
 }
 
 private struct NativeMetadata: Codable {
@@ -100,7 +96,7 @@ private enum TimestampMode: String {
     case none, words, sentences
 }
 
-private enum NativeError: LocalizedError {
+enum NativeError: LocalizedError {
     case usage
     case unavailable
     case unsupportedLocale
@@ -111,7 +107,7 @@ private enum NativeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .usage:
-            return "usage: transcriberrr-native INPUT [--output PATH]"
+            return "usage: transcriberrr-native INPUT [--output PATH] [--format txt|json|srt|vtt] [--timestamps none|words|sentences] [--offline]"
         case .unavailable:
             return "Apple SpeechTranscriber is unavailable on this Mac or requires macOS 26 or later"
         case .unsupportedLocale:
@@ -130,6 +126,24 @@ private enum NativeError: LocalizedError {
 struct TranscriberrrNative {
     static func main() async {
         do {
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            if arguments.first == "stream" || arguments == ["--stream-supported"] {
+                guard #available(macOS 26.0, *) else { throw NativeError.unavailable }
+                switch arguments {
+                case ["--stream-supported"]:
+                    _ = try await LiveSpeech.locale()
+                case ["stream"], ["stream", "--offline"]:
+                    do {
+                        try await LiveSpeech.run(offline: arguments.contains("--offline"))
+                    } catch {
+                        LiveSpeech.emitStartupError(error)
+                        throw error
+                    }
+                default:
+                    throw NativeError.usage
+                }
+                return
+            }
             let (input, output, format, timestamps, offline) = try parseArguments()
             guard #available(macOS 26.0, *) else { throw NativeError.unavailable }
             let transcript = try await transcribe(input: input, offline: offline)
@@ -137,8 +151,10 @@ struct TranscriberrrNative {
             if let output {
                 try data.write(to: output, options: .atomic)
             } else {
-                FileHandle.standardOutput.write(data)
-                FileHandle.standardOutput.write(Data([0x0a]))
+                try FileHandle.standardOutput.write(contentsOf: data)
+                if data.last != 0x0a {
+                    try FileHandle.standardOutput.write(contentsOf: Data([0x0a]))
+                }
             }
         } catch {
             FileHandle.standardError.write(Data("transcriberrr-native: \(error.localizedDescription)\n".utf8))
@@ -183,26 +199,36 @@ struct TranscriberrrNative {
     private static func render(transcript: NativeTranscript, format: OutputFormat, timestamps: TimestampMode) throws -> Data {
         switch format {
         case .json:
-            var document = transcript
-            if timestamps != .words {
-                document.segments = document.segments.map { segment in
-                    var segment = segment
-                    segment.words = []
-                    return segment
-                }
-            }
-            return try JSONEncoder().encode(document)
+            let encoder = JSONEncoder()
+            encoder.userInfo[.omitWords] = timestamps != .words
+            return try encoder.encode(transcript)
         case .txt:
-            return Data((transcript.text + "\n").utf8)
+            return Data((transcript.segments.lazy.map(\.text).joined() + "\n").utf8)
         case .srt, .vtt:
             var output = format == .vtt ? "WEBVTT\n\n" : ""
-            let cues: [(Double, Double, String)] = timestamps == .words
-                ? transcript.segments.flatMap { $0.words.map { ($0.start, $0.end, $0.text.trimmingCharacters(in: .whitespacesAndNewlines)) } }
-                : transcript.segments.map { ($0.start, $0.end, $0.text) }
-            for (index, cue) in cues.enumerated() {
-                if format == .srt { output += "\(index + 1)\n" }
-                let cueText = cue.2.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
-                output += "\(timestamp(cue.0, format: format)) --> \(timestamp(cue.1, format: format))\n\(cueText)\n\n"
+            var index = 0
+            func appendCue(start: Double, end: Double, text: String) {
+                var cueText = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                guard !cueText.isEmpty else { return }
+                cueText = cueText.replacingOccurrences(of: "-->", with: "->")
+                if format == .vtt {
+                    cueText = cueText.replacingOccurrences(of: "&", with: "&amp;")
+                        .replacingOccurrences(of: "<", with: "&lt;")
+                        .replacingOccurrences(of: ">", with: "&gt;")
+                } else {
+                    index += 1
+                    output += "\(index)\n"
+                }
+                output += "\(timestamp(start, format: format)) --> \(timestamp(end, format: format))\n\(cueText)\n\n"
+            }
+            for segment in transcript.segments {
+                if timestamps == .words {
+                    for word in segment.words {
+                        appendCue(start: word.start, end: word.end, text: word.text)
+                    }
+                } else {
+                    appendCue(start: segment.start, end: segment.end, text: segment.text)
+                }
             }
             return Data(output.utf8)
         }
@@ -221,88 +247,10 @@ struct TranscriberrrNative {
 
     @available(macOS 26.0, *)
     private static func transcribe(input: URL, offline: Bool) async throws -> NativeTranscript {
-        guard SpeechTranscriber.isAvailable else { throw NativeError.unavailable }
-        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) else {
-            throw NativeError.unsupportedLocale
-        }
-
-        let transcriber = SpeechTranscriber(
-            locale: locale,
-            transcriptionOptions: [],
-            reportingOptions: [],
-            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
-        )
-        if offline {
-            guard await AssetInventory.status(forModules: [transcriber]) == .installed else {
-                throw NativeError.assetsNotInstalled
-            }
-        } else if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            try await request.downloadAndInstall()
-        }
-
         let audioFile = try AVAudioFile(forReading: input)
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
-        let resultTask = Task { () throws -> [NativeWord] in
-            var words: [NativeWord] = []
-            var pendingPrefix = ""
-            for try await result in transcriber.results {
-                var firstRun = true
-                for run in result.text.runs {
-                    var text = String(result.text[run.range].characters)
-                    guard !text.isEmpty else { continue }
-                    if firstRun, let previous = words.last,
-                       previous.text.last?.isWhitespace == false,
-                       text.first?.isWhitespace == false {
-                        text = " " + text
-                    }
-                    firstRun = false
-                    guard let timeRange = run.audioTimeRange,
-                          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    else {
-                        if text.contains(where: { $0.isLetter || $0.isNumber }) {
-                            throw NativeError.missingTimestamps
-                        }
-                        // Untimed punctuation and spaces still belong to the transcript.
-                        if !words.isEmpty {
-                            words[words.count - 1].text += text
-                        } else {
-                            pendingPrefix += text
-                        }
-                        continue
-                    }
-                    text = pendingPrefix + text
-                    pendingPrefix = ""
-                    // Keep timings finite and ordered: the Rust side rejects a document with a
-                    // NaN, a backwards start, or end < start, losing the whole transcript.
-                    let rawStart = CMTimeGetSeconds(timeRange.start)
-                    let rawEnd = CMTimeGetSeconds(timeRange.end)
-                    let start = max(rawStart.isFinite ? rawStart : 0, words.last?.start ?? 0)
-                    let end = max(rawEnd.isFinite ? rawEnd : start, start)
-                    words.append(NativeWord(
-                        text: text,
-                        start: start,
-                        end: end,
-                        speaker: nil
-                    ))
-                }
-            }
-            if !pendingPrefix.isEmpty { throw NativeError.missingTimestamps }
-            return words
-        }
-        // No audio (a header-only file) leaves `analyzeSequence` with no last sample, and the
-        // results stream then never ends: waiting on it would hang forever.
-        let words: [NativeWord]
-        if audioFile.length > 0, let lastSample = try await analyzer.analyzeSequence(from: audioFile) {
-            try await analyzer.finalizeAndFinish(through: lastSample)
-            words = try await resultTask.value
-        } else {
-            await analyzer.cancelAndFinishNow()
-            resultTask.cancel()
-            words = []
-        }
-        let text = words.map(\.text).joined()
-        let segments = buildSegments(words)
-        let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
+        let frames = audioFile.length
+        let duration = Double(frames) / audioFile.processingFormat.sampleRate
+        let words = frames > 0 ? try await transcribeAudio(audioFile, offline: offline) : []
         let resourceValues = try? input.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
         return NativeTranscript(
             source: input.path,
@@ -311,8 +259,7 @@ struct TranscriberrrNative {
             // Same label as the other engines (the CLI is English-only).
             language: "English",
             duration_seconds: duration.isFinite ? duration : (words.last?.end ?? 0),
-            text: text,
-            segments: segments,
+            segments: buildSegments(words),
             metadata: NativeMetadata(
                 transcribedWith: "transcriberrr",
                 version: transcriberrrVersion,
@@ -325,6 +272,85 @@ struct TranscriberrrNative {
         )
     }
 
+    @available(macOS 26.0, *)
+    private static func transcribeAudio(_ audioFile: AVAudioFile, offline: Bool) async throws -> [NativeWord] {
+        guard SpeechTranscriber.isAvailable else { throw NativeError.unavailable }
+        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) else {
+            throw NativeError.unsupportedLocale
+        }
+
+        let transcriber = SpeechTranscriber(
+            locale: locale,
+            transcriptionOptions: [],
+            reportingOptions: [],
+            attributeOptions: [.audioTimeRange]
+        )
+        if offline {
+            guard await AssetInventory.status(forModules: [transcriber]) == .installed else {
+                throw NativeError.assetsNotInstalled
+            }
+        } else if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            try await request.downloadAndInstall()
+        }
+
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        do {
+            try await analyzer.start(inputAudioFile: audioFile, finishAfterFile: true)
+            return try await collectWords(from: transcriber)
+        } catch {
+            await analyzer.cancelAndFinishNow()
+            throw error
+        }
+    }
+
+    @available(macOS 26.0, *)
+    private static func collectWords(from transcriber: SpeechTranscriber) async throws -> [NativeWord] {
+        var words: [NativeWord] = []
+        var pendingPrefix = ""
+        for try await result in transcriber.results {
+            var firstRun = true
+            for run in result.text.runs {
+                var text = String(result.text[run.range].characters)
+                guard !text.isEmpty else { continue }
+                if firstRun, let previous = words.last,
+                   previous.text.last?.isWhitespace == false,
+                   text.first?.isWhitespace == false {
+                    text = " " + text
+                }
+                firstRun = false
+                guard let timeRange = run.audioTimeRange,
+                      text.contains(where: { !$0.isWhitespace })
+                else {
+                    if text.contains(where: { $0.isLetter || $0.isNumber }) {
+                        throw NativeError.missingTimestamps
+                    }
+                    // Untimed punctuation and spaces still belong to the transcript.
+                    if !words.isEmpty {
+                        words[words.count - 1].text += text
+                    } else {
+                        pendingPrefix += text
+                    }
+                    continue
+                }
+                text = pendingPrefix + text
+                pendingPrefix = ""
+                // Keep timings finite and ordered: the Rust side rejects a document with a
+                // NaN, a backwards start, or end < start, losing the whole transcript.
+                let rawStart = CMTimeGetSeconds(timeRange.start)
+                let rawEnd = CMTimeGetSeconds(timeRange.end)
+                let start = max(rawStart.isFinite ? rawStart : 0, words.last?.start ?? 0)
+                let end = max(rawEnd.isFinite ? rawEnd : start, start)
+                words.append(NativeWord(
+                    text: text,
+                    start: start,
+                    end: end
+                ))
+            }
+        }
+        if !pendingPrefix.isEmpty { throw NativeError.missingTimestamps }
+        return words
+    }
+
     private static func iso8601(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()
         // Whole seconds, like the other engines: merges order `transcribed_at` as text.
@@ -335,14 +361,19 @@ struct TranscriberrrNative {
     private static func buildSegments(_ words: [NativeWord]) -> [NativeSegment] {
         var segments: [NativeSegment] = []
         var current: [NativeWord] = []
+        let trailingPunctuation = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "”’\"')]}」』"))
         for word in words {
             let split = current.last.map { previous in
-                let ending = previous.text.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "”’\"')]}」』")))
-                return word.start - previous.end > 1.0 || ending.hasSuffix(".") || ending.hasSuffix("?") || ending.hasSuffix("!")
+                if word.start - previous.end > 1.0 { return true }
+                let ending = previous.text.trimmingCharacters(in: trailingPunctuation)
+                guard let finalCharacter = ending.last else { return false }
+                return "。？！".contains(finalCharacter)
+                    || (".?!".contains(finalCharacter)
+                        && (previous.text.last?.isWhitespace == true || word.text.first?.isWhitespace == true))
             } ?? false
-            if split, !current.isEmpty {
+            if split {
                 segments.append(segment(current))
-                current.removeAll(keepingCapacity: true)
+                current = []
             }
             current.append(word)
         }
@@ -352,10 +383,8 @@ struct TranscriberrrNative {
 
     private static func segment(_ words: [NativeWord]) -> NativeSegment {
         NativeSegment(
-            text: words.map(\.text).joined(),
             start: words.first?.start ?? 0,
-            end: words.map(\.end).max() ?? words.first?.start ?? 0,
-            speaker: nil,
+            end: words.lazy.map(\.end).max() ?? 0,
             words: words
         )
     }
