@@ -34,38 +34,44 @@ impl VoiceDetector {
         // transcribed it word for word.
         let mut previous_input = 0.0f32;
         let mut previous_output = 0.0f32;
+        let mut peak = 0.0f32;
         let samples = samples
             .iter()
             .map(|&sample| {
+                // A non-finite decoder sample would otherwise poison the rest of the filter.
+                let sample = if sample.is_finite() { sample } else { 0.0 };
                 previous_output = sample - previous_input + 0.943 * previous_output;
                 previous_input = sample;
+                peak = peak.max(previous_output.abs());
                 previous_output
             })
             .collect::<Vec<_>>();
-        let peak = samples
-            .iter()
-            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
         if peak == 0.0 || !peak.is_finite() {
             return false;
         }
         let gain = JUDGED_PEAK / peak;
-        let mut bytes = Vec::with_capacity(BYTES_PER_WINDOW);
+        // A short final chunk may contain fewer windows than the normal decision threshold.
+        let required_windows =
+            SHORTEST_SPEECH_WINDOWS.min(samples.len().div_ceil(SAMPLES_PER_WINDOW));
+        let mut bytes = [0u8; BYTES_PER_WINDOW];
         let mut run = 0;
         for window in samples.chunks(SAMPLES_PER_WINDOW) {
-            bytes.clear();
-            for index in 0..SAMPLES_PER_WINDOW {
-                let sample = window.get(index).copied().unwrap_or(0.0) * gain;
+            for (pair, &sample) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(window) {
+                let sample = sample * gain;
                 let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-                bytes.extend_from_slice(&sample.to_le_bytes());
+                *pair = sample.to_le_bytes();
             }
+            bytes[window.len() * 2..].fill(0);
             // `infer` only fails on a wrong window length; keep the chunk if it ever does.
-            let probability = self.0.infer(&bytes).unwrap_or(1.0);
+            let Ok(probability) = self.0.infer(&bytes) else {
+                return true;
+            };
             run = if probability >= SPEECH_PROBABILITY {
                 run + 1
             } else {
                 0
             };
-            if run >= SHORTEST_SPEECH_WINDOWS {
+            if run >= required_windows {
                 return true;
             }
         }
@@ -151,6 +157,9 @@ mod tests {
         };
         let detector = VoiceDetector::new().unwrap();
         let peak = speech.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        let mut damaged = vec![f32::NAN];
+        damaged.extend_from_slice(&speech);
+        assert!(detector.has_speech(&damaged));
         // Clean 24-bit speech peaking at -60 dBFS, padded with digital silence to a chunk.
         let mut quiet = vec![0.0; RATE * 10];
         quiet.extend(speech.iter().map(|s| s / peak * 0.001));

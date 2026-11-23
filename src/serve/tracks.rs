@@ -28,6 +28,8 @@ const GLOBAL_LAG_COMMANDS: usize = 64;
 const COMMAND_QUEUE: usize = 16;
 const SLOW_READER: u16 = 4008;
 const TAKEN_OVER: u16 = 4009;
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub(super) struct Registry {
@@ -422,6 +424,8 @@ enum Input {
     Invalid(Value),
     Ignore,
     PeerClose,
+    /// The WebSocket layer refused a frame. The socket can still be written.
+    Refused(super::FrameFailure),
     Closed,
 }
 
@@ -435,12 +439,47 @@ fn parse_message(message: Result<Message, axum::Error>) -> Input {
             Input::Invalid(error("invalid_message", "Expected a text message."))
         }
         Ok(Message::Close(_)) => Input::PeerClose,
-        Err(_) => Input::Closed,
+        Err(failure) => super::frame_failure(&failure).map_or(Input::Closed, Input::Refused),
         _ => Input::Ignore,
     }
 }
 
-pub(super) async fn run(mut socket: WebSocket, state: Arc<super::AppState>, resume_only: bool) {
+/// Detects a peer that vanished without closing the connection.
+#[derive(Clone, Copy)]
+struct Heartbeat {
+    ping_interval: Duration,
+    idle_timeout: Duration,
+}
+
+pub(super) async fn run(socket: WebSocket, state: Arc<super::AppState>, resume_only: bool) {
+    let heartbeat = Heartbeat {
+        ping_interval: PING_INTERVAL,
+        idle_timeout: IDLE_TIMEOUT,
+    };
+    negotiate(socket, state, resume_only, heartbeat).await;
+}
+
+#[cfg(test)]
+pub(super) async fn run_with_liveness(
+    socket: WebSocket,
+    state: Arc<super::AppState>,
+    resume_only: bool,
+    ping_interval: Duration,
+    idle_timeout: Duration,
+) {
+    let heartbeat = Heartbeat {
+        ping_interval,
+        idle_timeout,
+    };
+    negotiate(socket, state, resume_only, heartbeat).await;
+}
+
+async fn negotiate(
+    mut socket: WebSocket,
+    state: Arc<super::AppState>,
+    resume_only: bool,
+    heartbeat: Heartbeat,
+) {
     let mut shutdown = state.shutdown.clone();
     let deadline = tokio::time::sleep(if resume_only {
         RESUME_WINDOW
@@ -487,8 +526,13 @@ pub(super) async fn run(mut socket: WebSocket, state: Arc<super::AppState>, resu
                                 result = attach => result,
                             } {
                                 Some(Ok(attachment)) => {
-                                    connected(socket, sender.input, attachment, events, close)
-                                        .await;
+                                    let link = Link {
+                                        sender: sender.input,
+                                        events,
+                                        close,
+                                        heartbeat,
+                                    };
+                                    connected(socket, attachment, link).await;
                                     return;
                                 }
                                 Some(Err(failure)) => {
@@ -538,9 +582,19 @@ pub(super) async fn run(mut socket: WebSocket, state: Arc<super::AppState>, resu
                 .await;
                 return;
             }
-            Some(Input::Text(_)) if resuming => return,
+            Some(Input::Text(_)) if resuming => {
+                let _ = send_json(
+                    &mut socket,
+                    &error(
+                        "expected_resume",
+                        "Send a session resume event on this socket.",
+                    ),
+                )
+                .await;
+                return;
+            }
             Some(Input::Text(message)) => {
-                start_session(socket, state, Some(message)).await;
+                start_session(socket, state, Some(message), heartbeat).await;
                 return;
             }
             Some(Input::Invalid(failure)) => {
@@ -553,24 +607,49 @@ pub(super) async fn run(mut socket: WebSocket, state: Arc<super::AppState>, resu
                 let _ = tokio::time::timeout(CLOSE_TIMEOUT, socket.flush()).await;
                 return;
             }
+            Some(Input::Refused(failure)) => {
+                if send_json(&mut socket, &error(failure.code, failure.message))
+                    .await
+                    .is_ok()
+                {
+                    let frame = CloseFrame {
+                        code: failure.close_code,
+                        reason: failure.reason.into(),
+                    };
+                    let _ = tokio::time::timeout(
+                        CLOSE_TIMEOUT,
+                        socket.send(Message::Close(Some(frame))),
+                    )
+                    .await;
+                }
+                return;
+            }
             Some(Input::Closed) | None => return,
         }
     }
     if !resuming {
-        start_session(socket, state, None).await;
+        start_session(socket, state, None, heartbeat).await;
     }
 }
 
 enum SendFailure {
     Stalled,
     Closed,
+    Silent,
 }
 
 async fn send_text(
     socket: &mut (impl Sink<Message, Error = axum::Error> + Unpin),
     text: Utf8Bytes,
 ) -> Result<(), SendFailure> {
-    match tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(text))).await {
+    send_message(socket, Message::Text(text)).await
+}
+
+async fn send_message(
+    socket: &mut (impl Sink<Message, Error = axum::Error> + Unpin),
+    message: Message,
+) -> Result<(), SendFailure> {
+    match tokio::time::timeout(SEND_TIMEOUT, socket.send(message)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(SendFailure::Closed),
         Err(_) => Err(SendFailure::Stalled),
@@ -581,7 +660,12 @@ async fn send_json(socket: &mut WebSocket, value: &Value) -> Result<(), SendFail
     send_text(socket, value.to_string().into()).await
 }
 
-async fn start_session(mut socket: WebSocket, state: Arc<super::AppState>, initial: Option<Value>) {
+async fn start_session(
+    mut socket: WebSocket,
+    state: Arc<super::AppState>,
+    initial: Option<Value>,
+    heartbeat: Heartbeat,
+) {
     let Ok(permit) = Arc::clone(&state.active_sessions).try_acquire_owned() else {
         let _ = send_json(
             &mut socket,
@@ -611,43 +695,68 @@ async fn start_session(mut socket: WebSocket, state: Arc<super::AppState>, initi
         session.run(receiver, attachments).await;
         session.state.native.remove(&session.id);
     });
-    connected(
-        socket,
-        sender.input,
-        Attachment {
-            owner: 1,
-            announcement,
-            replay: Vec::new(),
-        },
+    let attachment = Attachment {
+        owner: 1,
+        announcement,
+        replay: Vec::new(),
+    };
+    let link = Link {
+        sender: sender.input,
         events,
         close,
-    )
-    .await;
+        heartbeat,
+    };
+    connected(socket, attachment, link).await;
 }
 
-async fn connected(
-    socket: WebSocket,
+enum ReadEnd {
+    PeerClosed,
+    Refused(super::FrameFailure),
+    Closed,
+}
+
+/// The socket side of a session attachment.
+struct Link {
     sender: mpsc::Sender<Command>,
-    attachment: Attachment,
-    mut events: EventReceiver,
-    mut close: CloseReceiver,
-) {
+    events: EventReceiver,
+    close: CloseReceiver,
+    heartbeat: Heartbeat,
+}
+
+async fn connected(socket: WebSocket, attachment: Attachment, link: Link) {
+    let Link {
+        sender,
+        mut events,
+        mut close,
+        heartbeat,
+    } = link;
     let (mut writer, mut reader) = socket.split();
     let owner = attachment.owner;
+    // Set only while the reader waits for the peer. Time the session spends
+    // not reading, to apply backpressure, never counts as peer silence.
+    let listening = Mutex::new(None::<Instant>);
     let reading = async {
-        while let Some(message) = reader.next().await {
+        loop {
+            *listening.lock().unwrap() = Some(Instant::now());
+            let message = reader.next().await;
+            *listening.lock().unwrap() = None;
+            let Some(message) = message else {
+                return ReadEnd::Closed;
+            };
             let command = match parse_message(message) {
                 Input::Text(message) => Command::Input { owner, message },
                 Input::Invalid(failure) => Command::Invalid { owner, failure },
                 Input::Ignore => continue,
-                Input::PeerClose => return true,
-                Input::Closed => return false,
+                Input::PeerClose => return ReadEnd::PeerClosed,
+                Input::Refused(failure) => return ReadEnd::Refused(failure),
+                Input::Closed => return ReadEnd::Closed,
             };
             if sender.send(command).await.is_err() {
-                return false;
+                // The session has ended. Its last events may still be queued, so
+                // leave the writer to deliver them and close the socket.
+                std::future::pending::<()>().await;
             }
         }
-        false
     };
     let writing = async {
         let delivery = async {
@@ -655,10 +764,28 @@ async fn connected(
             for event in attachment.replay {
                 send_text(&mut writer, event).await?;
             }
-            while let Some(event) = events.recv().await {
-                send_text(&mut writer, event.text).await?;
+            let start = tokio::time::Instant::now() + heartbeat.ping_interval;
+            let mut pings = tokio::time::interval_at(start, heartbeat.ping_interval);
+            pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    event = events.recv() => match event {
+                        Some(event) => send_text(&mut writer, event.text).await?,
+                        None => return Ok(()),
+                    },
+                    _ = pings.tick() => {
+                        // Any frame counts, including the pong a live peer returns.
+                        let silent = listening
+                            .lock()
+                            .unwrap()
+                            .is_some_and(|since| since.elapsed() >= heartbeat.idle_timeout);
+                        if silent {
+                            return Err(SendFailure::Silent);
+                        }
+                        send_message(&mut writer, Message::Ping(Default::default())).await?;
+                    }
+                }
             }
-            Ok(())
         };
         let closing = async {
             if close.wait_for(Option::is_some).await.is_err() {
@@ -672,12 +799,19 @@ async fn connected(
             result = delivery => match result {
                 Ok(()) => Some((1000, "session ended")),
                 Err(SendFailure::Stalled) => Some((SLOW_READER, "outbound delivery stalled")),
+                // The session stays resumable, as after any other disconnect.
+                Err(SendFailure::Silent) => Some((1001, "peer stopped responding")),
                 Err(SendFailure::Closed) => None,
             }
         }
     };
     let (peer_closed, close_notice) = tokio::select! {
-        peer_closed = reading => (peer_closed, None),
+        end = reading => match end {
+            ReadEnd::PeerClosed => (true, None),
+            // The close code tells the peer why. The session stays resumable.
+            ReadEnd::Refused(failure) => (false, Some((failure.close_code, failure.reason))),
+            ReadEnd::Closed => (false, None),
+        },
         notice = writing => (false, notice),
     };
     let closing = async {
@@ -686,14 +820,25 @@ async fn connected(
                 code,
                 reason: reason.into(),
             };
-            let _ = writer.send(Message::Close(Some(frame))).await;
+            if writer.send(Message::Close(Some(frame))).await.is_ok() {
+                // Wait for the peer's reply. Dropping the socket with its audio
+                // unread resets the connection, which can discard the events
+                // and the close frame before the peer reads them.
+                while let Some(Ok(message)) = reader.next().await {
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                }
+            }
         } else if peer_closed {
             // Tungstenite queues the close echo when reading a peer's close frame.
             let _ = writer.flush().await;
         }
     };
+    // A paused session does not read commands. It notices the closed event
+    // queue instead, so do not hold this socket's slot until the pause lifts.
     let _ = tokio::join!(
-        sender.send(Command::Detach { owner }),
+        tokio::time::timeout(CLOSE_TIMEOUT, sender.send(Command::Detach { owner })),
         tokio::time::timeout(CLOSE_TIMEOUT, closing),
     );
 }
@@ -716,7 +861,12 @@ const MAX_CAPTURE_QUEUE: usize = 128;
 const MAX_RAW_PACKETS: usize = 512;
 const MAX_RAW_FRAMES: usize = 2 * MAX_NATIVE_FRAMES as usize;
 const FINAL_WAIT: Duration = Duration::from_millis(1_250);
-const DIARIZATION_WAIT: Duration = Duration::from_secs(2);
+// Captions wait this long for a diarizer whose queue is full. After that its audio
+// is dropped until it catches up, and the captions it missed carry no speaker.
+#[cfg(feature = "diarization")]
+const DIARIZATION_STALL: Duration = Duration::from_secs(1);
+const DEFAULT_DIARIZATION_WAIT_MS: u64 = 2_000;
+const MAX_DIARIZATION_WAIT_MS: u64 = 10_000;
 
 enum CaptureAction {
     Audio(Audio),
@@ -774,7 +924,13 @@ struct Track {
     lagging: bool,
     #[cfg(feature = "diarization")]
     diarization: Option<super::diarization::Stream>,
-    diarize: bool,
+    // When the diarizer's queue first refused this track's head packet.
+    #[cfg(feature = "diarization")]
+    diarization_stalled: Option<Instant>,
+    // The diarizer fell behind and gets no audio until it has caught up.
+    #[cfg(feature = "diarization")]
+    diarization_dropping: bool,
+    diarization_wait: Option<Duration>,
 }
 
 enum MarkerAction {
@@ -794,7 +950,10 @@ struct Marker {
 
 impl Track {
     fn close_item(&mut self, turn: u64) {
-        self.draft = None;
+        // A later item's draft can be published while this item's final waits.
+        if self.draft.is_some_and(|(active, _)| active <= turn) {
+            self.draft = None;
+        }
         self.last_terminal = Some(turn);
     }
 
@@ -827,6 +986,7 @@ struct Session {
     bleed: LiveBleed,
     next_key: u64,
     ended_isolated: VecDeque<u64>,
+    poll_ids: Vec<String>,
 }
 
 impl Session {
@@ -849,6 +1009,7 @@ impl Session {
             bleed: LiveBleed::default(),
             next_key: 0,
             ended_isolated: VecDeque::new(),
+            poll_ids: Vec::new(),
         }
     }
 
@@ -875,6 +1036,8 @@ impl Session {
             },
             "limits": {
                 "max_tracks": self.state.max_tracks,
+                "default_diarization_wait_ms": DEFAULT_DIARIZATION_WAIT_MS,
+                "max_diarization_wait_ms": MAX_DIARIZATION_WAIT_MS,
                 "max_sessions": self.state.max_sessions,
                 "max_completed_sessions": self.state.max_sessions,
                 "max_append_frames": MAX_PACKET_FRAMES,
@@ -892,6 +1055,9 @@ impl Session {
                 "max_recognition_queue_frames": MAX_QUEUED_FRAMES,
                 "input_pause_capture_frames": MAX_PENDING_FRAMES,
                 "input_pause_capture_packets": MAX_CAPTURE_QUEUE,
+                "max_message_bytes": super::MAX_MESSAGE_BYTES,
+                "ping_interval_ms": PING_INTERVAL.as_millis() as u64,
+                "idle_timeout_ms": IDLE_TIMEOUT.as_millis() as u64,
             },
         })
     }
@@ -1073,7 +1239,12 @@ impl Session {
     }
 
     fn fail(&mut self, failure: Value) {
-        self.send(failure.to_string().into());
+        // Error replies are best effort. A burst of rejected messages, such as
+        // audio that is still arriving after the session began ending, must not
+        // disconnect a client that is reading its sequenced events.
+        if let Some(client) = &self.client {
+            let _ = client.send(failure.to_string().into());
+        }
     }
 
     fn input(&mut self, message: Value) {
@@ -1172,17 +1343,37 @@ impl Session {
                 "Live diarization is unavailable for this track.",
             ));
         }
+        let wait_ms = match message.get("diarization_wait_ms") {
+            None => DEFAULT_DIARIZATION_WAIT_MS,
+            Some(_) if !diarize => {
+                return Err(error(
+                    "invalid_diarization_wait",
+                    "diarization_wait_ms requires diarization on this track.",
+                ));
+            }
+            Some(value) => value.as_u64().filter(|ms| *ms <= MAX_DIARIZATION_WAIT_MS)
+                .ok_or_else(|| error(
+                    "invalid_diarization_wait",
+                    &format!("Expected diarization_wait_ms to be an integer from 0 to {MAX_DIARIZATION_WAIT_MS}."),
+                ))?,
+        };
         #[cfg(feature = "diarization")]
         let diarization = if diarize {
-            Some(
-                self.state
-                    .diarization
-                    .as_ref()
-                    .and_then(|worker| worker.reserve())
-                    .ok_or_else(|| {
-                        error("diarization_busy", "The live diarizer is already reserved.")
-                    })?,
-            )
+            use super::diarization::ReserveError;
+            let worker = self.state.diarization.as_ref().ok_or_else(|| {
+                error(
+                    "unsupported_diarization",
+                    "Live diarization is unavailable for this track.",
+                )
+            })?;
+            Some(worker.try_reserve().map_err(|reason| match reason {
+                ReserveError::Busy => {
+                    error("diarization_busy", "The live diarizer is already reserved.")
+                }
+                ReserveError::Stopped => {
+                    error("unsupported_diarization", "The live diarizer has stopped.")
+                }
+            })?)
         } else {
             None
         };
@@ -1226,18 +1417,26 @@ impl Session {
                 raw_frames: 0,
                 outputs: VecDeque::new(),
                 lagging: false,
-                diarize,
+                diarization_wait: diarize.then(|| Duration::from_millis(wait_ms)),
                 #[cfg(feature = "diarization")]
                 diarization,
+                #[cfg(feature = "diarization")]
+                diarization_stalled: None,
+                #[cfg(feature = "diarization")]
+                diarization_dropping: false,
             },
         );
-        self.emit(json!({
+        let mut registered = json!({
             "type": "transcriberrr.track.registered",
             "track_id": id,
             "role": message["role"],
             "speaker": speaker,
             "next_expected_frame": expected,
-        }));
+        });
+        if diarize {
+            registered["diarization_wait_ms"] = wait_ms.into();
+        }
+        self.emit(registered);
         Ok(())
     }
 
@@ -1289,7 +1488,10 @@ impl Session {
     fn diarization_available(&self) -> bool {
         #[cfg(feature = "diarization")]
         {
-            self.state.diarization.is_some()
+            self.state
+                .diarization
+                .as_ref()
+                .is_some_and(|worker| worker.is_running())
         }
         #[cfg(not(feature = "diarization"))]
         {
@@ -1527,11 +1729,32 @@ impl Session {
                         break;
                     };
                     #[cfg(feature = "diarization")]
-                    if let Some(stream) = &track.diarization
-                        && !stream.try_append(*start, samples)
-                    {
-                        blocked = true;
-                        break;
+                    if let Some(stream) = &track.diarization {
+                        // Resume only once the diarizer has caught up, so that labelled
+                        // stretches stay long instead of alternating with gaps.
+                        if track.diarization_dropping && stream.caught_up() {
+                            track.diarization_dropping = false;
+                        }
+                        let queued =
+                            !track.diarization_dropping && stream.try_append(*start, samples);
+                        if queued {
+                            track.diarization_stalled = None;
+                        } else if !track.diarization_dropping && self.shutdown_deadline.is_none() {
+                            // A brief stall keeps every label. A diarizer slower than the
+                            // capture would otherwise stop the captions for good, so past
+                            // the limit it loses this audio. It sees a capture gap, and
+                            // the captions inside report their missing coverage.
+                            let since = *track.diarization_stalled.get_or_insert(now);
+                            if now.duration_since(since) < DIARIZATION_STALL {
+                                blocked = true;
+                                break;
+                            }
+                            track.diarization_stalled = None;
+                            track.diarization_dropping = true;
+                        }
+                        // During shutdown, a backlogged diarizer must not hold back the
+                        // captions and end markers. Its finals publish with the labels
+                        // decided so far.
                     }
                     let CaptureAction::Audio(Audio::Samples { start, mut samples }) =
                         track.capture.pop_front().expect("capture head").action
@@ -1558,7 +1781,7 @@ impl Session {
                     let marker = track.next_marker + 1;
                     let (result, action) = match action {
                         CaptureAction::Audio(Audio::Gap { start, end, reason }) => (
-                            track.handle.gap(marker, false),
+                            track.handle.gap(marker),
                             MarkerAction::Gap {
                                 start: *start,
                                 end: *end,
@@ -1610,25 +1833,43 @@ impl Session {
     }
 
     fn poll(&mut self) {
+        // The socket task drops its event queue when the connection ends.
+        if self.client.as_ref().is_some_and(|client| {
+            client
+                .events
+                .as_ref()
+                .is_some_and(|events| events.is_closed())
+        }) {
+            self.client = None;
+            self.detached_at.get_or_insert_with(Instant::now);
+        }
         let input_paused = self.update_input_pressure(Instant::now());
-        let track_ids: Vec<_> = self.tracks.keys().cloned().collect();
-        for id in track_ids {
+        // Reuse the ID list between ticks. It changes only when a track
+        // registers or ends.
+        let mut track_ids = std::mem::take(&mut self.poll_ids);
+        if !track_ids.iter().eq(self.tracks.keys()) {
+            track_ids.clear();
+            track_ids.extend(self.tracks.keys().cloned());
+        }
+        for id in &track_ids {
             let mut ready = Vec::new();
             if !input_paused && self.detached_at.is_none() {
                 self.tracks
-                    .get_mut(&id)
+                    .get_mut(id)
                     .unwrap()
                     .clock
                     .drain(Instant::now(), false, &mut ready);
             }
-            self.audio(&id, ready);
-            self.poll_track(&id);
+            self.audio(id, ready);
+            self.poll_track(id);
         }
+        self.poll_ids = track_ids;
         self.finish_if_drained();
     }
 
     fn poll_track(&mut self, id: &str) {
-        let mut track = self.tracks.remove(id).expect("registered track");
+        // Reinsert under the same key so polling does not allocate it again.
+        let (key, mut track) = self.tracks.remove_entry(id).expect("registered track");
         let now = Instant::now();
         let mut closed = false;
         while track.outputs.len() < OUTBOUND_EVENTS {
@@ -1636,12 +1877,7 @@ impl Session {
                 Ok(event) => {
                     track.outputs.push_back(Output {
                         event,
-                        deadline: now
-                            + if track.diarize {
-                                DIARIZATION_WAIT
-                            } else {
-                                FINAL_WAIT
-                            },
+                        deadline: now + track.diarization_wait.unwrap_or(FINAL_WAIT),
                         redo: None,
                         quality: Quality::default(),
                     });
@@ -1658,6 +1894,7 @@ impl Session {
                 Published::Yes => {}
                 Published::Wait => {
                     track.outputs.push_front(output);
+                    self.publish_next_drafts(id, &mut track, now);
                     break;
                 }
                 Published::End => {
@@ -1681,7 +1918,26 @@ impl Session {
             }));
             self.retire(&track);
         } else {
-            self.tracks.insert(id.into(), track);
+            self.tracks.insert(key, track);
+        }
+    }
+
+    /// Keeps captions moving while the head final waits for bleed or speaker
+    /// labels. Drafts carry their item ID, so a later item's draft can precede
+    /// an earlier item's final. Stop at the first terminal event or marker so
+    /// those keep their order.
+    fn publish_next_drafts(&mut self, id: &str, track: &mut Track, now: Instant) {
+        let head = &track.outputs.front().expect("waiting output").event;
+        if !matches!(head.update, PipelineUpdate::Final(_)) {
+            return;
+        }
+        let waiting = head.turn;
+        while track.outputs.get(1).is_some_and(|next| {
+            next.event.turn > waiting && matches!(next.event.update, PipelineUpdate::Draft(_))
+        }) {
+            let mut draft = track.outputs.remove(1).expect("queued draft");
+            let published = self.publish(id, track, &mut draft, now);
+            debug_assert!(matches!(published, Published::Yes));
         }
     }
 
@@ -1704,7 +1960,6 @@ impl Session {
         output: &mut Output,
         now: Instant,
     ) -> Published {
-        let overload = matches!(output.event.update, PipelineUpdate::OverloadFinal(_));
         let PipelineEvent {
             turn,
             start,
@@ -1717,7 +1972,9 @@ impl Session {
         {
             return Published::Yes;
         }
-        let item_id = format!("item_{}_{}", track.key, turn);
+        let (key, item_turn) = (track.key, *turn);
+        // Format the ID only for an event, not on every poll of a waiting final.
+        let item_id = move || format!("item_{key}_{item_turn}");
         match update {
             PipelineUpdate::Draft(hypothesis) => {
                 let revision = match track.draft {
@@ -1726,26 +1983,15 @@ impl Session {
                 };
                 track.draft = Some((*turn, revision));
                 self.emit(json!({
-                    "type": "transcriberrr.transcript.draft", "track_id": id, "item_id": item_id,
+                    "type": "transcriberrr.transcript.draft", "track_id": id, "item_id": item_id(),
                     "start_frame": start, "end_frame": end, "revision": revision, "text": hypothesis.text,
                     "words": words(hypothesis),
                     "speaker": track.speaker,
                     "speaker_source": track.speaker.as_ref().map(|_| "client"),
                 }));
             }
-            PipelineUpdate::Final(hypothesis) | PipelineUpdate::OverloadFinal(hypothesis) => {
-                // A stable decoder prefix can include part of a word whose timing
-                // has not settled yet. An overload final can only confirm timed words.
-                if overload && !hypothesis.words.is_empty() {
-                    rebuild_text(hypothesis);
-                }
-                if track.role == Role::Isolated && overload {
-                    if !self.bleed_stable(track, *start, *end, hypothesis, &mut output.quality) {
-                        track.close_item(*turn);
-                        self.retract(id, &item_id, "overload");
-                        return Published::Yes;
-                    }
-                } else if track.role == Role::Isolated {
+            PipelineUpdate::Final(hypothesis) => {
+                if track.role == Role::Isolated {
                     let ready = self.bleed.ready_through(track.key, *end, FINAL_LOOKAHEAD);
                     if !ready && now < output.deadline && output.redo.is_none() {
                         return Published::Wait;
@@ -1763,26 +2009,36 @@ impl Session {
                         BleedFinal::Wait => return Published::Wait,
                         BleedFinal::Muted => {
                             track.close_item(*turn);
-                            self.retract(id, &item_id, "bleed");
+                            self.retract(id, &item_id(), "bleed");
                             return Published::Yes;
                         }
                         BleedFinal::Unavailable => {
                             track.close_item(*turn);
-                            self.retract(id, &item_id, "bleed_redecode_unavailable");
+                            self.retract(id, &item_id(), "bleed_redecode_unavailable");
                             return Published::Yes;
                         }
                         BleedFinal::Ready => {}
                     }
                 }
-                let Some(mut event) = final_event(
-                    id,
-                    &item_id,
-                    track,
-                    *start,
-                    *end,
-                    hypothesis,
-                    now >= output.deadline,
-                ) else {
+                // Shutdown publishes with the labels already decided. Waiting out
+                // a long label deadline would let the shutdown deadline drop the caption.
+                let expired = now >= output.deadline || self.shutdown_deadline.is_some();
+                // A finished or failed diarizer publishes no more labels to wait for,
+                // and one that has decided past this caption cannot fill a hole in it.
+                #[cfg(feature = "diarization")]
+                let expired = expired
+                    || track
+                        .diarization
+                        .as_ref()
+                        .is_some_and(|stream| stream.is_finished() || stream.decided_past(*end));
+                // Complete attribution requires coverage through the end. While
+                // the diarizer is catching up, skip copying word intervals on each tick.
+                if track.diarization_wait.is_some() && !expired {
+                    return Published::Wait;
+                }
+                let Some(mut event) =
+                    final_event(id, &item_id(), track, *start, *end, hypothesis, expired)
+                else {
                     return Published::Wait;
                 };
                 if track.role == Role::Isolated {
@@ -1794,14 +2050,18 @@ impl Session {
             }
             PipelineUpdate::Failed(reason) => {
                 track.close_item(*turn);
-                self.retract(id, &item_id, reason);
+                self.retract(id, &item_id(), reason);
             }
             PipelineUpdate::Committed { marker } => {
+                // Give the diarizer the track's label wait to finish before
+                // releasing it. Every final ahead of this marker has published.
                 #[cfg(feature = "diarization")]
-                if track
-                    .markers
-                    .front()
-                    .is_some_and(|head| matches!(head.action, MarkerAction::End))
+                if now < output.deadline
+                    && self.shutdown_deadline.is_none()
+                    && track
+                        .markers
+                        .front()
+                        .is_some_and(|head| matches!(head.action, MarkerAction::End))
                     && track
                         .diarization
                         .as_ref()
@@ -1840,47 +2100,6 @@ impl Session {
         }));
     }
 
-    fn bleed_stable(
-        &mut self,
-        track: &Track,
-        start: u64,
-        end: u64,
-        hypothesis: &mut Hypothesis,
-        quality: &mut Quality,
-    ) -> bool {
-        if !hypothesis.words.is_empty() {
-            hypothesis.words.retain(|word| {
-                if !self
-                    .bleed
-                    .ready_through(track.key, word.end_sample, FINAL_LOOKAHEAD)
-                {
-                    return false;
-                }
-                let decision = self.bleed.decision(
-                    track.key,
-                    word.start_sample,
-                    word.end_sample,
-                    Context::Final,
-                );
-                quality.merge(decision.quality);
-                !decision.quality.missing_peer && !decision.muted
-            });
-            rebuild_text(hypothesis);
-            return !hypothesis.words.is_empty();
-        }
-        if !self.bleed.ready_through(track.key, end, FINAL_LOOKAHEAD) {
-            return false;
-        }
-        let Some((mut final_samples, draft_samples)) = track.interval(start, end) else {
-            return false;
-        };
-        quality.merge(
-            self.bleed
-                .apply(track.key, start, &mut final_samples, Context::Final),
-        );
-        !quality.missing_peer && final_samples == draft_samples && !hypothesis.text.is_empty()
-    }
-
     fn bleed_final(
         &mut self,
         track: &Track,
@@ -1891,8 +2110,13 @@ impl Session {
         within_deadline: bool,
     ) -> BleedFinal {
         let Range { start, end } = interval;
-        if !hypothesis.words.is_empty() {
+        // Rebuilding a partially aligned transcript from its timed words would
+        // discard speech that the recognizer transcribed without timestamps.
+        if fully_aligned(hypothesis) {
             let count = hypothesis.words.len();
+            // A word is judged where the decoder produced it, not where it was spoken.
+            // On the two-microphone fixture the spoken times let through leaked words
+            // that these times mute (design/realtime-server-validation.md).
             hypothesis.words.retain(|word| {
                 let decision = self.bleed.decision(
                     track.key,
@@ -1976,14 +2200,22 @@ impl Redo {
             let Some(packet) = self.remaining.front() else {
                 break;
             };
-            match self.worker.append(self.start, packet.clone(), 1) {
-                Ok(()) => {
-                    self.start += packet.len() as u64;
-                    self.remaining.pop_front();
-                }
+            // Reserve before taking the packet. A full worker leaves it queued.
+            let permit = match self.worker.reserve(packet.len()) {
+                Ok(permit) => permit,
                 Err(QueueError::Full) => return BleedFinal::Wait,
                 Err(QueueError::Closed) => return BleedFinal::Unavailable,
+            };
+            let packet = self.remaining.pop_front().expect("queued packet");
+            let frames = packet.len() as u64;
+            if self
+                .worker
+                .append_reserved(permit, self.start, packet, 1)
+                .is_err()
+            {
+                return BleedFinal::Unavailable;
             }
+            self.start += frames;
         }
         if self.remaining.is_empty() && !self.committed {
             match self.worker.commit(1) {
@@ -2020,6 +2252,10 @@ fn rebuild_text(hypothesis: &mut Hypothesis) {
     hypothesis.text = fragment_text(hypothesis).trim_start().to_owned();
 }
 
+fn fully_aligned(hypothesis: &Hypothesis) -> bool {
+    !hypothesis.words.is_empty() && fragment_text(hypothesis).trim() == hypothesis.text.trim()
+}
+
 fn fragment_text(hypothesis: &Hypothesis) -> String {
     hypothesis
         .words
@@ -2028,10 +2264,42 @@ fn fragment_text(hypothesis: &Hypothesis) -> String {
         .collect()
 }
 
+/// When the word was spoken: the recognizer's corrected time where it supplies one.
+fn spoken(word: &super::recognizer::TimedWord) -> (u64, u64) {
+    word.spoken.unwrap_or((word.start_sample, word.end_sample))
+}
+
+/// The interval each word takes its speaker label from: when it was spoken. Punctuation
+/// is spoken at the end of its word and takes no time, so it is labelled with that word.
+/// A word spoken before a forced cut has no time left inside its item, and is labelled
+/// where the decoder produced it.
+#[cfg(feature = "diarization")]
+fn label_intervals(hypothesis: &Hypothesis) -> Vec<(u64, u64)> {
+    let mut intervals: Vec<(u64, u64)> = Vec::with_capacity(hypothesis.words.len());
+    for word in &hypothesis.words {
+        let (start, end) = spoken(word);
+        let lettered = word.text.chars().any(char::is_alphanumeric);
+        let interval = if start < end {
+            (start, end)
+        } else if let Some(&previous) = intervals.last().filter(|_| !lettered) {
+            previous
+        } else {
+            (word.start_sample, word.end_sample)
+        };
+        intervals.push(interval);
+    }
+    intervals
+}
+
 fn words(hypothesis: &Hypothesis) -> Vec<Value> {
-    hypothesis.words.iter().map(|word| {
-        json!({"text": word.text, "start_frame": word.start_sample, "end_frame": word.end_sample})
-    }).collect()
+    hypothesis
+        .words
+        .iter()
+        .map(|word| {
+            let (start, end) = spoken(word);
+            json!({"text": word.text, "start_frame": start, "end_frame": end})
+        })
+        .collect()
 }
 
 fn final_event(
@@ -2043,6 +2311,21 @@ fn final_event(
     hypothesis: &Hypothesis,
     expired: bool,
 ) -> Option<Value> {
+    // Decide before building the event. A final waiting for labels polls here every tick.
+    #[cfg(feature = "diarization")]
+    let attribution = track
+        .diarization
+        .as_ref()
+        .filter(|_| track.diarization_wait.is_some())
+        .and_then(|stream| {
+            let intervals = label_intervals(hypothesis);
+            stream.attribution(start, end, &intervals, expired)
+        });
+    #[cfg(not(feature = "diarization"))]
+    let attribution: Option<std::convert::Infallible> = None;
+    if track.diarization_wait.is_some() && attribution.is_none() && !expired {
+        return None;
+    }
     let mut event = json!({
         "type": "transcriberrr.transcript.final",
         "track_id": id,
@@ -2055,22 +2338,20 @@ fn final_event(
         "speaker_spans": [],
     });
     event["words"] = Value::Array(words(hypothesis));
-    if !track.diarize {
+    if track.diarization_wait.is_none() {
         return Some(event);
     }
     #[cfg(feature = "diarization")]
-    if let Some(stream) = &track.diarization {
-        let intervals: Vec<_> = hypothesis
-            .words
-            .iter()
-            .map(|word| (word.start_sample, word.end_sample))
-            .collect();
-        if let Some(attribution) = stream.attribution(start, end, &intervals) {
-            let fully_aligned = !hypothesis.words.is_empty()
-                && fragment_text(hypothesis).trim() == hypothesis.text.trim();
+    {
+        if let Some(attribution) = attribution {
+            let fully_aligned = fully_aligned(hypothesis);
             event["speaker"] = json!(attribution.speaker.filter(|_| fully_aligned));
             event["speaker_source"] = json!("diarization");
             event["speaker_spans"] = json!(attribution.speaker_spans);
+            if let Some(coverage) = attribution.partial_coverage {
+                event["diarization_partial"] = json!(true);
+                event["diarization_coverage"] = json!(coverage);
+            }
             event["text_attribution"] = json!(if fully_aligned
                 && attribution.words.iter().any(Option::is_some)
             {
@@ -2088,9 +2369,6 @@ fn final_event(
             }
             return Some(event);
         }
-    }
-    if !expired {
-        return None;
     }
     #[cfg(feature = "diarization")]
     if let Some(stream) = &track.diarization {
@@ -2166,6 +2444,7 @@ mod mixed_tests {
                 text: text.into(),
                 start_sample,
                 end_sample,
+                spoken: None,
             })
             .collect()
         } else {
@@ -2195,7 +2474,7 @@ mod mixed_tests {
                     end: END,
                     update,
                 },
-                deadline: Instant::now() + DIARIZATION_WAIT,
+                deadline: Instant::now() + Duration::from_millis(DEFAULT_DIARIZATION_WAIT_MS),
                 redo: None,
                 quality: Quality::default(),
             });
@@ -2216,36 +2495,11 @@ mod mixed_tests {
                 text: text.into(),
                 start_sample: START + start,
                 end_sample: START + end,
+                spoken: None,
             })
             .collect(),
             ..Hypothesis::default()
         }
-    }
-
-    #[tokio::test]
-    async fn mixed_overload_final_excludes_unconfirmed_suffix() {
-        let (mut session, mut events) = mixed_track().await;
-        script(&session, vec![span("speaker_1", START, END)]);
-        queue_caption(
-            &mut session,
-            PipelineUpdate::OverloadFinal(partly_timed_caption()),
-        );
-        session.poll_track(TRACK);
-
-        let event = next_event(&mut events);
-        assert_eq!(event["type"], "transcriberrr.transcript.final");
-        assert_eq!(event["text"], "The cedar trees. We");
-        assert_eq!(
-            event["words"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|word| word["text"].as_str().unwrap())
-                .collect::<String>(),
-            event["text"]
-        );
-        assert_eq!(event["speaker"], "speaker_1");
-        assert_eq!(event["text_attribution"], "word");
     }
 
     #[tokio::test]
@@ -2342,6 +2596,49 @@ mod mixed_tests {
     }
 
     #[tokio::test]
+    async fn mixed_deadline_keeps_decided_words_at_recorded_window_boundary() {
+        let (session, _events) = mixed_track().await;
+        let track = &session.tracks[TRACK];
+        // The recorded third Apple caption ended inside the next Sortformer window.
+        let start = 395_028;
+        let cutoff = 504_852;
+        let end = 521_748;
+        track
+            .diarization
+            .as_ref()
+            .unwrap()
+            .script_coverage((90_132, cutoff), vec![span("speaker_1", start, cutoff)]);
+        let word = |text: &str, start_sample, end_sample| TimedWord {
+            text: text.into(),
+            start_sample,
+            end_sample,
+            spoken: None,
+        };
+        let hypothesis = Hypothesis {
+            text: "old wooden bridge.".into(),
+            words: vec![
+                word("old", 492_948, 495_828),
+                word(" wooden", 495_828, 507_348),
+                word(" bridge.", 507_348, 515_988),
+            ],
+            ..Hypothesis::default()
+        };
+        assert!(final_event(TRACK, "item", track, start, end, &hypothesis, false).is_none());
+        let result = final_event(TRACK, "item", track, start, end, &hypothesis, true).unwrap();
+        assert_eq!(result["text"], hypothesis.text);
+        assert_eq!(result["diarization_partial"], true);
+        assert_eq!(result["diarization_coverage"], json!([[start, cutoff]]));
+        assert_eq!(result["speaker"], Value::Null);
+        assert_eq!(result["speaker_source"], "diarization");
+        assert_eq!(result["text_attribution"], "word");
+        assert_eq!(result["words"][0]["speaker"], "speaker_1");
+        assert_eq!(result["words"][1]["speaker"], Value::Null);
+        assert_eq!(result["words"][2]["speaker"], Value::Null);
+        assert_eq!(result["speaker_spans"][0]["end_frame"], cutoff);
+        assert!(result.get("diarization_unavailable").is_none());
+    }
+
+    #[tokio::test]
     async fn mixed_final_waits_then_expires_explicitly_unlabeled() {
         let (mut session, mut events) = mixed_track().await;
         caption(&mut session, true);
@@ -2381,6 +2678,248 @@ mod mixed_tests {
             events.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    fn drain_types(events: &mut EventReceiver) -> Vec<String> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| {
+                let event: Value = serde_json::from_str(&event.text).unwrap();
+                event["type"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn mixed_shutdown_publishes_a_waiting_final_and_ends_the_session() {
+        let (mut session, mut events, _close, shutdown) = super::tests::session_fixture().await;
+        Arc::get_mut(&mut session.state).unwrap().diarization = Some(Worker::scripted());
+        session
+            .register(&json!({
+                "track_id": TRACK, "role": "mixed_audio", "start_frame": START,
+                "diarization": true, "diarization_wait_ms": MAX_DIARIZATION_WAIT_MS,
+            }))
+            .unwrap();
+        next_event(&mut events);
+        caption(&mut session, true);
+        session
+            .tracks
+            .get_mut(TRACK)
+            .unwrap()
+            .outputs
+            .front_mut()
+            .unwrap()
+            .deadline = Instant::now() + Duration::from_millis(MAX_DIARIZATION_WAIT_MS);
+        session.poll_track(TRACK);
+        assert!(drain_types(&mut events).is_empty());
+
+        // The scripted diarizer never covers the caption or finishes. Shutdown
+        // must still publish the caption and end the session well inside its
+        // eight-second deadline instead of waiting out the label window.
+        let (_endpoint, commands, attachments) = SessionEndpoint::channel();
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(3), session.run(commands, attachments))
+            .await
+            .expect("shutdown waited for speaker labels");
+        assert!(session.ended);
+        let mut received = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| serde_json::from_str::<Value>(&event.text).unwrap());
+        let caption = received.next().unwrap();
+        assert_eq!(caption["type"], "transcriberrr.transcript.final");
+        assert_eq!(caption["text"], "red amber blue");
+        assert_eq!(caption["diarization_unavailable"], true);
+        assert_eq!(
+            received
+                .map(|event| event["type"].clone())
+                .collect::<Vec<_>>(),
+            ["transcriberrr.track.ended", "transcriberrr.session.ended"]
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_track_end_waits_for_the_diarizer_only_until_its_deadline() {
+        let (mut session, mut events) = mixed_track().await;
+        session.commit(TRACK, true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.tracks[TRACK].outputs.is_empty() {
+                session.poll_track(TRACK);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // The end marker waits for the scripted diarizer, which never finishes.
+        assert!(drain_types(&mut events).is_empty());
+        let marker = session.tracks.get_mut(TRACK).unwrap();
+        assert!(matches!(
+            marker.outputs.front().unwrap().event.update,
+            PipelineUpdate::Committed { .. }
+        ));
+        marker.outputs.front_mut().unwrap().deadline = Instant::now();
+        session.poll_track(TRACK);
+        assert_eq!(drain_types(&mut events), ["transcriberrr.track.ended"]);
+        assert!(!session.tracks.contains_key(TRACK));
+    }
+
+    #[tokio::test]
+    async fn a_diarizer_that_falls_behind_loses_audio_instead_of_stalling_captions() {
+        use super::tests::{RedecodeRecognizer, session_with_recognizer};
+        let (mut session, mut events, _close, _shutdown) =
+            session_with_recognizer(|| Ok(Box::new(RedecodeRecognizer::default())), 1).await;
+        Arc::get_mut(&mut session.state).unwrap().diarization = Some(Worker::scripted());
+        session
+            .register(&json!({"track_id": TRACK, "role": "mixed_audio", "diarization": true}))
+            .unwrap();
+        next_event(&mut events);
+        let packet = |index: u64| Audio::Samples {
+            start: index * 24_000,
+            samples: vec![12_000; 24_000],
+        };
+        // Polls until the track reaches a state. `waiting` restarts the stall clock on
+        // every poll, so a slow machine cannot run it out.
+        async fn settle(session: &mut Session, waiting: bool, done: impl Fn(&Track) -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let track = session.tracks.get_mut(TRACK).unwrap();
+                    if waiting && track.diarization_stalled.is_some() {
+                        track.diarization_stalled = Some(Instant::now());
+                    }
+                    session.poll();
+                    let track = &session.tracks[TRACK];
+                    if done(track) && track.handle.backlog_frames() == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the track did not settle");
+        }
+
+        // The scripted diarizer queues three seconds of audio and never takes them.
+        session.audio(TRACK, (0..4).map(packet).collect());
+        settle(&mut session, true, |track| track.capture.len() == 1).await;
+        let track = &session.tracks[TRACK];
+        assert!(track.diarization_stalled.is_some() && !track.diarization_dropping);
+
+        // Past the stall limit, recognition goes on without the diarizer.
+        session.tracks.get_mut(TRACK).unwrap().diarization_stalled =
+            Some(Instant::now() - DIARIZATION_STALL);
+        settle(&mut session, false, |track| track.capture.is_empty()).await;
+        assert!(session.tracks[TRACK].diarization_dropping);
+        session.audio(TRACK, vec![packet(4)]);
+        settle(&mut session, false, |track| track.capture.is_empty()).await;
+        assert!(session.tracks[TRACK].diarization_dropping);
+
+        // Once the diarizer has caught up it hears the track again.
+        fn stream(session: &Session) -> &super::super::diarization::Stream {
+            session.tracks[TRACK].diarization.as_ref().unwrap()
+        }
+        stream(&session).script_drain();
+        assert!(stream(&session).caught_up());
+        session.audio(TRACK, vec![packet(5)]);
+        settle(&mut session, false, |track| track.capture.is_empty()).await;
+        assert!(!session.tracks[TRACK].diarization_dropping);
+        assert!(!stream(&session).caught_up());
+    }
+
+    #[tokio::test]
+    async fn mixed_final_does_not_wait_for_audio_the_diarizer_never_received() {
+        fn cover(session: &Session, interval: (u64, u64), spans: Vec<SpeakerSpan>) {
+            let stream = session.tracks[TRACK].diarization.as_ref().unwrap();
+            stream.script_coverage(interval, spans);
+        }
+        let (mut session, mut events) = mixed_track().await;
+        caption(&mut session, true);
+        let track = session.tracks.get_mut(TRACK).unwrap();
+        track.outputs.front_mut().unwrap().deadline = Instant::now() + Duration::from_secs(60);
+
+        // The diarizer has decided the start of the caption. The rest may still come.
+        let heard = (START, START + 4_000);
+        cover(&session, heard, vec![span("speaker_1", heard.0, heard.1)]);
+        session.poll_track(TRACK);
+        assert!(drain_types(&mut events).is_empty());
+
+        // It then decides audio after the caption, so it never received the middle.
+        // The caption is published now instead of at its deadline a minute away.
+        cover(&session, (END, END + 1_000), Vec::new());
+        session.poll_track(TRACK);
+        let published = next_event(&mut events);
+        assert_eq!(published["type"], "transcriberrr.transcript.final");
+        assert_eq!(published["diarization_partial"], true);
+        assert_eq!(
+            published["diarization_coverage"],
+            json!([[heard.0, heard.1]])
+        );
+        assert_eq!(published["words"][0]["speaker"], "speaker_1");
+        assert!(published["words"][2]["speaker"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_diarizer_is_not_advertised_and_refuses_tracks() {
+        let (mut session, _events, _close, _shutdown) = super::tests::session_fixture().await;
+        Arc::get_mut(&mut session.state).unwrap().diarization = Some(Worker::scripted());
+        let capabilities = session.initial_announcement()["capabilities"].clone();
+        assert_eq!(capabilities["diarization"], true);
+        assert_eq!(capabilities["max_diarized_tracks"], 1);
+
+        Arc::get_mut(&mut session.state).unwrap().diarization = Some(Worker::stopped());
+        let capabilities = session.initial_announcement()["capabilities"].clone();
+        assert_eq!(capabilities["diarization"], false);
+        assert_eq!(capabilities["max_diarized_tracks"], 0);
+        let refused = session
+            .register(&json!({"track_id": TRACK, "role": "mixed_audio", "diarization": true}))
+            .unwrap_err();
+        assert_eq!(refused["error"]["code"], "unsupported_diarization");
+    }
+
+    #[tokio::test]
+    async fn mixed_shutdown_does_not_wait_for_a_backlogged_diarizer() {
+        use super::tests::{RedecodeRecognizer, session_with_recognizer};
+        let (mut session, mut events, _close, shutdown) =
+            session_with_recognizer(|| Ok(Box::new(RedecodeRecognizer::default())), 1).await;
+        Arc::get_mut(&mut session.state).unwrap().diarization = Some(Worker::scripted());
+        session
+            .register(&json!({"track_id": TRACK, "role": "mixed_audio", "diarization": true}))
+            .unwrap();
+        next_event(&mut events);
+        // The scripted diarizer queues three seconds of audio and never drains it.
+        let packets = (0..4)
+            .map(|packet| Audio::Samples {
+                start: packet * 24_000,
+                samples: vec![12_000; 24_000],
+            })
+            .collect();
+        session.audio(TRACK, packets);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                session.poll();
+                let track = &session.tracks[TRACK];
+                if track.capture.len() == 1 && track.handle.backlog_frames() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the recognizer did not take the first three packets");
+
+        let (_endpoint, commands, attachments) = SessionEndpoint::channel();
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(3), session.run(commands, attachments))
+            .await
+            .expect("shutdown waited for the diarizer queue");
+        let types: Vec<_> = drain_types(&mut events)
+            .into_iter()
+            .filter(|kind| kind != "transcriberrr.track.backlog")
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "transcriberrr.transcript.final",
+                "transcriberrr.track.ended",
+                "transcriberrr.session.ended"
+            ]
+        );
     }
 }
 
@@ -2562,7 +3101,7 @@ mod tests {
         session_with_recognizer(|| Ok(Box::new(UnusedRecognizer)), 1).await
     }
 
-    async fn session_with_recognizer(
+    pub(super) async fn session_with_recognizer(
         load: impl FnOnce() -> anyhow::Result<Box<dyn super::super::recognizer::Recognizer>>
         + Send
         + 'static,
@@ -3073,6 +3612,109 @@ mod tests {
         serde_json::from_str(&events.try_recv().unwrap().text).unwrap()
     }
 
+    #[cfg(feature = "diarization")]
+    #[test]
+    fn punctuation_takes_its_speaker_label_from_the_word_it_closes() {
+        use super::super::recognizer::TimedWord;
+
+        let word = |text: &str, spoken| TimedWord {
+            text: text.into(),
+            start_sample: 9_000,
+            end_sample: 9_500,
+            spoken,
+        };
+        let hypothesis = Hypothesis {
+            words: vec![
+                word("Yes", Some((1_000, 3_000))),
+                word(",", Some((3_000, 3_000))),
+                word(" fine", Some((4_000, 6_000))),
+                // Without a spoken time the recognizer's own interval labels the word.
+                word(".", None),
+            ],
+            ..Hypothesis::default()
+        };
+        assert_eq!(
+            label_intervals(&hypothesis),
+            [
+                (1_000, 3_000),
+                (1_000, 3_000),
+                (4_000, 6_000),
+                (9_000, 9_500)
+            ]
+        );
+        // A word spoken before its item began is labelled where it was decoded, and
+        // so is punctuation with no word before it.
+        let after_cut = Hypothesis {
+            words: vec![
+                word(",", Some((2_000, 2_000))),
+                word(" so", Some((2_000, 2_000))),
+            ],
+            ..Hypothesis::default()
+        };
+        assert_eq!(
+            label_intervals(&after_cut),
+            [(9_000, 9_500), (9_000, 9_500)]
+        );
+    }
+
+    #[tokio::test]
+    async fn bleed_judges_a_word_where_it_was_decoded_and_clients_get_when_it_was_spoken() {
+        use super::super::recognizer::TimedWord;
+
+        let (mut session, mut events, _close, _shutdown) =
+            session_with_recognizer(|| Ok(Box::new(RedecodeRecognizer::default())), 2).await;
+        Arc::get_mut(&mut session.state).unwrap().capabilities =
+            super::super::recognizer::capabilities(crate::EngineKind::AppleNative);
+        prepare_bleed_item(&mut session);
+        next_event(&mut events);
+        next_event(&mut events);
+        let own = TimedWord {
+            text: "Own".into(),
+            start_sample: OWN_START + 5 * BLOCK_FRAMES,
+            end_sample: OWN_START + 9 * BLOCK_FRAMES,
+            spoken: Some((OWN_START + BLOCK_FRAMES, OWN_START + 6 * BLOCK_FRAMES)),
+        };
+        // Punctuation is spoken at the end of its word and takes no time.
+        let stop = TimedWord {
+            text: ".".into(),
+            start_sample: OWN_START + 9 * BLOCK_FRAMES,
+            end_sample: OWN_START + 10 * BLOCK_FRAMES,
+            spoken: Some((OWN_START + 6 * BLOCK_FRAMES, OWN_START + 6 * BLOCK_FRAMES)),
+        };
+        // Decoded inside the bleed, though placed in the own speech before it.
+        let leaked = TimedWord {
+            text: " Leaked.".into(),
+            start_sample: BLEED_START + 7 * BLOCK_FRAMES,
+            end_sample: ITEM_END - 3 * BLOCK_FRAMES,
+            spoken: Some((OWN_START + 6 * BLOCK_FRAMES, OWN_START + 12 * BLOCK_FRAMES)),
+        };
+        let hypothesis = Hypothesis {
+            text: "Own. Leaked.".into(),
+            words: vec![own, stop, leaked],
+            ..Hypothesis::default()
+        };
+        let output = scripted(1, OWN_START, ITEM_END, PipelineUpdate::Final(hypothesis));
+        deliver_scripted(&mut session, output);
+        let final_event = next_event(&mut events);
+        assert_eq!(final_event["type"], "transcriberrr.transcript.final");
+        assert_eq!(final_event["text"], "Own.");
+        assert_eq!(
+            final_event["words"],
+            json!([
+                {
+                    "text": "Own",
+                    "start_frame": OWN_START + BLOCK_FRAMES,
+                    "end_frame": OWN_START + 6 * BLOCK_FRAMES,
+                },
+                {
+                    "text": ".",
+                    "start_frame": OWN_START + 6 * BLOCK_FRAMES,
+                    "end_frame": OWN_START + 6 * BLOCK_FRAMES,
+                },
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn timed_bleed_filters_words_and_terminal_replay_is_immutable() {
         use super::super::recognizer::TimedWord;
@@ -3088,11 +3730,13 @@ mod tests {
             text: "Own speech.".into(),
             start_sample: OWN_START + 5 * BLOCK_FRAMES,
             end_sample: BLEED_START - 5 * BLOCK_FRAMES,
+            spoken: None,
         };
         let leaked = TimedWord {
             text: " Leaked speech.".into(),
             start_sample: BLEED_START + 7 * BLOCK_FRAMES,
             end_sample: ITEM_END - 3 * BLOCK_FRAMES,
+            spoken: None,
         };
         let hypothesis = Hypothesis {
             text: "Own speech. Leaked speech.".into(),
@@ -3191,7 +3835,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RedecodeRecognizer(Arc<std::sync::atomic::AtomicUsize>);
+    pub(super) struct RedecodeRecognizer(Arc<std::sync::atomic::AtomicUsize>);
 
     struct RedecodeStream {
         finishes: Arc<std::sync::atomic::AtomicUsize>,
@@ -3245,6 +3889,109 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "diarization")]
+    #[tokio::test]
+    async fn diarization_wait_registration_validates_options_and_echoes_effective_value() {
+        use crate::serve::diarization::Worker;
+        let (mut session, mut events, _close, _shutdown) = session_fixture().await;
+        Arc::get_mut(&mut session.state).unwrap().diarization = Some(Worker::scripted());
+        let limits = &session.initial_announcement()["limits"];
+        assert_eq!(limits["default_diarization_wait_ms"], 2000);
+        assert_eq!(limits["max_diarization_wait_ms"], 10000);
+        let mut request = json!({"track_id": "mix", "role": "mixed_audio", "diarization": true});
+        for invalid in [
+            json!(-1),
+            json!(10001),
+            json!(0.5),
+            json!("1000"),
+            Value::Null,
+        ] {
+            request["diarization_wait_ms"] = invalid;
+            let failure = session.register(&request).unwrap_err();
+            assert_eq!(failure["error"]["code"], "invalid_diarization_wait");
+        }
+        request["diarization_wait_ms"] = 0.into();
+        request["diarization"] = false.into();
+        assert_eq!(
+            session.register(&request).unwrap_err()["error"]["code"],
+            "invalid_diarization_wait"
+        );
+        request.as_object_mut().unwrap().remove("diarization");
+        assert!(session.register(&request).is_err());
+        request
+            .as_object_mut()
+            .unwrap()
+            .remove("diarization_wait_ms");
+        session.register(&request).unwrap();
+        assert!(next_event(&mut events).get("diarization_wait_ms").is_none());
+        session.tracks.remove("mix");
+        request["diarization"] = true.into();
+        for (value, expected) in [(None, 2000), (Some(0), 0), (Some(10000), 10000)] {
+            if let Some(value) = value {
+                request["diarization_wait_ms"] = value.into();
+            }
+            session.register(&request).unwrap();
+            assert_eq!(next_event(&mut events)["diarization_wait_ms"], expected);
+            session.tracks.remove("mix");
+        }
+    }
+
+    #[cfg(feature = "diarization")]
+    #[tokio::test]
+    async fn diarization_wait_sets_deadline_on_recognized_final() {
+        use crate::serve::diarization::Worker;
+        let (mut session, mut events, _close, _shutdown) =
+            session_with_recognizer(|| Ok(Box::new(RedecodeRecognizer::default())), 1).await;
+        Arc::get_mut(&mut session.state).unwrap().diarization = Some(Worker::scripted());
+        session
+            .register(&json!({
+                "track_id": "mix", "role": "mixed_audio", "diarization": true,
+                "diarization_wait_ms": 8000,
+            }))
+            .unwrap();
+        next_event(&mut events);
+        session.audio(
+            "mix",
+            vec![Audio::Samples {
+                start: 0,
+                samples: vec![12000; 12000],
+            }],
+        );
+        session.commit("mix", false).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let before = Instant::now();
+                session.poll_track("mix");
+                if let Some(final_output) = session.tracks["mix"].outputs.front() {
+                    assert!(matches!(
+                        final_output.event.update,
+                        PipelineUpdate::Final(_)
+                    ));
+                    let budget = Duration::from_secs(8);
+                    assert!(
+                        (before + budget..=Instant::now() + budget)
+                            .contains(&final_output.deadline)
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(events.try_recv().is_err());
+        session
+            .tracks
+            .get_mut("mix")
+            .unwrap()
+            .outputs
+            .front_mut()
+            .unwrap()
+            .deadline = Instant::now();
+        session.poll_track("mix");
+        assert_eq!(next_event(&mut events)["diarization_unavailable"], true);
+    }
+
     #[tokio::test]
     async fn untimed_bleed_redecodes_final_pcm() {
         let fake = RedecodeRecognizer::default();
@@ -3278,6 +4025,40 @@ mod tests {
         assert_eq!(event["bleed_missing_peer"], false);
         assert_eq!(event["words"], json!([]));
         assert_eq!(finishes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn partially_timed_bleed_preserves_unaligned_speech() {
+        use super::super::recognizer::TimedWord;
+
+        let (mut session, mut events, _close, _shutdown) =
+            session_with_recognizer(|| Ok(Box::new(RedecodeRecognizer::default())), 2).await;
+        prepare_bleed_item(&mut session);
+        next_event(&mut events);
+        next_event(&mut events);
+        let hypothesis = Hypothesis {
+            text: "Own speech. Leaked speech.".into(),
+            words: vec![TimedWord {
+                text: " Leaked speech.".into(),
+                start_sample: BLEED_START + 7 * BLOCK_FRAMES,
+                end_sample: ITEM_END - 3 * BLOCK_FRAMES,
+                spoken: None,
+            }],
+            ..Hypothesis::default()
+        };
+        let output = scripted(1, OWN_START, ITEM_END, PipelineUpdate::Final(hypothesis));
+        deliver_scripted(&mut session, output);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !session.tracks["mic"].outputs.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                session.poll_track("mic");
+            }
+        })
+        .await
+        .unwrap();
+        let event = next_event(&mut events);
+        assert_eq!(event["type"], "transcriberrr.transcript.final");
+        assert_eq!(event["text"], "Own speech.");
     }
 
     #[tokio::test]
@@ -3330,5 +4111,92 @@ mod tests {
         assert_eq!(track.interval(1, 5), Some((vec![1; 4], vec![1, 0, 0, 1])));
         assert!(track.interval(5, 7).is_none());
         assert!(track.interval(next, next + 6).is_some());
+    }
+
+    #[tokio::test]
+    async fn drafts_for_the_next_item_pass_a_final_waiting_for_bleed() {
+        let (mut session, mut events, _close, _shutdown) =
+            session_with_recognizer(|| Ok(Box::new(RedecodeRecognizer::default())), 2).await;
+        for track_id in ["mic", "peer"] {
+            session
+                .register(&json!({"track_id": track_id, "role": "isolated_mic"}))
+                .unwrap();
+            next_event(&mut events);
+        }
+        let item = |turn, update| scripted(turn, 0, 4_800, update);
+        let draft = |turn, text: &str| {
+            item(
+                turn,
+                PipelineUpdate::Draft(Hypothesis {
+                    text: text.into(),
+                    ..Hypothesis::default()
+                }),
+            )
+        };
+        let assert_draft = |event: Value, item_id: &str, revision: u64, text: &str| {
+            assert_eq!(event["type"], "transcriberrr.transcript.draft", "{event}");
+            assert_eq!(event["item_id"], item_id);
+            assert_eq!(event["revision"], revision);
+            assert_eq!(event["text"], text);
+        };
+        deliver_scripted(&mut session, draft(1, "first"));
+        assert_draft(next_event(&mut events), "item_0_1", 1, "first");
+
+        // The silent peer leaves the first item's bleed undecided until its deadline.
+        let pending = item(1, PipelineUpdate::Final(Hypothesis::default()));
+        deliver_scripted(&mut session, pending);
+        assert!(events.try_recv().is_err());
+        deliver_scripted(&mut session, draft(2, "second"));
+        assert_draft(next_event(&mut events), "item_0_2", 1, "second");
+        deliver_scripted(&mut session, draft(2, "second item"));
+        assert_draft(next_event(&mut events), "item_0_2", 2, "second item");
+
+        let expire_head = |session: &mut Session| {
+            let track = session.tracks.get_mut("mic").unwrap();
+            track.outputs.front_mut().unwrap().deadline = Instant::now();
+            session.poll_track("mic");
+        };
+        let assert_final = |event: Value, item_id: &str| {
+            assert_eq!(event["type"], "transcriberrr.transcript.final", "{event}");
+            assert_eq!(event["item_id"], item_id);
+            assert_eq!(event["bleed_missing_peer"], true);
+        };
+        expire_head(&mut session);
+        assert_final(next_event(&mut events), "item_0_1");
+        // Closing the first item leaves the second item's revisions intact.
+        deliver_scripted(&mut session, draft(2, "second item again"));
+        assert_draft(next_event(&mut events), "item_0_2", 3, "second item again");
+
+        // A marker behind a waiting final keeps its place, and so do later drafts.
+        let pending = item(2, PipelineUpdate::Final(Hypothesis::default()));
+        deliver_scripted(&mut session, pending);
+        session
+            .tracks
+            .get_mut("mic")
+            .unwrap()
+            .markers
+            .push_back(Marker {
+                id: 1,
+                action: MarkerAction::Commit,
+            });
+        let committed = item(2, PipelineUpdate::Committed { marker: 1 });
+        deliver_scripted(&mut session, committed);
+        deliver_scripted(&mut session, draft(3, "third"));
+        assert!(events.try_recv().is_err());
+        expire_head(&mut session);
+        assert_final(next_event(&mut events), "item_0_2");
+        assert_eq!(
+            next_event(&mut events)["type"],
+            "transcriberrr.track.committed"
+        );
+        assert_draft(next_event(&mut events), "item_0_3", 1, "third");
+    }
+
+    #[tokio::test]
+    async fn announcement_publishes_liveness_limits() {
+        let (session, _events, _close, _shutdown) = session_fixture().await;
+        let limits = &session.initial_announcement()["limits"];
+        assert_eq!(limits["ping_interval_ms"], PING_INTERVAL.as_millis() as u64);
+        assert_eq!(limits["idle_timeout_ms"], IDLE_TIMEOUT.as_millis() as u64);
     }
 }

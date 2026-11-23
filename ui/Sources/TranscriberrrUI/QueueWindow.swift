@@ -197,7 +197,7 @@ struct QueueWindow: View {
             case .server: ServerPanel(server: state.server, state: state)
             }
         }
-        .alert("Couldn’t Plan the Queue", isPresented: Binding(
+        .alert("Queue Error", isPresented: Binding(
             get: { state.planningError != nil },
             set: { if !$0 { state.planningError = nil } }
         )) {

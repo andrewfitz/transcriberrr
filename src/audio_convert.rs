@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,7 +40,14 @@ impl TempPath {
     pub(crate) fn create(extension: &str) -> Result<Self> {
         loop {
             let path = Self::next_path(extension);
-            match File::create_new(&path) {
+            let mut options = File::options();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
                 Ok(_) => return Ok(Self(path)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -132,6 +139,90 @@ fn is_ogg(path: &Path) -> Result<bool> {
     Ok(file.read_exact(&mut magic).is_ok() && &magic == b"OggS")
 }
 
+/// Symphonia reports AAC timestamps on the unedited media clock. MP4 edit lists
+/// can move, trim, or repeat that exact audio on the video presentation clock.
+struct AudioPresentation {
+    movie_timescale: u32,
+    audio_timescale: u32,
+    edits: Vec<mp4_atom::ElstEntry>,
+}
+
+impl AudioPresentation {
+    fn read(path: &Path) -> Result<Self> {
+        use mp4_atom::{Atom, FourCC, Header, Moov, ReadAtom, ReadFrom};
+        let file = File::open(path)?;
+        let end = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
+        loop {
+            let header = Header::read_from(&mut reader)?;
+            let start = reader.stream_position()?;
+            let available = end.checked_sub(start).context("invalid MP4 atom offset")?;
+            let size = header.size.map_or(available, |size| size as u64);
+            anyhow::ensure!(size <= available, "truncated MP4 atom");
+            if header.kind == Moov::KIND {
+                // Unrecognized or unusually large metadata leaves the video independent.
+                anyhow::ensure!(size <= 64 * 1024 * 1024, "MP4 movie header too large");
+                let movie = Moov::read_atom(&header, &mut reader)?;
+                // Fragment-local presentation offsets need their own timeline comparison.
+                anyhow::ensure!(movie.mvex.is_none(), "fragmented MP4 presentation");
+                let mut audio = movie
+                    .trak
+                    .into_iter()
+                    .filter(|track| track.mdia.hdlr.handler == FourCC::new(b"soun"));
+                let track = audio.next().context("MP4 has no audio track")?;
+                anyhow::ensure!(audio.next().is_none(), "multiple MP4 audio tracks");
+                let samples = &track.mdia.minf.stbl;
+                anyhow::ensure!(
+                    samples.cslg.is_none()
+                        && samples.ctts.as_ref().is_none_or(|ctts| ctts
+                            .entries
+                            .iter()
+                            .all(|entry| entry.sample_offset == 0)),
+                    "MP4 audio has composition offsets"
+                );
+                anyhow::ensure!(
+                    movie.mvhd.timescale != 0 && track.mdia.mdhd.timescale != 0,
+                    "missing MP4 timescale"
+                );
+                let edits = track
+                    .edts
+                    .and_then(|edts| edts.elst)
+                    .map(|elst| elst.entries)
+                    .unwrap_or_default();
+                return Ok(Self {
+                    movie_timescale: movie.mvhd.timescale,
+                    audio_timescale: track.mdia.mdhd.timescale,
+                    edits,
+                });
+            }
+            reader.seek(SeekFrom::Start(start + size))?;
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        let equal_time = |a: u64, a_scale: u32, b: u64, b_scale: u32| {
+            u128::from(a) * u128::from(b_scale) == u128::from(b) * u128::from(a_scale)
+        };
+        self.edits.len() == other.edits.len()
+            && self.edits.iter().zip(&other.edits).all(|(a, b)| {
+                a.media_rate == b.media_rate
+                    && equal_time(
+                        a.segment_duration,
+                        self.movie_timescale,
+                        b.segment_duration,
+                        other.movie_timescale,
+                    )
+                    && match (a.media_time, b.media_time) {
+                        (Some(a), Some(b)) => {
+                            equal_time(a, self.audio_timescale, b, other.audio_timescale)
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
+    }
+}
+
 /// Zoom saves the same AAC audio in the meeting video and its audio-only export.
 /// Compare the complete stream so a renamed video with different audio stays in the queue.
 pub(crate) fn same_aac_audio(left: &Path, right: &Path) -> Result<bool> {
@@ -168,8 +259,11 @@ pub(crate) fn same_aac_audio(left: &Path, right: &Path) -> Result<bool> {
         }
     }
 
-    let (mut left, mut right) = (probe(left)?, probe(right)?);
-    let (Some(a), Some(b)) = (aac_track(left.as_ref()), aac_track(right.as_ref())) else {
+    let (mut left_reader, mut right_reader) = (probe(left)?, probe(right)?);
+    let (Some(a), Some(b)) = (
+        aac_track(left_reader.as_ref()),
+        aac_track(right_reader.as_ref()),
+    ) else {
         return Ok(false);
     };
     let (a_id, b_id) = (a.id, b.id);
@@ -190,8 +284,8 @@ pub(crate) fn same_aac_audio(left: &Path, right: &Path) -> Result<bool> {
     let mut frames = 0u64;
     loop {
         match (
-            next_audio(left.as_mut(), a_id)?,
-            next_audio(right.as_mut(), b_id)?,
+            next_audio(left_reader.as_mut(), a_id)?,
+            next_audio(right_reader.as_mut(), b_id)?,
         ) {
             (Some(a), Some(b)) if a.ts == b.ts && a.dur == b.dur && a.data == b.data => {
                 frames = frames.saturating_add(a.dur);
@@ -199,7 +293,10 @@ pub(crate) fn same_aac_audio(left: &Path, right: &Path) -> Result<bool> {
                     return Ok(false);
                 }
             }
-            (None, None) => return Ok(frames == expected_frames),
+            (None, None) => {
+                return Ok(frames == expected_frames
+                    && AudioPresentation::read(left)?.matches(&AudioPresentation::read(right)?));
+            }
             _ => return Ok(false),
         }
     }
@@ -384,7 +481,11 @@ impl<W: Write> OggWriter<W> {
 /// Write 32-bit float mono WAV, used to hand already-decoded audio to the Apple helper.
 pub(crate) fn write_float_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     // RIFF sizes are u32 and include the 36 header bytes after the size field.
-    let data_len = u32::try_from(samples.len() * 4)
+    let byte_rate = sample_rate
+        .checked_mul(4)
+        .filter(|rate| *rate > 0)
+        .context("invalid sample rate for WAV")?;
+    let data_len = u32::try_from(std::mem::size_of_val(samples))
         .ok()
         .filter(|length| length.checked_add(36).is_some())
         .context("audio too long for WAV")?;
@@ -397,13 +498,18 @@ pub(crate) fn write_float_wav(path: &Path, samples: &[f32], sample_rate: u32) ->
     out.write_all(&3u16.to_le_bytes())?; // IEEE float
     out.write_all(&1u16.to_le_bytes())?; // mono
     out.write_all(&sample_rate.to_le_bytes())?;
-    out.write_all(&(sample_rate * 4).to_le_bytes())?; // byte rate
+    out.write_all(&byte_rate.to_le_bytes())?; // byte rate
     out.write_all(&4u16.to_le_bytes())?; // block align
     out.write_all(&32u16.to_le_bytes())?; // bits per sample
     out.write_all(b"data")?;
     out.write_all(&data_len.to_le_bytes())?;
-    for sample in samples {
-        out.write_all(&sample.to_le_bytes())?;
+    let mut buffer = [0u8; 8192];
+    for chunk in samples.chunks(buffer.len() / 4) {
+        let bytes = &mut buffer[..std::mem::size_of_val(chunk)];
+        for (slot, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(chunk) {
+            *slot = sample.to_le_bytes();
+        }
+        out.write_all(bytes)?;
     }
     out.flush()?;
     Ok(())
@@ -474,6 +580,20 @@ mod tests {
             read.push(packet.data.to_vec());
         }
         assert_eq!(read, packets);
+    }
+
+    #[test]
+    fn float_wav_writes_full_and_partial_blocks() {
+        let path = TempPath::create("wav").unwrap();
+        let samples: Vec<_> = (0..4097).map(|i| i as f32).collect();
+        write_float_wav(path.path(), &samples, 16_000).unwrap();
+        let bytes = std::fs::read(path.path()).unwrap();
+        let expected: Vec<_> = samples.iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert_eq!(&bytes[44..], expected);
+        for rate in [0, u32::MAX] {
+            assert!(write_float_wav(path.path(), &samples, rate).is_err());
+            assert_eq!(std::fs::read(path.path()).unwrap(), bytes);
+        }
     }
 
     #[test]

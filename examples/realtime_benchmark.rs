@@ -3,12 +3,15 @@
 //! adjacent .txt references.
 
 #[cfg(feature = "parakeet")]
+#[allow(dead_code)]
 #[path = "../src/serve/parakeet_profile.rs"]
 mod parakeet_profile;
 
 #[cfg(feature = "parakeet")]
 mod benchmark {
-    use super::parakeet_profile::{STREAMING_CONFIG, final_padding_samples, warmup_samples};
+    use super::parakeet_profile::{
+        STREAMING_CONFIG, final_padding_samples, single_window, warmup_window_frames,
+    };
     use anyhow::{Context, Result, ensure};
     use parakeet_rs::{
         ExecutionConfig, ExecutionProvider, ParakeetUnified, ParakeetUnifiedHandle, TimestampMode,
@@ -250,7 +253,6 @@ mod benchmark {
             "pass at least one fixture and one repeat"
         );
         let execution = ExecutionConfig::new().with_execution_provider(ExecutionProvider::BurnWgpu);
-        let shared = ParakeetUnifiedHandle::from_pretrained(model, Some(execution))?;
         let mut config = STREAMING_CONFIG;
         if let Ok(left) = std::env::var("TRANSCRIBERRR_BENCH_LEFT_SECONDS") {
             config.left_context_secs = left.parse()?;
@@ -261,9 +263,14 @@ mod benchmark {
         if let Ok(chunk) = std::env::var("TRANSCRIBERRR_BENCH_CHUNK_SECONDS") {
             config.chunk_secs = chunk.parse()?;
         }
-        let mut warm = ParakeetUnified::from_shared_with_streaming_config(&shared, config)?;
-        warm.transcribe_chunk(&vec![0.0; warmup_samples(config)])?;
-        drop(warm);
+        config.validate()?;
+        let shared = ParakeetUnifiedHandle::from_pretrained(model, Some(execution))?;
+        // As the listener does: one call on every window length this profile can produce.
+        for frames in 1..=warmup_window_frames(&[config]) {
+            let window = single_window(frames);
+            let mut warm = ParakeetUnified::from_shared_with_streaming_config(&shared, window)?;
+            warm.transcribe_chunk(&vec![0.0; window.chunk_samples()])?;
+        }
         let tracks = fixtures
             .iter()
             .map(|path| {

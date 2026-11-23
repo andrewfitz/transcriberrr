@@ -5512,6 +5512,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mp4-atom"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "327faeb7d11fc3735194fdaeaa82af72167801bf39dd3d6b2684c8fc5cd7fc19"
+dependencies = [
+ "derive_more",
+ "num",
+ "pastey 0.2.3",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6183,9 +6196,9 @@ dependencies = [
 
 [[package]]
 name = "parakeet-rs"
-version = "0.4.1"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e4adf50ebc26af6c0bd6e8261bcaba249cc00a415f91c672ff2864c436b4eff"
+checksum = "70583860165ab384ca96be333714623f062fba83029957be843208f934262ba1"
 dependencies = [
  "burn",
  "burn-store",
@@ -9166,9 +9179,14 @@ dependencies = [
  "clap",
  "futures-util",
  "hf-hub",
+ "hyper",
+ "hyper-util",
  "libc",
+ "mp4-atom",
+ "ndarray 0.17.2",
  "parakeet-rs",
  "qwen3_asr",
+ "realfft",
  "ring",
  "rubato",
  "rustvani-vad",

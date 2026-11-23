@@ -2,6 +2,8 @@
 //! borrowing streams on one thread. Dropping a stream cancels it without flushing.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use candle_core::{DType, Device};
@@ -9,7 +11,7 @@ use qwen3_asr::{
     AsrStream, AsrTranscription, AudioInput, Batch, LoadOptions, Qwen3Asr, StreamOptions,
     TranscribeOptions, forced_aligner::Qwen3ForcedAligner,
 };
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::{
     DeviceKind, EngineKind, QWEN_DEFAULT_CHUNK_SECONDS, QWEN_TOKENS_PER_SECOND, chunk_ranges,
@@ -41,12 +43,30 @@ pub(super) struct Hypothesis {
 pub(super) struct TimedWord {
     /// Exact fragment of the transcript, with its preceding whitespace if present.
     pub text: String,
+    /// On the recognizer's own clock. Rollover cuts and bleed decisions use it.
     pub start_sample: u64,
     pub end_sample: u64,
+    /// When the word was spoken, from a recognizer whose clock runs behind the speech.
+    /// Clients and speaker labels get these times in place of the recognizer's.
+    pub spoken: Option<(u64, u64)>,
 }
 
 pub(super) trait Recognizer {
     fn start(&self, options: &RecognitionOptions) -> Result<Box<dyn RecognitionStream + '_>>;
+
+    /// Whether a native stream decodes audio that arrives together in fewer, longer
+    /// windows. The worker then collects a track's queued audio before decoding.
+    fn coalesces_backlog(&self) -> bool {
+        false
+    }
+
+    /// Native tracks may use a decoder profile of their own.
+    fn start_native(
+        &self,
+        options: &RecognitionOptions,
+    ) -> Result<Box<dyn RecognitionStream + '_>> {
+        self.start(options)
+    }
 
     /// Permanent loss of a backend that can fail independently of the worker thread.
     fn backend_failure(&self) -> Option<watch::Receiver<Option<String>>> {
@@ -56,6 +76,12 @@ pub(super) trait Recognizer {
     /// Retained audio that may seed a new native timed item after rollover.
     fn rollover_preroll_samples(&self) -> u64 {
         0
+    }
+
+    /// Signaled whenever a final requested by `RecognitionStream::request_final` may
+    /// have resolved. A recognizer with only synchronous finals returns `None`.
+    fn final_notify(&self) -> Option<Arc<Notify>> {
+        None
     }
 
     fn start_committed(
@@ -68,12 +94,38 @@ pub(super) trait Recognizer {
 
 pub(super) trait RecognitionStream {
     fn push(&mut self, samples: &[f32]) -> Result<Option<Hypothesis>>;
+
+    /// Feeds consecutive spans that are all available now. A recognizer that sizes its
+    /// inference window by the audio waiting decodes them together.
+    fn push_spans(&mut self, spans: &[&[f32]]) -> Result<Option<Hypothesis>> {
+        let mut latest = None;
+        for span in spans {
+            if let Some(hypothesis) = self.push(span)? {
+                latest = Some(hypothesis);
+            }
+        }
+        Ok(latest)
+    }
+    /// Blocks until the final is available. Valid after `request_final` as well.
     fn finish(self: Box<Self>) -> Result<Hypothesis>;
+
+    /// Asks for the final without waiting for it. `Some(deadline)` means the result
+    /// arrives through `try_final`; `None` means the caller must use `finish`.
+    fn request_final(&mut self) -> Result<Option<Instant>> {
+        Ok(None)
+    }
+
+    /// The requested final once it has arrived, or a failure once `now` reaches the
+    /// deadline. Never blocks.
+    fn try_final(&mut self, _now: Instant) -> Option<Result<Hypothesis>> {
+        None
+    }
 }
 
 pub(super) struct CommittedStream<'a> {
     stream: Box<dyn RecognitionStream + 'a>,
     samples: Vec<f32>,
+    flushed: bool,
 }
 
 impl<'a> CommittedStream<'a> {
@@ -81,7 +133,16 @@ impl<'a> CommittedStream<'a> {
         Self {
             stream,
             samples: Vec::new(),
+            flushed: false,
         }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if !self.flushed {
+            self.flushed = true;
+            self.stream.push(&std::mem::take(&mut self.samples))?;
+        }
+        Ok(())
     }
 }
 
@@ -91,8 +152,17 @@ impl RecognitionStream for CommittedStream<'_> {
         Ok(None)
     }
 
+    fn request_final(&mut self) -> Result<Option<Instant>> {
+        self.flush()?;
+        self.stream.request_final()
+    }
+
+    fn try_final(&mut self, now: Instant) -> Option<Result<Hypothesis>> {
+        self.stream.try_final(now)
+    }
+
     fn finish(mut self: Box<Self>) -> Result<Hypothesis> {
-        self.stream.push(&self.samples)?;
+        self.flush()?;
         self.stream.finish()
     }
 }
@@ -208,21 +278,18 @@ pub(super) fn load_with_aligner(
         }
         #[cfg(feature = "parakeet")]
         EngineKind::ParakeetV3 => {
-            use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetUnifiedHandle};
+            use parakeet_rs::{ExecutionConfig, ExecutionProvider};
             let provider = match device {
                 DeviceKind::Metal => ExecutionProvider::BurnWgpu,
                 DeviceKind::Cpu | DeviceKind::Coreml => ExecutionProvider::BurnCpu,
             };
             let recognizer = load_model(&cache, model, |path| {
                 let config = ExecutionConfig::new().with_execution_provider(provider);
-                ParakeetUnifiedHandle::from_pretrained(path, Some(config))
+                parakeet::ParakeetRecognizer::load(path, config)
                     .context("loading Parakeet Unified for live transcription")
             })?;
-            let mut probe = parakeet::decoder(&recognizer)
-                .context("initializing the Parakeet Unified startup probe")?;
-            let samples = super::parakeet_profile::warmup_samples(probe.streaming_config());
-            probe
-                .transcribe_chunk(&vec![0.0; samples])
+            recognizer
+                .warmup()
                 .context("warming the Parakeet Unified streaming model")?;
             Ok(Box::new(recognizer))
         }
@@ -449,6 +516,7 @@ fn align_qwen_words(
             text: word.text,
             start_sample: (word.start * SAMPLE_RATE as f32).round() as u64,
             end_sample: (word.end * SAMPLE_RATE as f32).round() as u64,
+            spoken: None,
         })
         .collect())
 }
@@ -511,85 +579,247 @@ mod tests {
 
 #[cfg(feature = "parakeet")]
 mod parakeet {
-    use super::super::parakeet_profile::{STREAMING_CONFIG, final_padding_samples};
+    use super::super::parakeet_profile::{
+        STREAMING_CONFIG, final_padding_samples, single_window, warmup_window_frames,
+    };
+    use super::super::parakeet_stream::{FRAME_SAMPLES, StreamDecoder, UnifiedModel};
+    use super::super::trace;
     use super::*;
-    use parakeet_rs::{ParakeetUnified, ParakeetUnifiedHandle, TimestampMode, TranscriptionResult};
+    use crate::parakeet_engine::{ParakeetWord, estimate_word_ends};
+    use parakeet_rs::{ExecutionConfig, TranscriptionResult, UnifiedStreamingConfig};
 
-    pub(super) fn decoder(model: &ParakeetUnifiedHandle) -> Result<ParakeetUnified> {
-        Ok(ParakeetUnified::from_shared_with_streaming_config(
-            model,
-            STREAMING_CONFIG,
-        )?)
+    const STANDARD: UnifiedStreamingConfig = UnifiedStreamingConfig {
+        chunk_secs: 1.44,
+        ..STREAMING_CONFIG
+    };
+    /// A native stream that has fallen behind decodes up to this many hops in one window.
+    /// An encoder call costs about the same for 1 s as for 4 s of audio, so one long
+    /// window catches up where a window per hop would fall further behind.
+    const NATIVE_MAX_HOPS: usize = 3;
+    const FRAME_SECONDS: f32 = FRAME_SAMPLES as f32 / SAMPLE_RATE as f32;
+    /// A streaming window emits a word's first token some time after the word began,
+    /// and later the less audio the window held before it. With only the 0.64 s left
+    /// context before it, the token trails the onset by `LATENCY_AFTER_LEFT_CONTEXT`.
+    /// Each further encoder frame heard takes off `LATENCY_PER_FRAME_HEARD`, down to
+    /// `SHORTEST_LATENCY`, which a 0.96 s hop reaches at its end and a window over a
+    /// backlog keeps. Measured on read speech against forced alignment, through the
+    /// socket and with windows of one to three hops.
+    const LEFT_CONTEXT_FRAMES: usize = 8;
+    const LATENCY_AFTER_LEFT_CONTEXT: f32 = 0.41;
+    const LATENCY_PER_FRAME_HEARD: f32 = 0.01;
+    const SHORTEST_LATENCY: f32 = 0.3;
+    /// A stream's first window has no left context. It emits nothing for about 0.7 s
+    /// and then its first words together, `FIRST_WINDOW_LATENCY` after they began. A
+    /// token it emits after `FIRST_WINDOW_SETTLING_FRAME` trails by
+    /// `FIRST_WINDOW_LATENCY_PER_FRAME` less for each frame past it.
+    const FIRST_WINDOW_LATENCY: f32 = 0.5;
+    const FIRST_WINDOW_SETTLING_FRAME: usize = 9;
+    const FIRST_WINDOW_LATENCY_PER_FRAME: f32 = 0.07;
+
+    /// Seconds by which the token emitted at stream frame `frame` trails the onset of
+    /// its word, when its window held `heard_before` encoder frames before it.
+    fn emission_latency(frame: usize, heard_before: usize) -> f32 {
+        // Only a window that starts the stream holds exactly the stream so far.
+        if heard_before == frame {
+            let settled = frame.saturating_sub(FIRST_WINDOW_SETTLING_FRAME) as f32;
+            return (FIRST_WINDOW_LATENCY - settled * FIRST_WINDOW_LATENCY_PER_FRAME)
+                .max(SHORTEST_LATENCY);
+        }
+        let further = heard_before.saturating_sub(LEFT_CONTEXT_FRAMES) as f32;
+        (LATENCY_AFTER_LEFT_CONTEXT - further * LATENCY_PER_FRAME_HEARD).max(SHORTEST_LATENCY)
     }
 
-    struct ParakeetStream {
-        decoder: ParakeetUnified,
-        received_samples: usize,
-        drafts: bool,
+    pub(super) struct ParakeetRecognizer {
+        model: Arc<UnifiedModel>,
     }
 
-    impl ParakeetStream {
-        fn open(model: &ParakeetUnifiedHandle, drafts: bool) -> Result<Box<Self>> {
-            Ok(Box::new(Self {
-                decoder: decoder(model)?,
-                received_samples: 0,
-                drafts,
-            }))
+    impl ParakeetRecognizer {
+        pub(super) fn load(path: &std::path::Path, execution: ExecutionConfig) -> Result<Self> {
+            Ok(Self {
+                model: UnifiedModel::load(path, execution)?,
+            })
+        }
+
+        /// Runs the encoder once on every window length a stream can produce, before the
+        /// listener reports ready. The GPU backend prepares its kernels for a length the
+        /// first time it sees one, which takes up to a second (more on a busy host) and
+        /// would otherwise stall the first stream that needs it. A full window is one hop
+        /// or a backlog of several; the last window of an utterance covers whatever
+        /// remains, so it can be any shorter length.
+        pub(super) fn warmup(&self) -> Result<()> {
+            let mut profiles = vec![STANDARD];
+            profiles.extend((1..=NATIVE_MAX_HOPS).map(|hops| UnifiedStreamingConfig {
+                chunk_secs: hops as f32 * STREAMING_CONFIG.chunk_secs,
+                ..STREAMING_CONFIG
+            }));
+            for frames in 1..=warmup_window_frames(&profiles) {
+                warm(&self.model, frames)?;
+            }
+            Ok(())
         }
     }
 
-    impl Recognizer for ParakeetUnifiedHandle {
+    fn warm(model: &Arc<UnifiedModel>, encoder_frames: usize) -> Result<()> {
+        let mut decoder = StreamDecoder::new(model, single_window(encoder_frames))?;
+        let samples = encoder_frames * FRAME_SAMPLES;
+        decoder.extend(&vec![0.0; samples]);
+        decoder.decode_window(samples, false)?;
+        Ok(())
+    }
+
+    struct ParakeetStream {
+        decoder: StreamDecoder,
+        received_samples: usize,
+        drafts: bool,
+        /// The profile's hop: the shortest window a push decodes, and the grid on which
+        /// every window starts.
+        hop_samples: usize,
+        /// The longest window. Equal to the hop on a stream with fixed windows.
+        max_hop_samples: usize,
+    }
+
+    impl ParakeetStream {
+        fn open(
+            recognizer: &ParakeetRecognizer,
+            config: UnifiedStreamingConfig,
+            drafts: bool,
+            max_hops: usize,
+        ) -> Result<Box<Self>> {
+            let hop_samples = config.chunk_samples();
+            let decoder = StreamDecoder::new(&recognizer.model, config)?;
+            Ok(Box::new(Self {
+                decoder,
+                received_samples: 0,
+                drafts,
+                hop_samples,
+                max_hop_samples: max_hops * hop_samples,
+            }))
+        }
+
+        /// Decodes every buffered window that has its right context. A
+        /// window covers the whole hops waiting, up to the longest, so a stream that has
+        /// fallen behind catches up in one encoder call. Reports whether text was added.
+        fn decode_ready(&mut self) -> Result<bool> {
+            let mut emitted = false;
+            loop {
+                let waiting = self
+                    .decoder
+                    .pending_samples()
+                    .saturating_sub(self.decoder.right_context_samples());
+                let hops = waiting / self.hop_samples * self.hop_samples;
+                if hops == 0 {
+                    return Ok(emitted);
+                }
+                emitted |= self.window("push", hops.min(self.max_hop_samples), false)?;
+            }
+        }
+
+        fn window(&mut self, call: &str, hop: usize, last: bool) -> Result<bool> {
+            let started = trace::enabled().then(Instant::now);
+            let emitted = self.decoder.decode_window(hop, last)?;
+            if let Some(started) = started {
+                trace::emit(
+                    "decode",
+                    serde_json::json!({
+                        "call": call,
+                        "ms": started.elapsed().as_secs_f64() * 1e3,
+                        "received_samples": self.received_samples,
+                        "hop_secs": hop as f32 / SAMPLE_RATE as f32,
+                        "drafts": self.drafts,
+                        "emitted": emitted,
+                    }),
+                );
+            }
+            Ok(emitted)
+        }
+    }
+
+    impl Recognizer for ParakeetRecognizer {
         fn start(&self, _options: &RecognitionOptions) -> Result<Box<dyn RecognitionStream + '_>> {
-            Ok(ParakeetStream::open(self, true)?)
+            // Standard turns keep the fixed 1.44 s hop their fixtures were accepted with.
+            Ok(ParakeetStream::open(self, STANDARD, true, 1)?)
+        }
+
+        fn start_native(
+            &self,
+            _options: &RecognitionOptions,
+        ) -> Result<Box<dyn RecognitionStream + '_>> {
+            Ok(ParakeetStream::open(
+                self,
+                STREAMING_CONFIG,
+                true,
+                NATIVE_MAX_HOPS,
+            )?)
         }
 
         fn start_committed(
             &self,
             _options: &RecognitionOptions,
         ) -> Result<Box<dyn RecognitionStream + '_>> {
-            // The worker already retained this turn through commit. Feed its spans directly:
-            // Parakeet drains one hop from its PCM buffer per window, so giving it the entire
-            // turn at once would shift all remaining samples on every inference.
-            Ok(ParakeetStream::open(self, false)?)
+            // The worker already retained this turn through commit and feeds its spans
+            // directly, so the stream never holds more than a window of PCM.
+            Ok(ParakeetStream::open(self, STANDARD, false, 1)?)
+        }
+
+        fn coalesces_backlog(&self) -> bool {
+            true
         }
 
         fn rollover_preroll_samples(&self) -> u64 {
-            STREAMING_CONFIG.chunk_samples() as u64
+            // The new decoder needs the tested 1.44 s of preceding speech at a forced cut.
+            STANDARD.chunk_samples() as u64
         }
     }
 
     impl RecognitionStream for ParakeetStream {
         fn push(&mut self, samples: &[f32]) -> Result<Option<Hypothesis>> {
-            self.received_samples += samples.len();
-            let emitted = self.decoder.transcribe_chunk(samples)?;
-            if !self.drafts || emitted.is_empty() {
-                return Ok(None);
+            self.push_spans(&[samples])
+        }
+
+        fn push_spans(&mut self, spans: &[&[f32]]) -> Result<Option<Hypothesis>> {
+            // One buffer lets the decoder see everything waiting before it sizes a window.
+            for span in spans {
+                self.decoder.extend(span);
+                self.received_samples += span.len();
             }
-            Ok(Some(hypothesis(
-                self.decoder.get_timed_transcript(TimestampMode::Words),
-                false,
-            )))
+            let emitted = self.decode_ready()?;
+            Ok((self.drafts && emitted).then(|| self.hypothesis(false)))
         }
 
         fn finish(mut self: Box<Self>) -> Result<Hypothesis> {
-            // The decoder's flush processes only complete encoder frames. Keep the last
-            // partial frame by padding here, after the item has recorded its real duration.
-            let padding =
-                final_padding_samples(self.received_samples, self.decoder.streaming_config());
-            if padding > 0 {
-                self.decoder.transcribe_chunk(&vec![0.0; padding])?;
+            // Windows are whole encoder frames. Keep the last partial frame by padding
+            // here, after the item has recorded its real duration.
+            let padding = final_padding_samples(self.received_samples, STREAMING_CONFIG);
+            self.decoder.extend(&[0.0; FRAME_SAMPLES][..padding]);
+            self.decode_ready()?;
+            // Nothing follows what is left, so it is decoded without right context: in
+            // one window on a stream with variable windows, else hop by hop.
+            while self.decoder.pending_samples() >= FRAME_SAMPLES {
+                let rest = self.decoder.pending_samples() / FRAME_SAMPLES * FRAME_SAMPLES;
+                let hop = if self.max_hop_samples > self.hop_samples {
+                    rest.min(self.max_hop_samples)
+                } else {
+                    self.hop_samples
+                };
+                self.window("finish", hop, true)?;
             }
-            self.decoder.flush()?;
-            Ok(hypothesis(
-                self.decoder.get_timed_transcript(TimestampMode::Words),
-                true,
-            ))
+            Ok(self.hypothesis(true))
         }
     }
 
-    fn hypothesis(result: TranscriptionResult, final_result: bool) -> Hypothesis {
+    /// The decoder's words on its own clock, each with the time it was spoken.
+    /// `heard_before` gives the encoder frames a frame's window held before it, and
+    /// `received_samples` is the audio the stream has been given.
+    fn hypothesis(
+        result: TranscriptionResult,
+        heard_before: impl Fn(usize) -> usize,
+        received_samples: usize,
+        final_result: bool,
+    ) -> Hypothesis {
         let mut remainder = result.text.as_str();
         let mut words = Vec::with_capacity(result.tokens.len());
+        let mut spoken = Vec::with_capacity(result.tokens.len());
+        let mut floor = 0.0f32;
         for word in result.tokens {
             let whitespace = remainder.len() - remainder.trim_start().len();
             let Some(next) = remainder[whitespace..].strip_prefix(&word.text) else {
@@ -604,8 +834,19 @@ mod parakeet {
                 text: fragment.to_owned(),
                 start_sample: (word.start * SAMPLE_RATE as f32).round() as u64,
                 end_sample: (word.end * SAMPLE_RATE as f32).round() as u64,
+                spoken: None,
+            });
+            let frame = (word.start / FRAME_SECONDS).round() as usize;
+            // Onsets stay in order and inside the stream.
+            let onset = (word.start - emission_latency(frame, heard_before(frame))).max(floor);
+            floor = onset;
+            spoken.push(ParakeetWord {
+                text: word.text,
+                start: onset,
+                end: onset,
             });
         }
+        place_spoken(&mut words, spoken, received_samples);
         if !remainder.trim().is_empty() {
             words.clear();
         } else if final_result {
@@ -622,6 +863,73 @@ mod parakeet {
             stable: true,
             words,
             language: None,
+        }
+    }
+
+    /// Records when each word was spoken, from its corrected onset. A word runs to the
+    /// next onset in continuous speech and keeps an estimated length before a pause, as
+    /// in a recording decoded whole. Words the decoder emitted in one frame share an
+    /// onset: they divide the time to the next onset by their length in letters.
+    /// Punctuation closes the word before it.
+    fn place_spoken(words: &mut [TimedWord], mut spoken: Vec<ParakeetWord>, received: usize) {
+        if words.len() != spoken.len() {
+            return;
+        }
+        estimate_word_ends(&mut spoken, received as f32 / SAMPLE_RATE as f32);
+        let letters = |word: &ParakeetWord| {
+            word.text
+                .chars()
+                .filter(|letter| letter.is_alphanumeric())
+                .count()
+        };
+        let voiced: Vec<usize> = (0..spoken.len())
+            .filter(|&index| letters(&spoken[index]) > 0)
+            .collect();
+        let mut first = 0;
+        while first < voiced.len() {
+            let onset = spoken[voiced[first]].start;
+            let run = voiced[first..]
+                .iter()
+                .take_while(|&&index| spoken[index].start == onset)
+                .count();
+            let group = &voiced[first..first + run];
+            // The run ends where its last word does, and no later than the next onset.
+            let mut end = spoken[group[run - 1]].end.max(onset);
+            if let Some(&next) = voiced.get(first + run) {
+                end = end.min(spoken[next].start);
+            }
+            let total: usize = group.iter().map(|&index| letters(&spoken[index])).sum();
+            let mut before = 0;
+            for &index in group {
+                let share = |count: usize| onset + (end - onset) * count as f32 / total as f32;
+                spoken[index].start = share(before);
+                before += letters(&spoken[index]);
+                spoken[index].end = share(before);
+            }
+            first += run;
+        }
+        let samples = |seconds: f32| (seconds * SAMPLE_RATE as f32).round() as u64;
+        let mut previous_end = None;
+        for (word, timed) in spoken.iter().zip(words) {
+            timed.spoken = Some(if letters(word) > 0 {
+                let bound = (samples(word.start), samples(word.end));
+                previous_end = Some(bound.1);
+                bound
+            } else {
+                let at = previous_end.unwrap_or_else(|| samples(word.start));
+                (at, at)
+            });
+        }
+    }
+
+    impl ParakeetStream {
+        fn hypothesis(&self, final_result: bool) -> Hypothesis {
+            hypothesis(
+                self.decoder.transcript(),
+                |frame| self.decoder.frames_heard_before(frame),
+                self.received_samples,
+                final_result,
+            )
         }
     }
 
@@ -655,8 +963,8 @@ mod parakeet {
                     })
                     .collect(),
             };
-            let draft = hypothesis(result.clone(), false);
-            let finalized = hypothesis(result, true);
+            let draft = hypothesis(result.clone(), |_| 20, 16_000, false);
+            let finalized = hypothesis(result, |_| 20, 16_000, true);
             let fragments: Vec<_> = finalized
                 .words
                 .iter()
@@ -668,6 +976,109 @@ mod parakeet {
             assert_eq!(draft.text, finalized.text);
             assert_eq!(finalized.words[0].start_sample, 4000);
             assert_eq!(finalized.words[0].end_sample, 8000);
+        }
+
+        /// A token of `text` emitted at encoder frame `frame`.
+        fn token(text: &str, frame: usize) -> TimedToken {
+            TimedToken {
+                text: text.into(),
+                start: frame as f32 * FRAME_SECONDS,
+                end: (frame + 1) as f32 * FRAME_SECONDS,
+            }
+        }
+
+        /// Windows of one 12-frame hop: the first with no left context, the rest with 8.
+        fn single_hops(frame: usize) -> usize {
+            if frame < 12 { frame } else { frame % 12 + 8 }
+        }
+
+        fn close(samples: u64, seconds: f32) -> bool {
+            samples.abs_diff((seconds * SAMPLE_RATE as f32).round() as u64) <= 2
+        }
+
+        #[test]
+        fn latency_is_longest_in_a_first_window_and_shrinks_with_audio_heard() {
+            assert_eq!(emission_latency(9, 9), FIRST_WINDOW_LATENCY);
+            assert_eq!(emission_latency(12, 8), LATENCY_AFTER_LEFT_CONTEXT);
+            assert!(emission_latency(9, 9) > emission_latency(12, 8));
+            // The first window settles toward the latency of the windows after it.
+            assert!(emission_latency(11, 11) < emission_latency(12, 8));
+            assert!(emission_latency(11, 11) > SHORTEST_LATENCY);
+            assert!(emission_latency(23, 19) < emission_latency(13, 9));
+            // A window over a backlog hears more, down to the latency of a whole decode.
+            assert_eq!(emission_latency(47, 43), SHORTEST_LATENCY);
+            assert_eq!(emission_latency(200, 43), SHORTEST_LATENCY);
+        }
+
+        #[test]
+        fn words_carry_the_time_they_were_spoken_beside_the_decoder_clock() {
+            let result = TranscriptionResult {
+                text: "Hello there. Friend".into(),
+                tokens: vec![
+                    token("Hello", 9),
+                    token("there", 14),
+                    token(".", 15),
+                    token("Friend", 40),
+                ],
+            };
+            let onset =
+                |frame| frame as f32 * FRAME_SECONDS - emission_latency(frame, single_hops(frame));
+            let finalized = hypothesis(result.clone(), single_hops, 4 * 16_000, true);
+            let spoken: Vec<_> = finalized
+                .words
+                .iter()
+                .map(|word| word.spoken.unwrap())
+                .collect();
+            // The decoder's clock is untouched.
+            assert_eq!(finalized.words[0].start_sample, 9 * 1_280);
+            assert_eq!(finalized.words[3].end_sample, 41 * 1_280);
+            // Continuous speech: a word runs from its onset to the next.
+            assert!(close(spoken[0].0, onset(9)) && close(spoken[0].1, onset(14)));
+            assert!(close(spoken[1].0, onset(14)));
+            // Before a pause it keeps an estimated length instead.
+            assert!(spoken[1].1 > spoken[1].0 && spoken[1].1 < spoken[3].0 - 16_000);
+            // Punctuation closes the word before it.
+            assert_eq!(spoken[2], (spoken[1].1, spoken[1].1));
+            assert!(close(spoken[3].0, onset(40)));
+            assert!(spoken[3].1 > spoken[3].0 && spoken[3].1 <= 4 * 16_000);
+
+            // A draft withholds its last word, whose onset still bounds the one before.
+            let draft = hypothesis(result, single_hops, 4 * 16_000, false);
+            let drafted: Vec<_> = draft
+                .words
+                .iter()
+                .map(|word| word.spoken.unwrap())
+                .collect();
+            assert_eq!(drafted, spoken[..3]);
+        }
+
+        #[test]
+        fn spoken_times_stay_ordered_inside_the_stream() {
+            let result = TranscriptionResult {
+                text: "Oh, no wait".into(),
+                tokens: vec![
+                    token("Oh", 2),
+                    token(",", 2),
+                    token("no", 3),
+                    token("wait", 20),
+                ],
+            };
+            let finalized = hypothesis(result, single_hops, 21 * 1_280, true);
+            let spoken: Vec<_> = finalized
+                .words
+                .iter()
+                .map(|word| word.spoken.unwrap())
+                .collect();
+            // Both onsets fall before the stream began and are held at its start, where
+            // the two words share the time to the next onset.
+            assert_eq!(spoken[0].0, 0);
+            assert!(spoken[0].1 > 0);
+            assert_eq!(spoken[1], (spoken[0].1, spoken[0].1));
+            assert_eq!(spoken[2].0, spoken[0].1);
+            assert_eq!(spoken[2].1 - spoken[2].0, spoken[0].1);
+            assert!(spoken[2].1 <= spoken[3].0);
+            // The last word cannot outlast the audio received.
+            assert_eq!(spoken[3].1, 21 * 1_280);
         }
     }
 }

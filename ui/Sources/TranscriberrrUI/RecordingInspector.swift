@@ -60,6 +60,7 @@ struct RecordingInspector: View {
                 let tracks = items.filter { $0.skipReason == nil }
                 let history = state.meetingResults(meeting, previous: state.mergedSessions.filter { $0.meetingID == id })
                 let outcomes = state.passOutcomes(for: .meeting(id))
+                let rows = resultRows(outcomes)
                 inspectorForm {
                     Section {
                         statusRow
@@ -85,7 +86,7 @@ struct RecordingInspector: View {
                         Label(meeting.label, systemImage: "video")
                     }
                     speakerTracks(meeting, items: items)
-                    transcriptSections(resultRows(outcomes) + mergeRows(history, excluding: outcomePaths(outcomes)))
+                    transcriptSections(rows + mergeRows(history, excluding: availablePaths(rows)))
                     removeSection(.meeting(id))
                 }
             } else {
@@ -221,8 +222,8 @@ struct RecordingInspector: View {
                 get: { item.diarize },
                 set: { state.setDiarization(for: item, enabled: $0) }
             ))
-            .disabled(item.isoTrack || !state.supportsDiarization)
-            if item.diarize && state.supportsDiarization {
+            .disabled(item.isoTrack)
+            if item.diarize {
                 Picker("Speakers", selection: Binding(
                     get: { item.speakerCount ?? 0 },
                     set: { state.setSpeakerCount(for: item, $0 == 0 ? nil : $0) }
@@ -389,10 +390,10 @@ struct RecordingInspector: View {
     }
 
     private func resolvedOutputs(for item: AudioItem) -> [TranscriptRow] {
-        let outcomes = state.passOutcomes(for: .recording(item.id))
-        let seen = outcomePaths(outcomes)
+        let outcomes = resultRows(state.passOutcomes(for: .recording(item.id)))
+        let seen = availablePaths(outcomes)
         let history = state.modelOutputs(for: item).filter { !seen.contains(URL(fileURLWithPath: $0.path).standardizedFileURL.path) }
-        var results = resultRows(outcomes) + history.map { saved in
+        var results = outcomes + history.map { saved in
             TranscriptRow(id: "saved-\(saved.id)", title: modelTitle(saved.tag), status: "Saved",
                           output: URL(fileURLWithPath: saved.path), canReveal: true)
         }
@@ -403,8 +404,8 @@ struct RecordingInspector: View {
         return results
     }
 
-    private func outcomePaths(_ outcomes: [AppState.PassOutcome]) -> Set<String> {
-        Set(outcomes.filter { $0.output.map(isAvailable) == true }
+    private func availablePaths(_ rows: [TranscriptRow]) -> Set<String> {
+        Set(rows.lazy.filter(\.canReveal)
             .compactMap { $0.output?.standardizedFileURL.path })
     }
 
@@ -495,29 +496,29 @@ struct RecordingInspector: View {
                         .help("Start a new labeled paragraph at each speaker change.")
                 }
             }
-            if state.supportsDiarization {
-                Section("Recognition") {
+            Section("Recognition") {
+                if state.offersDeviceSelection {
                     Picker("Acceleration", selection: saved(\.device)) {
                         Text("Metal GPU").tag("metal")
                         Text("CPU").tag("cpu")
                     }
-                    Toggle("Diarize new recordings", isOn: saved(\.diarize))
-                    if state.diarize || state.items.contains(where: \.diarize) {
-                        LabeledContent("Diarization model") {
-                            VStack(alignment: .trailing, spacing: 5) {
-                                pathLabel(state.diarizationModelArgument)
-                                Button("Choose…") {
-                                    state.chooseDiarizationModel(state.diarizationModel) {
-                                        state.diarizationModel = $0
-                                        state.saveQueue()
-                                    }
+                }
+                Toggle("Diarize new recordings", isOn: saved(\.diarize))
+                if state.diarize || state.items.contains(where: \.diarize) {
+                    LabeledContent("Diarization model") {
+                        VStack(alignment: .trailing, spacing: 5) {
+                            pathLabel(state.diarizationModelArgument)
+                            Button("Choose…") {
+                                state.chooseDiarizationModel(state.diarizationModel) {
+                                    state.diarizationModel = $0
+                                    state.saveQueue()
                                 }
-                                .accessibilityLabel("Choose diarization model")
-                                if state.diarizationModelArgument != "sortformer" {
-                                    Button("Use Default") {
-                                        state.diarizationModel = URL(fileURLWithPath: "/sortformer")
-                                        state.saveQueue()
-                                    }
+                            }
+                            .accessibilityLabel("Choose diarization model")
+                            if state.diarizationModelArgument != "sortformer" {
+                                Button("Use Default") {
+                                    state.diarizationModel = URL(fileURLWithPath: "/sortformer")
+                                    state.saveQueue()
                                 }
                             }
                         }

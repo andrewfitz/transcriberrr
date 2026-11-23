@@ -3,6 +3,7 @@ mod bleed;
 mod merge;
 mod model_cache;
 mod serve;
+mod session;
 mod transcript;
 mod vad;
 use transcript::{
@@ -206,6 +207,8 @@ enum CliCommand {
     /// Merge transcripts of one session's per-speaker (iso) tracks into one transcript, each
     /// track labeled as its own speaker. Zoom participant files are named automatically.
     Merge(MergeArgs),
+    /// Recognize or reconcile a session of explicitly placed PCM tracks.
+    Session(session::SessionArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -453,8 +456,14 @@ fn transcripts_in(folder: &Path) -> Result<Vec<PathBuf>> {
 
 fn convert_transcript(args: ConvertArgs) -> Result<()> {
     let input = expand_home(&args.input);
-    let mut doc = read_transcript(&input)?;
-    apply_timestamps(&mut doc, args.timestamps)?;
+    let file = File::open(&input).with_context(|| format!("opening {}", input.display()))?;
+    let value: serde_json::Value = serde_json::from_reader(BufReader::new(file))
+        .with_context(|| format!("reading {}", input.display()))?;
+    let native = value
+        .get("version")
+        .is_some()
+        .then(|| session::NativeResult::parse(&value))
+        .transpose()?;
     let extension = match args.format {
         OutputFormat::Txt => "txt",
         OutputFormat::Json => "json",
@@ -471,16 +480,36 @@ fn convert_transcript(args: ConvertArgs) -> Result<()> {
     }
     // Written whole and then moved into place, so a failed write leaves the old file (which
     // may be the input itself) intact.
-    write_output(
-        &doc,
-        &output,
-        RenderOptions {
-            format: args.format,
-            timestamps: args.timestamps,
-            speaker_turns: args.speaker_turns,
-        },
-        args.overwrite,
-    )?;
+    if native.is_some() && matches!(args.format, OutputFormat::Json) {
+        transcript::publish_atomic(&output, args.overwrite, |writer| {
+            serde_json::to_writer_pretty(writer, &value).map_err(std::io::Error::from)
+        })?;
+    } else {
+        let mut doc = if let Some(native) = native {
+            let (doc, (offset, scale)) = native.projected_document(&input);
+            if offset < 0 && args.timestamps != TimestampGranularity::None {
+                eprintln!(
+                    "note: output cue zero corresponds to transcript clock time {offset}/{scale} seconds"
+                );
+            }
+            doc
+        } else {
+            serde_json::from_value::<TranscriptDocument>(value)
+                .with_context(|| format!("reading transcript {}", input.display()))?
+        };
+        doc.validate()?;
+        apply_timestamps(&mut doc, args.timestamps)?;
+        write_output(
+            &doc,
+            &output,
+            RenderOptions {
+                format: args.format,
+                timestamps: args.timestamps,
+                speaker_turns: args.speaker_turns,
+            },
+            args.overwrite,
+        )?;
+    }
     eprintln!("{} -> {}", input.display(), output.display());
     if args.json {
         write_json_line(&serde_json::json!({
@@ -490,13 +519,17 @@ fn convert_transcript(args: ConvertArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum EngineKind {
     #[value(name = "qwen3", alias = "qwen")]
+    #[serde(alias = "qwen")]
     Qwen3,
     #[value(name = "apple-native", alias = "apple")]
+    #[serde(alias = "apple")]
     AppleNative,
     #[value(name = "parakeet-v3", alias = "parakeet")]
+    #[serde(alias = "parakeet")]
     ParakeetV3,
 }
 
@@ -950,10 +983,26 @@ struct AlignedWord {
     end_time: f32,
 }
 
+impl AlignedWord {
+    fn on_chunk_timeline(mut self, samples: &std::ops::Range<usize>) -> Self {
+        // The aligner predicts quantized times and can overshoot a chunk. A prediction
+        // outside its audio must not push words in subsequent chunks forward.
+        let rate = TARGET_SAMPLE_RATE as f64;
+        let offset = samples.start as f64;
+        let position = |seconds: f32| {
+            ((offset + (f64::from(seconds) * rate).clamp(0.0, samples.len() as f64)) / rate) as f32
+        };
+        self.start_time = position(self.start_time);
+        self.end_time = position(self.end_time).max(self.start_time);
+        self
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if !matches!(cli.command, Some(CliCommand::Serve(_))) {
         install_cancel_handler();
+        install_parent_watchdog();
     }
     if cli.jsonl {
         write_json_line(&serde_json::json!({
@@ -1015,26 +1064,41 @@ fn print_capabilities() -> Result<()> {
             EngineKind::AppleNative => ("apple", true, "macos", &[][..]),
         };
         let native = matches!(engine, EngineKind::AppleNative);
+        // Rounded estimates from an offline 54-second, three-track Apple M4 Max fixture.
+        let realtime_factor = match engine {
+            EngineKind::Qwen3 => 1.3,
+            EngineKind::ParakeetV3 => 0.8,
+            EngineKind::AppleNative => 0.03,
+        };
         serde_json::json!({
             "name": engine_name(engine), "aliases": [alias], "included": included,
             "default_model": default_asr(engine), "model_source": model_source,
             "model_tag": model_tag(engine, default_asr(engine)), "devices": devices,
-            "diarization": !native && included && cfg!(feature = "diarization"),
+            "diarization": included && cfg!(feature = "diarization"),
             "realtime": serve::engine_capabilities(engine),
+            "diarization_speaker_limit": included.then(session::diarization_limit).flatten(),
+            "estimated_realtime_factor": included.then_some(realtime_factor),
             "minimum_macos": if native { "26.0" } else { "14.0" },
             "helper_present": native.then(|| apple_native_helper().is_some()),
+            "cache_revision": native.then(session::shared_cache::apple_revision).flatten(),
         })
     });
     write_json_line(&serde_json::json!({
         "schema_version": CLI_SCHEMA_VERSION, "version": env!("CARGO_PKG_VERSION"),
+        "cache_revision": session::shared_cache::provider_revision(),
         "platform": "macos-arm64", "engines": engines, "models": model_cache::SUPPORTED_MODELS,
+        "session_schema_version": session::VERSION,
+        "session": {"schema_version": session::VERSION, "speaker_limit": session::diarization_limit(),
+            "sample_rate": TARGET_SAMPLE_RATE, "bleed_policy": "independent", "language": "English"},
         "input_extensions": AUDIO_EXTENSIONS, "output_formats": ["json", "txt", "srt", "vtt"],
         "timestamps": ["words", "sentences", "none"],
         "automation": {
             "serve": ["serve"], "realtime_endpoint": "/v1/realtime?intent=transcription",
-            "plan": "--plan", "events": "--jsonl", "offline": "--offline", "manifest_stdin": ["--manifest", "-"],
+            "plan": "--plan", "zoom_iso_inventory": ["--plan", "--inventory-only", "--offline"],
+            "events": "--jsonl", "offline": "--offline", "manifest_stdin": ["--manifest", "-"],
             "cache_status": "--model-status", "check_model": "--cached-model", "model_tag": "--print-model-tag",
             "convert": ["convert", "--json"], "merge": ["merge", "--json"],
+            "session": ["session", "--manifest", "-", "--jsonl"],
         },
     }))
 }
@@ -1045,6 +1109,7 @@ fn run_command(mut cli: Cli) -> Result<()> {
         Some(CliCommand::Capabilities) => return print_capabilities(),
         Some(CliCommand::Convert(args)) => return convert_transcript(args),
         Some(CliCommand::Merge(args)) => return merge_transcripts(args),
+        Some(CliCommand::Session(args)) => return session::run(cli, args),
         None => {}
     }
     cli.output_dir = expand_home(&cli.output_dir);
@@ -1214,11 +1279,6 @@ impl RunRequirements {
     fn validate(&self, cli: &Cli) -> Result<()> {
         ensure_apple_silicon()?;
         if matches!(cli.engine, EngineKind::AppleNative) {
-            if self.diarization {
-                bail!(
-                    "Apple SpeechTranscriber does not provide diarization; use --engine qwen3 with --diarize"
-                );
-            }
             if apple_native_helper().is_none() {
                 bail!(
                     "Apple SpeechTranscriber helper is not bundled; set TRANSCRIBERRR_NATIVE or build the macOS app"
@@ -1270,6 +1330,7 @@ fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Val
                 serde_json::json!({
                     "id": id,
                     "cached": path.is_some(),
+                    "revision": path.as_deref().and_then(|path| session::shared_cache::revision(path).ok()),
                     "path": path.map(|path| path.display().to_string()),
                 })
             })
@@ -1356,9 +1417,58 @@ fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Val
     }
     check_cancelled()?;
     let requirements = RunRequirements::for_units(&cli, pending.iter());
-    requirements.validate(&cli)?;
+    with_inference_models(&cli, &requirements, &model_label, |mut models| {
+        let mut failures = rejected.len();
+        for unit in pending {
+            if cancel_requested() {
+                // Caught between units, so no job recorded it: the app shows unrun rows as
+                // canceled, rather than failed, only after a `canceled` event.
+                for job in unit.jobs() {
+                    progress.record(ProgressEvent {
+                        phase: Some("Canceled".to_owned()),
+                        ..ProgressEvent::new(input_key(&job.input), "canceled")
+                    })?;
+                }
+                break;
+            }
+            if unit_done(&cli, &progress, &unit) {
+                record_skipped(&cli, &mut progress, &unit)?;
+                continue;
+            }
+            match unit {
+                Unit::Single(job) => {
+                    run_job(
+                        &cli,
+                        &job,
+                        models.reborrow(),
+                        &mut progress,
+                        None,
+                        &mut failures,
+                    )?;
+                }
+                Unit::Session(session) => {
+                    run_session(&cli, &session, &mut models, &mut progress, &mut failures)?;
+                }
+            }
+        }
+        check_cancelled()?;
+        if failures > 0 {
+            bail!("{failures} input file(s) failed");
+        }
+        Ok(())
+    })
+}
+
+fn with_inference_models<T>(
+    cli: &Cli,
+    requirements: &RunRequirements,
+    model_label: &str,
+    run: impl FnOnce(InferenceModels<'_>) -> Result<T>,
+) -> Result<T> {
+    requirements.validate(cli)?;
+    let model_cache = model_cache::ModelCache::new(cli.model_cache.clone(), cli.offline);
     if cli.offline {
-        for (_, id) in requirements.models(&cli) {
+        for (_, id) in requirements.models(cli) {
             if model_cache.lookup(id).is_none() {
                 bail!(
                     "model {id:?} is not available locally (--offline); prefetch it with --download-model or supply a local model path"
@@ -1367,8 +1477,6 @@ fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Val
         }
     }
     audio_convert::remove_stale_temp_files();
-    // Resolved after the --resume early exit so an already-finished queue needs no model
-    // (and no network to fetch one).
     #[cfg(feature = "diarization")]
     let diarization_model_path = if requirements.diarization {
         let value = cli
@@ -1462,52 +1570,15 @@ fn run_cli(mut cli: Cli, plan: Option<Plan>, stream_pass: Option<serde_json::Val
     #[cfg(not(feature = "diarization"))]
     let mut diarizer: Option<Diarizer> = None;
 
-    JOBS_STARTED.store(true, Ordering::SeqCst);
-    let mut failures = rejected.len();
-    let mut models = InferenceModels {
+    let models = InferenceModels {
         asr: asr.as_ref(),
         aligner: aligner.as_ref(),
         parakeet: parakeet.as_mut(),
         diarizer: &mut diarizer,
-        model_label: &model_label,
+        model_label,
     };
-    for unit in pending {
-        if cancel_requested() {
-            // Caught between units, so no job recorded it: the app shows unrun rows as
-            // canceled, rather than failed, only after a `canceled` event.
-            for job in unit.jobs() {
-                progress.record(ProgressEvent {
-                    phase: Some("Canceled".to_owned()),
-                    ..ProgressEvent::new(input_key(&job.input), "canceled")
-                })?;
-            }
-            break;
-        }
-        if unit_done(&cli, &progress, &unit) {
-            record_skipped(&cli, &mut progress, &unit)?;
-            continue;
-        }
-        match unit {
-            Unit::Single(job) => {
-                run_job(
-                    &cli,
-                    &job,
-                    models.reborrow(),
-                    &mut progress,
-                    None,
-                    &mut failures,
-                )?;
-            }
-            Unit::Session(session) => {
-                run_session(&cli, &session, &mut models, &mut progress, &mut failures)?;
-            }
-        }
-    }
-    check_cancelled()?;
-    if failures > 0 {
-        bail!("{failures} input file(s) failed");
-    }
-    Ok(())
+    JOBS_STARTED.store(true, Ordering::SeqCst);
+    run(models)
 }
 
 /// Set by the first SIGTERM/SIGINT. The app cancels a run with SIGTERM; checking this at job
@@ -1543,6 +1614,24 @@ fn install_cancel_handler() {
     }
 }
 
+/// Parent polling must also run while a model load or an explicitly permitted model
+/// download is inside a library call that cannot report cancellation.
+fn install_parent_watchdog() {
+    let Some(pid) = launcher_pid() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        while unsafe { libc::getppid() } == pid {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        request_cancel(libc::SIGTERM);
+        // ASR and native-helper loops get time to terminate child processes and remove
+        // temporary output. A blocking dependency cannot hold the job indefinitely.
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        unsafe { libc::_exit(128 + libc::SIGTERM) };
+    });
+}
+
 fn cancel_requested() -> bool {
     CANCELLED.load(Ordering::SeqCst) || launcher_exited()
 }
@@ -1550,11 +1639,14 @@ fn cancel_requested() -> bool {
 /// The app sets TRANSCRIBERRR_PARENT_PID. If it crashes or is force-quit, the CLI is
 /// reparented and would keep the GPU busy, then die mid-write without recording the track.
 /// Opt-in, so `nohup transcriberrr … &` from a closed terminal keeps running.
-fn launcher_exited() -> bool {
+fn launcher_pid() -> Option<libc::pid_t> {
     std::env::var("TRANSCRIBERRR_PARENT_PID")
         .ok()
-        .and_then(|pid| pid.parse::<libc::pid_t>().ok())
-        .is_some_and(|pid| unsafe { libc::getppid() } != pid)
+        .and_then(|pid| pid.parse().ok())
+}
+
+fn launcher_exited() -> bool {
+    launcher_pid().is_some_and(|pid| unsafe { libc::getppid() } != pid)
 }
 
 fn check_cancelled() -> Result<()> {
@@ -1673,6 +1765,8 @@ struct Skip {
     reason: String,
     /// The inputs transcribed instead; if all of them fail before running, so does this.
     instead: Vec<PathBuf>,
+    /// Segment whose participant audio covers this recording.
+    covered_segment: Option<u32>,
 }
 
 /// Fail the files that would write the same output, and the rest of their sessions.
@@ -1838,21 +1932,37 @@ fn reject_missing_zoom_parts(
                     .or_default()
                     .push(recording);
             }
-        } else if let merge::TrackName::Zoom { meeting, .. } = name {
+        } else if let merge::TrackName::Zoom {
+            meeting, segment, ..
+        } = name
+        {
             missing_tracks
                 .entry(session_folder(path))
                 .or_default()
-                .insert(meeting);
+                .insert((meeting, segment));
         }
     }
     if missing_tracks.is_empty() && missing_recordings.is_empty() {
         return;
     }
+    let participant_meetings: HashSet<_> = units
+        .iter()
+        .filter_map(|unit| {
+            let Unit::Session(session) = unit else {
+                return None;
+            };
+            Some((
+                session_folder(&session.jobs[0].input),
+                session.zoom.clone()?,
+            ))
+        })
+        .collect();
     units.retain(|unit| {
-        let (folder, id, missing_segment) = match unit {
+        let (folder, id, standalone_segment, missing_segment) = match unit {
             Unit::Session(session) if session.zoom.is_some() => (
                 session_folder(&session.jobs[0].input),
                 session.zoom.clone(),
+                None,
                 false,
             ),
             Unit::Single(job) if job.zoom_recording => {
@@ -1862,19 +1972,32 @@ fn reject_missing_zoom_parts(
                     .filter_map(|path| zoom_media(path, &merge::parse_path(path)))
                     .collect::<Vec<_>>();
                 let id = parts.iter().find_map(|media| media.meeting.clone());
-                let missing_segment = missing_recordings.get(&folder).is_some_and(|missing| {
-                    missing.iter().any(|media| {
-                        (media.meeting.is_none() || id.is_none() || media.meeting == id)
-                            && !parts.iter().any(|part| part.segment == media.segment)
+                let standalone_segment = parts
+                    .first()
+                    .filter(|part| {
+                        part.numbered_segment
+                            && id.as_ref().is_some_and(|id| {
+                                participant_meetings.contains(&(folder.clone(), id.clone()))
+                            })
                     })
-                });
-                (folder, id, missing_segment)
+                    .map(|part| part.segment);
+                let missing_segment = standalone_segment.is_none()
+                    && missing_recordings.get(&folder).is_some_and(|missing| {
+                        missing.iter().any(|media| {
+                            (media.meeting.is_none() || id.is_none() || media.meeting == id)
+                                && !parts.iter().any(|part| part.segment == media.segment)
+                        })
+                    });
+                (folder, id, standalone_segment, missing_segment)
             }
             _ => return true,
         };
-        let missing_participant = missing_tracks
-            .get(&folder)
-            .is_some_and(|ids| id.is_none_or(|id| ids.contains(&id)));
+        let missing_participant = missing_tracks.get(&folder).is_some_and(|tracks| {
+            tracks.iter().any(|(meeting, segment)| {
+                id.as_ref().is_none_or(|id| id == meeting)
+                    && standalone_segment.is_none_or(|number| number == *segment)
+            })
+        });
         let reason = if missing_participant {
             "a selected participant track from this Zoom meeting is unavailable"
         } else if missing_segment {
@@ -1918,8 +2041,12 @@ fn queue_plan(
                 for (job, speaker) in session.jobs.iter().zip(&session.speakers) {
                     let path = input_key(&job.input);
                     meeting_members.insert(path.clone(), key.clone());
+                    let segment = match merge::parse_path(&job.input) {
+                        merge::TrackName::Zoom { segment, .. } => Some(segment),
+                        _ => None,
+                    };
                     files.push(serde_json::json!({
-                        "path": path, "meeting": key, "speaker": speaker, "iso": true, "done": done,
+                        "path": path, "meeting": key, "zoom_segment": segment, "speaker": speaker, "iso": true, "done": done,
                     }));
                 }
             }
@@ -1943,12 +2070,14 @@ fn queue_plan(
         }
     }
     for skip in skips {
-        let meeting = skip
-            .instead
-            .iter()
-            .find_map(|path| meeting_members.get(&input_key(path)));
+        let meeting = skip.covered_segment.and_then(|_| {
+            skip.instead
+                .iter()
+                .find_map(|path| meeting_members.get(&input_key(path)))
+        });
         files.push(serde_json::json!({
-            "path": input_key(&skip.job.input), "meeting": meeting, "skip": skip.reason,
+            "zoom_audio_copy_clock_verified": skip.job.zoom_audio_copy.is_some() && skip.covered_segment.is_some(),
+            "zoom_segment": skip.covered_segment, "path": input_key(&skip.job.input), "meeting": meeting, "skip": skip.reason,
             "zoom_recording": skip.job.zoom_recording,
             "covered_by": skip.instead.iter().map(|path| input_key(path)).collect::<Vec<_>>(),
         }));
@@ -2049,26 +2178,75 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<(Vec<Uni
     let mut skips: Vec<Skip> = Vec::new();
     let mut taken = vec![false; jobs.len()];
 
+    let has_videos = jobs.iter().any(|job| !job.iso && is_video(&job.input));
+    let has_audio_copies = jobs.iter().any(|job| job.zoom_audio_copy.is_some());
     let mut audio_by_stem: HashMap<_, Vec<_>> = HashMap::new();
     let mut audio_by_input = HashMap::new();
-    let mut iso_by_meeting: HashMap<_, Vec<_>> = HashMap::new();
+    let mut iso_by_meeting: HashMap<_, BTreeMap<_, Vec<_>>> = HashMap::new();
+    let mut known_segments: HashMap<_, HashSet<_>> = HashMap::new();
     let stem_key = |index: usize| folded_path(&input_key(&jobs[index].input.with_extension("")));
     for (index, job) in jobs.iter().enumerate() {
+        let folder = folders[index].as_path();
+        if let Some(recording) = &media[index]
+            && recording.numbered_segment
+            && let Some(id) = resolved_id(folder, recording.meeting.as_deref())
+        {
+            known_segments
+                .entry((folder.to_owned(), id))
+                .or_default()
+                .insert(recording.segment);
+        }
         if is_video(&job.input) {
             continue;
         }
-        audio_by_stem
-            .entry(stem_key(index))
-            .or_default()
-            .push(index);
-        audio_by_input.insert(input_key(&job.input), index);
-        if let merge::TrackName::Zoom { meeting, .. } = &names[index]
-            && job.iso
-        {
-            iso_by_meeting
-                .entry((folders[index].as_path(), meeting.clone()))
+        if has_videos {
+            audio_by_stem
+                .entry(stem_key(index))
                 .or_default()
                 .push(index);
+        }
+        if has_audio_copies {
+            audio_by_input.insert(input_key(&job.input), index);
+        }
+        if let merge::TrackName::Zoom {
+            meeting, segment, ..
+        } = &names[index]
+            && job.iso
+        {
+            let key = (folder.to_owned(), meeting.clone());
+            known_segments
+                .entry(key.clone())
+                .or_default()
+                .insert(*segment);
+            iso_by_meeting
+                .entry(key)
+                .or_default()
+                .entry(*segment)
+                .or_default()
+                .push(index);
+        }
+    }
+    for path in missing {
+        let folder = session_folder(path);
+        let name = merge::parse_path(path);
+        let clock = match &name {
+            merge::TrackName::Zoom {
+                meeting, segment, ..
+            } => Some((meeting.clone(), *segment)),
+            _ => zoom_media(path, &name).and_then(|recording| {
+                if !recording.numbered_segment {
+                    return None;
+                }
+                Some((
+                    resolved_id(&folder, recording.meeting.as_deref())?,
+                    recording.segment,
+                ))
+            }),
+        };
+        if let Some((id, segment)) = clock
+            && let Some(known) = known_segments.get_mut(&(folder, id))
+        {
+            known.insert(segment);
         }
     }
     let track_paths = |indices: &[usize]| {
@@ -2081,9 +2259,22 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<(Vec<Uni
         let iso = media[index].as_ref().and_then(|recording| {
             let folder = folders[index].as_path();
             let id = resolved_id(folder, recording.meeting.as_deref())?;
-            iso_by_meeting.get(&(folder, id))
+            let key = (folder.to_owned(), id);
+            let segment = if recording.numbered_segment {
+                recording.segment
+            } else {
+                let segments = known_segments.get(&key)?;
+                if segments.len() != 1 {
+                    return None;
+                }
+                *segments.iter().next()?
+            };
+            iso_by_meeting
+                .get(&key)?
+                .get(&segment)
+                .map(|tracks| (segment, tracks))
         });
-        let (reason, replacements) = if let Some(iso) = iso {
+        let (reason, replacements) = if let Some((_, iso)) = iso {
             let kind = if is_video(&job.input) {
                 "video"
             } else {
@@ -2116,6 +2307,7 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<(Vec<Uni
             job: job.clone(),
             reason,
             instead: track_paths(replacements),
+            covered_segment: iso.map(|(segment, _)| segment),
         });
     }
 
@@ -2153,12 +2345,18 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<(Vec<Uni
         taken[index] = true;
         let folder = folders[index].as_path();
         let id = resolved_id(folder, recording.meeting.as_deref());
-        let copy = recording
-            .legacy_copy
+        let has_participants = id
+            .as_ref()
+            .is_some_and(|id| iso_by_meeting.contains_key(&(folder.to_owned(), id.clone())));
+        // A mixed-only segment has its own zero-based clock and destination. Keep it
+        // independent of both the participant merge and any existing whole-meeting fallback.
+        let separate_segment =
+            (has_participants && recording.numbered_segment).then_some(recording.segment);
+        let copy = (recording.legacy_copy || has_participants && !recording.numbered_segment)
             .then(|| jobs[index].input.file_stem())
             .flatten();
         let segments = recordings
-            .entry((folder, id, copy))
+            .entry((folder, id, copy, separate_segment))
             .or_insert_with(BTreeMap::new);
         segments
             .entry(recording.segment)
@@ -2167,7 +2365,7 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<(Vec<Uni
     }
     let mut singles: Vec<usize> = Vec::new();
     let mut joined = HashMap::new();
-    for ((folder, id, copy), segments) in recordings {
+    for ((folder, id, copy, separate_segment), segments) in recordings {
         let mut parts = Vec::with_capacity(segments.len());
         let mut redundant = Vec::new();
         for mut candidates in segments.into_values() {
@@ -2207,13 +2405,15 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<(Vec<Uni
                     job: jobs[index].clone(),
                     reason: reason.clone(),
                     instead: vec![primary.input.clone()],
+                    covered_segment: None,
                 });
             }
         }
         let output =
             (primary.zoom_recording && primary.output.is_none() && copy.is_none()).then(|| {
-                let stable = fallback_output_path(cli, primary, folder, id.as_deref());
-                if stable.exists() {
+                let stable =
+                    fallback_output_path(cli, primary, folder, id.as_deref(), separate_segment);
+                if separate_segment.is_some() || stable.exists() {
                     return stable;
                 }
                 if id.is_some()
@@ -2223,7 +2423,7 @@ fn plan_units(cli: &Cli, jobs: Vec<Job>, missing: &[PathBuf]) -> Result<(Vec<Uni
                             .is_some_and(|item| item.meeting.is_none())
                     })
                 {
-                    let legacy = fallback_output_path(cli, primary, folder, None);
+                    let legacy = fallback_output_path(cli, primary, folder, None, None);
                     if legacy.is_file() {
                         return legacy;
                     }
@@ -2949,15 +3149,15 @@ fn transcribe_qwen_chunks(
                 text_parts.push(result.text);
             }
             // Offset by the chunk's exact starting sample; chunk lengths vary with the cut points.
-            let offset = range.start as f32 / TARGET_SAMPLE_RATE as f32;
             if let Some(value) = result.timestamps {
                 let envelope = serde_json::from_value::<TimestampEnvelope>(value)
                     .context("Qwen3 returned timestamps in an unexpected format")?;
-                aligned.extend(envelope.items.into_iter().map(|mut word| {
-                    word.start_time += offset;
-                    word.end_time += offset;
-                    word
-                }));
+                aligned.extend(
+                    envelope
+                        .items
+                        .into_iter()
+                        .map(|word| word.on_chunk_timeline(range)),
+                );
             }
             let progress = 0.2 + 0.52 * (index + 1) as f32 / total as f32;
             report(
@@ -3005,7 +3205,8 @@ fn chunk_ranges(samples: &[f32], chunk_samples: usize) -> Vec<std::ops::Range<us
             let mut quietest = (energy, first);
             for position in first + 1..=limit - window {
                 energy += samples[position + window - 1].abs() - samples[position - 1].abs();
-                if energy < quietest.0 {
+                // Prefer a longer chunk when a pause spans several equally quiet windows.
+                if energy <= quietest.0 {
                     quietest = (energy, position);
                 }
             }
@@ -3082,12 +3283,40 @@ fn process_one(
     {
         bail!("output exists (use --overwrite): {}", destination.display());
     }
-    if matches!(cli.engine, EngineKind::AppleNative) {
-        return process_apple_native(cli, job, gate, output, overwrite, report);
-    }
     let started = Instant::now();
-    report(0.05, "Decoding audio")?;
-    let mut audio = decode_job(job)?;
+    let (doc, warning) = if matches!(cli.engine, EngineKind::AppleNative) {
+        process_apple_native(cli, job, gate, models.diarizer, None, report)?
+    } else {
+        report(0.05, "Decoding audio")?;
+        let audio = decode_job(job)?;
+        transcribe_audio(cli, job, models, gate, audio, report)?
+    };
+    let words = gate.is_some().then(|| doc.clone());
+    if let Some(destination) = &output {
+        report(0.95, "Writing output")?;
+        write_job_output(cli, doc, destination, overwrite)?;
+        eprintln!(
+            "{} -> {} ({:.2}s)",
+            job.input.display(),
+            destination.display(),
+            started.elapsed().as_secs_f32()
+        );
+    }
+    Ok(Processed {
+        output,
+        warning,
+        words,
+    })
+}
+
+fn transcribe_audio(
+    cli: &Cli,
+    job: &Job,
+    models: InferenceModels<'_>,
+    gate: Option<&bleed::Mask>,
+    mut audio: Audio,
+    report: &mut dyn FnMut(f32, &str) -> Result<()>,
+) -> Result<(TranscriptDocument, Option<String>)> {
     if audio.samples.is_empty() {
         bail!(
             "audio file contains no decodable samples: {}",
@@ -3241,17 +3470,6 @@ fn process_one(
             merged_from: Vec::new(),
         },
     };
-    let words = gate.is_some().then(|| doc.clone());
-    if let Some(destination) = &output {
-        report(0.95, "Writing output")?;
-        write_job_output(cli, doc, destination, overwrite)?;
-        eprintln!(
-            "{} -> {} ({:.2}s)",
-            job.input.display(),
-            destination.display(),
-            started.elapsed().as_secs_f32()
-        );
-    }
     // The app shows this on the finished row; otherwise an empty transcript looks like success.
     let warning = [
         (!spoke).then(|| "No speech detected; the transcript is empty".to_owned()),
@@ -3260,39 +3478,52 @@ fn process_one(
     .into_iter()
     .flatten()
     .reduce(|first, second| format!("{first}; {second}"));
-    Ok(Processed {
-        output,
-        warning,
-        words,
-    })
+    Ok((doc, warning))
+}
+
+fn label_native_segments(segments: Vec<Segment>, spans: &[SpeakerSpan]) -> Vec<Segment> {
+    let lookup = SpeakerLookup::new(Some(spans));
+    segments
+        .into_iter()
+        .flat_map(|mut segment| {
+            if segment.words.is_empty() {
+                segment.speaker = lookup.at(segment.start, segment.end);
+                return vec![segment];
+            }
+            for word in &mut segment.words {
+                word.speaker = lookup.at(word.start, word.end);
+            }
+            build_segments(segment.words)
+        })
+        .collect()
 }
 
 fn process_apple_native(
     cli: &Cli,
     job: &Job,
     gate: Option<&bleed::Mask>,
-    output: Option<PathBuf>,
-    overwrite: bool,
+    diarizer: &mut Option<Diarizer>,
+    staged_pcm: Option<Audio>,
     report: &mut dyn FnMut(f32, &str) -> Result<()>,
-) -> Result<Processed> {
-    if job.diarize || job.speakers.is_some() {
-        bail!(
-            "Apple SpeechTranscriber does not provide diarization; use --engine qwen3 with --diarize"
-        );
-    }
+) -> Result<(TranscriptDocument, Option<String>)> {
     let helper = apple_native_helper().context(
         "Apple SpeechTranscriber helper is not bundled; set TRANSCRIBERRR_NATIVE or build the macOS app",
     )?;
     // Decode WebM and Ogg here for the helper. Normalize QTA too so every engine uses the same
     // playback-compatible track. Speaker tracks and split recordings also need a single WAV.
+    // Both models must see the same sample clock. Recorded sessions already
+    // supply a verified PCM WAV and its decoded samples.
+    let mut pcm = staged_pcm;
     let mut decode_warning = None;
-    let converted = if gate.is_some()
-        || !job.parts.is_empty()
-        || job.input.extension().is_some_and(|extension| {
-            ["webm", "ogg", "qta"]
-                .iter()
-                .any(|format| extension.eq_ignore_ascii_case(format))
-        }) {
+    let converted = if pcm.is_none()
+        && (job.diarize
+            || gate.is_some()
+            || !job.parts.is_empty()
+            || job.input.extension().is_some_and(|extension| {
+                ["webm", "ogg", "qta"]
+                    .iter()
+                    .any(|format| extension.eq_ignore_ascii_case(format))
+            })) {
         report(0.05, "Decoding audio")?;
         let mut audio = decode_job(job)?;
         if audio.samples.is_empty() {
@@ -3307,6 +3538,9 @@ fn process_apple_native(
         decode_warning = audio.warning.take();
         let wav = audio_convert::TempPath::create("wav")?;
         audio_convert::write_float_wav(wav.path(), &audio.samples, TARGET_SAMPLE_RATE)?;
+        if job.diarize {
+            pcm = Some(audio);
+        }
         Some(wav)
     } else {
         None
@@ -3385,6 +3619,22 @@ fn process_apple_native(
     doc.language = "English".to_owned();
     doc.metadata.transcribed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     doc.validate()?;
+    if job.diarize {
+        report(0.82, "Diarizing")?;
+        let audio = pcm
+            .as_ref()
+            .context("missing PCM for Apple word diarization")?;
+        let spans = run_diarization(diarizer, &audio.samples, job.speakers.unwrap_or(8))?;
+        let spans_ref = spans
+            .as_deref()
+            .context("Sortformer did not return speaker spans")?;
+        doc.segments = label_native_segments(doc.segments, spans_ref);
+        doc.metadata.diarization = Some(DiarizationMetadata {
+            enabled: true,
+            speakers: job.speakers,
+            detected_speakers: detected_speaker_count(&spans),
+        });
+    }
     if let Some(gate) = gate {
         let words = doc
             .segments
@@ -3403,18 +3653,8 @@ fn process_apple_native(
     .into_iter()
     .flatten()
     .reduce(|first, second| format!("{first}; {second}"));
-    let words = gate.is_some().then(|| doc.clone());
-    if let Some(destination) = &output {
-        report(0.95, "Writing output")?;
-        write_job_output(cli, doc, destination, overwrite)?;
-    } else {
-        check_cancelled()?;
-    }
-    Ok(Processed {
-        output,
-        warning,
-        words,
-    })
+    check_cancelled()?;
+    Ok((doc, warning))
 }
 
 fn write_job_output(
@@ -3437,9 +3677,15 @@ fn write_job_output(
 }
 
 fn apple_native_helper() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = |path: &PathBuf| {
+        path.metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    };
     if let Some(path) = std::env::var_os("TRANSCRIBERRR_NATIVE")
         .and_then(|path| std::path::absolute(path).ok())
-        .filter(|path| path.is_file())
+        .filter(executable)
     {
         return Some(path);
     }
@@ -3451,7 +3697,7 @@ fn apple_native_helper() -> Option<PathBuf> {
         directory.join("../../ui/.build/out/Products/Release/transcriberrr-native"),
         directory.join("../../ui/.build/release/transcriberrr-native"),
     ];
-    candidates.into_iter().find(|path| path.is_file())
+    candidates.into_iter().find(executable)
 }
 
 fn is_video(path: &Path) -> bool {
@@ -3480,6 +3726,7 @@ enum ZoomMediaKind {
 struct ZoomMedia {
     meeting: Option<String>,
     segment: u32,
+    numbered_segment: bool,
     kind: ZoomMediaKind,
     /// Legacy `audio_only01`-style exports remain separate recordings.
     legacy_copy: bool,
@@ -3532,6 +3779,7 @@ fn zoom_media_by_name(path: &Path, name: &merge::TrackName) -> Option<ZoomMedia>
         return Some(ZoomMedia {
             meeting: meeting.clone(),
             segment: *segment,
+            numbered_segment: meeting.is_some(),
             kind: if video {
                 ZoomMediaKind::Video
             } else {
@@ -3551,6 +3799,7 @@ fn zoom_media_by_name(path: &Path, name: &merge::TrackName) -> Option<ZoomMedia>
         return Some(ZoomMedia {
             meeting: None,
             segment: tail.parse().ok()?,
+            numbered_segment: true,
             kind: ZoomMediaKind::Video,
             legacy_copy: false,
         });
@@ -3573,6 +3822,7 @@ fn zoom_media_by_name(path: &Path, name: &merge::TrackName) -> Option<ZoomMedia>
     Some(ZoomMedia {
         meeting: Some(tail[tail.len() - 9..].to_owned()),
         segment,
+        numbered_segment: true,
         kind,
         legacy_copy: false,
     })
@@ -3593,7 +3843,7 @@ fn zoom_recording_id(path: &Path) -> Option<String> {
     zoom_media(path, &merge::parse_path(path)).and_then(|media| media.meeting)
 }
 
-fn input_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
+fn input_files(dir: &Path, recursive: bool, rejected: &mut Vec<(PathBuf, String)>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let walker = WalkDir::new(dir).max_depth(if recursive { usize::MAX } else { 1 });
     for entry in walker.into_iter().filter_entry(|entry| {
@@ -3626,7 +3876,10 @@ fn input_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
                 );
             }
             Ok(_) => {}
-            Err(error) => eprintln!("warning: skipping {error}"),
+            Err(error) => rejected.push((
+                error.path().unwrap_or(dir).to_path_buf(),
+                format!("scanning inputs: {error}"),
+            )),
         }
     }
     paths.sort();
@@ -3832,6 +4085,7 @@ fn collect_jobs(
     let mut opt_out = HashSet::new();
     let mut discover = true;
     let mut excluded = Vec::new();
+    let mut scan_errors = Vec::new();
     let mut add = |input: PathBuf, item: &ManifestItem, valid: bool| {
         let key = input_key(&input);
         if !known.insert(key.clone()) {
@@ -3913,7 +4167,7 @@ fn collect_jobs(
                 .output_dir
                 .map(|path| resolve_manifest_path(base, &path));
             if input.is_dir() && item.output.is_none() {
-                for path in input_files(&input, true) {
+                for path in input_files(&input, true, &mut scan_errors) {
                     add(path, &item, true);
                 }
             } else {
@@ -3929,7 +4183,7 @@ fn collect_jobs(
             let auto = matches!(cli.iso_tracks, IsoMode::Auto);
             fs::read_dir(&dir)
                 .with_context(|| format!("reading input directory {}", dir.display()))?;
-            for path in input_files(&dir, cli.recursive || auto) {
+            for path in input_files(&dir, cli.recursive || auto, &mut scan_errors) {
                 if cli.recursive
                     || path.parent() == Some(dir.as_path())
                     || (auto && zoom_candidate(&path).is_some())
@@ -3940,7 +4194,7 @@ fn collect_jobs(
         } else {
             for path in cli.inputs.iter().map(|path| expand_home(path)) {
                 if path.is_dir() {
-                    for file in input_files(&path, true) {
+                    for file in input_files(&path, true, &mut scan_errors) {
                         add(file, &settings, true);
                     }
                 } else {
@@ -3949,6 +4203,7 @@ fn collect_jobs(
             }
         }
     }
+    rejected.extend(scan_errors);
     if matches!(cli.iso_tracks, IsoMode::Auto) {
         known.extend(excluded);
         add_zoom_companions(&mut jobs, &mut known, &opt_out, discover, rejected);
@@ -4004,6 +4259,7 @@ fn decode_audio(path: &Path) -> Result<Audio> {
         // (afconvert ADTS AAC: "end of stream"; μ-law/A-law WAV: "malformed fmt chunk"). Core
         // Audio reads all of them (see audio_convert), so try it on any failure.
         Err(error) if path.is_file() => {
+            check_cancelled()?;
             let caf = without_panic(|| audio_convert::convert_with_core_audio(path))
                 .with_context(|| format!("{error:#}; the Core Audio fallback also failed"))?;
             without_panic(|| decode_with_symphonia(caf.path()))
@@ -4059,19 +4315,20 @@ struct Section {
 }
 
 impl Section {
-    fn flush(&mut self, output: &mut Vec<f32>) {
+    fn flush(&mut self, output: &mut Vec<f32>) -> Result<()> {
         let mut samples = std::mem::take(&mut self.samples);
         // Float WAV/CAF can hold NaN or infinity; one would spread through the resampler and
         // the bleed levels' filter state and silence everything after it.
         for sample in samples.iter_mut().filter(|sample| !sample.is_finite()) {
             *sample = 0.0;
         }
-        let samples = resample(samples, self.rate, TARGET_SAMPLE_RATE);
+        let samples = resample(samples, self.rate, TARGET_SAMPLE_RATE)?;
         if output.is_empty() {
             *output = samples;
         } else {
             output.extend(samples);
         }
+        Ok(())
     }
 }
 
@@ -4085,7 +4342,10 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
     let probed = get_probe().format(
         &hint,
         mss,
-        &FormatOptions::default(),
+        &FormatOptions {
+            enable_gapless: true,
+            ..Default::default()
+        },
         &MetadataOptions::default(),
     )?;
     let mut format = probed.format;
@@ -4119,6 +4379,9 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
             Err(SymphoniaError::IoError(error)) => return Err(error.into()),
             Err(error) => return Err(error.into()),
         };
+        if (decoded_packets + skipped_packets).is_multiple_of(256) {
+            check_cancelled()?;
+        }
         match decoder.decode(&packet) {
             Ok(buffer) => {
                 let rate = buffer.spec().rate;
@@ -4127,7 +4390,7 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
                 }
                 if rate != section.rate {
                     if !section.samples.is_empty() {
-                        section.flush(&mut output);
+                        section.flush(&mut output)?;
                     }
                     section.rate = rate;
                 }
@@ -4143,7 +4406,7 @@ fn decode_with_symphonia(path: &Path) -> Result<Audio> {
     if decoded_packets == 0 {
         bail!("audio stream has no decodable packets");
     }
-    section.flush(&mut output);
+    section.flush(&mut output)?;
     if output.is_empty() {
         bail!("audio stream has no decodable samples");
     }
@@ -4232,34 +4495,58 @@ const RESAMPLE_ZERO_CROSSINGS: f64 = 8.0;
 /// energy (sibilants, hiss) back into the 0–8 kHz speech band; the low-pass at the lower
 /// Nyquist frequency prevents that. Sample rates share a large divisor in practice
 /// (48 kHz → 16 kHz needs one phase, 44.1 kHz needs 160), so every kernel is precomputed.
-fn resample(input: Vec<f32>, source_rate: u32, target_rate: u32) -> Vec<f32> {
+fn resample(input: Vec<f32>, source_rate: u32, target_rate: u32) -> Result<Vec<f32>> {
     if input.is_empty() || source_rate == target_rate {
-        return input;
+        return Ok(input);
     }
     let divisor = gcd(source_rate, target_rate);
     let up = (target_rate / divisor) as usize;
     let down = (source_rate / divisor) as usize;
     let cutoff = (target_rate as f64 / source_rate as f64).min(1.0) * 0.95;
     let half = (RESAMPLE_ZERO_CROSSINGS / cutoff).ceil() as usize;
+    let weight_at = |distance: f64| {
+        let x = distance * cutoff;
+        let sinc = if x.abs() < 1e-9 {
+            1.0
+        } else {
+            (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+        };
+        let window = if distance.abs() >= half as f64 {
+            0.0
+        } else {
+            0.5 + 0.5 * (std::f64::consts::PI * distance / half as f64).cos()
+        };
+        sinc * window
+    };
+    let output_len = ((input.len() as f64 * up as f64 / down as f64).round() as usize).max(1);
+    // Unusual source rates can have thousands of phases and millions of taps per phase.
+    // For short clips or very large tables, evaluate only the weights that have input.
+    if output_len < up || up.saturating_mul(2 * half) > 1_048_576 {
+        return resample_blocks(output_len, |index| {
+            let position = index * down;
+            let base = position / up;
+            let frac = (position % up) as f64 / up as f64;
+            let first = (base + 1).saturating_sub(half);
+            let end = (base + half + 1).min(input.len());
+            let mut sum = 0.0;
+            let mut total = 0.0;
+            for (offset, sample) in input[first..end].iter().enumerate() {
+                let weight = weight_at((first + offset) as f64 - base as f64 - frac);
+                sum += f64::from(*sample) * weight;
+                total += weight;
+            }
+            if total.abs() > 1e-12 {
+                (sum / total) as f32
+            } else {
+                sum as f32
+            }
+        });
+    }
     let kernels: Vec<Vec<f32>> = (0..up)
         .map(|phase| {
             let frac = phase as f64 / up as f64;
             let weights: Vec<f64> = (0..2 * half)
-                .map(|tap| {
-                    let distance = tap as f64 + 1.0 - half as f64 - frac;
-                    let x = distance * cutoff;
-                    let sinc = if x.abs() < 1e-9 {
-                        1.0
-                    } else {
-                        (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
-                    };
-                    let window = if distance.abs() >= half as f64 {
-                        0.0
-                    } else {
-                        0.5 + 0.5 * (std::f64::consts::PI * distance / half as f64).cos()
-                    };
-                    sinc * window
-                })
+                .map(|tap| weight_at(tap as f64 + 1.0 - half as f64 - frac))
                 .collect();
             let total: f64 = weights.iter().sum();
             weights
@@ -4268,34 +4555,41 @@ fn resample(input: Vec<f32>, source_rate: u32, target_rate: u32) -> Vec<f32> {
                 .collect()
         })
         .collect();
-    let output_len = ((input.len() as f64 * up as f64 / down as f64).round() as usize).max(1);
-    (0..output_len)
-        .map(|index| {
-            let position = index * down;
-            let base = position / up;
-            let kernel = &kernels[position % up];
-            // Taps cover input[base + 1 - half ..= base + half]. Renormalize over the taps that
-            // fall inside the clip so the first and last few milliseconds are not attenuated.
-            let first = (base + 1).saturating_sub(half);
-            let skip = first + half - (base + 1);
-            let taps = input.get(first..).unwrap_or_default();
-            // Inside the clip every tap has a sample, and each kernel already sums to 1.
-            if skip == 0 && taps.len() >= kernel.len() {
-                return dot(&taps[..kernel.len()], kernel);
-            }
-            let (sum, weight) = taps
-                .iter()
-                .zip(&kernel[skip..])
-                .fold((0.0f32, 0.0f32), |(sum, total), (sample, weight)| {
-                    (sum + sample * weight, total + weight)
-                });
-            if weight.abs() > 1e-6 {
-                sum / weight
-            } else {
-                sum
-            }
-        })
-        .collect()
+    resample_blocks(output_len, |index| {
+        let position = index * down;
+        let base = position / up;
+        let kernel = &kernels[position % up];
+        // Taps cover input[base + 1 - half ..= base + half]. Renormalize over the taps that
+        // fall inside the clip so the first and last few milliseconds are not attenuated.
+        let first = (base + 1).saturating_sub(half);
+        let skip = first + half - (base + 1);
+        let taps = input.get(first..).unwrap_or_default();
+        // Inside the clip every tap has a sample, and each kernel already sums to 1.
+        if skip == 0 && taps.len() >= kernel.len() {
+            return dot(&taps[..kernel.len()], kernel);
+        }
+        let (sum, weight) = taps
+            .iter()
+            .zip(&kernel[skip..])
+            .fold((0.0f32, 0.0f32), |(sum, total), (sample, weight)| {
+                (sum + sample * weight, total + weight)
+            });
+        if weight.abs() > 1e-6 {
+            sum / weight
+        } else {
+            sum
+        }
+    })
+}
+
+/// Check for cancellation between output blocks, outside the per-sample filter.
+fn resample_blocks(len: usize, sample_at: impl Fn(usize) -> f32) -> Result<Vec<f32>> {
+    let mut samples = Vec::with_capacity(len);
+    for start in (0..len).step_by(4096) {
+        check_cancelled()?;
+        samples.extend((start..len.min(start + 4096)).map(&sample_at));
+    }
+    Ok(samples)
 }
 
 /// A dot product summed in eight lanes, which the compiler vectorizes; one running sum must
@@ -4378,47 +4672,40 @@ impl<'a> SpeakerLookup<'a> {
 /// keep whichever speakers Sortformer happened to number first and drop a main speaker.
 #[cfg_attr(not(feature = "diarization"), allow(dead_code))]
 fn limit_speakers(mut spans: Vec<SpeakerSpan>, max_speakers: usize) -> Vec<SpeakerSpan> {
-    let mut talk_time: HashMap<usize, u64> = HashMap::new();
-    for span in &spans {
-        *talk_time.entry(span.speaker_id).or_default() += span.end.saturating_sub(span.start);
+    // Track only per-speaker totals and first appearances, including the input position
+    // to preserve the diarizer's ordering when speakers start simultaneously.
+    let mut speakers = HashMap::new();
+    for (index, span) in spans.iter().enumerate() {
+        let first = (span.start, index);
+        let (duration, earliest) = speakers.entry(span.speaker_id).or_insert((0u64, first));
+        *duration += span.end.saturating_sub(span.start);
+        *earliest = (*earliest).min(first);
     }
-    if talk_time.len() > max_speakers {
-        let mut ranked = talk_time.into_iter().collect::<Vec<_>>();
-        ranked.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
-        let kept = ranked
-            .into_iter()
-            .take(max_speakers)
-            .map(|(speaker, _)| speaker)
-            .collect::<Vec<_>>();
-        spans.retain(|span| kept.contains(&span.speaker_id));
+    let mut ranked = speakers.into_iter().collect::<Vec<_>>();
+    if ranked.len() > max_speakers {
+        ranked.sort_unstable_by_key(|&(speaker, (duration, _))| {
+            (std::cmp::Reverse(duration), speaker)
+        });
+        ranked.truncate(max_speakers);
     }
-    // Number the speakers kept 0, 1, … by first appearance: transcripts label raw IDs, and
-    // "Speaker 0" and "Speaker 3" for two speakers reads as if some were lost.
-    let mut order = spans.clone();
-    order.sort_by_key(|span| span.start);
-    let mut ids: Vec<usize> = Vec::new();
-    for span in &order {
-        if !ids.contains(&span.speaker_id) {
-            ids.push(span.speaker_id);
+    ranked.sort_unstable_by_key(|&(_, (_, first))| first);
+    spans.retain_mut(|span| {
+        if let Some(id) = ranked.iter().position(|&(id, _)| id == span.speaker_id) {
+            span.speaker_id = id;
+            true
+        } else {
+            false
         }
-    }
-    for span in &mut spans {
-        span.speaker_id = ids
-            .iter()
-            .position(|&id| id == span.speaker_id)
-            .unwrap_or(span.speaker_id);
-    }
+    });
     spans
 }
 
 fn detected_speaker_count(segments: &Option<Vec<SpeakerSpan>>) -> Option<usize> {
     let segments = segments.as_ref()?;
-    let mut ids = segments
+    let ids = segments
         .iter()
         .map(|segment| segment.speaker_id)
-        .collect::<Vec<_>>();
-    ids.sort_unstable();
-    ids.dedup();
+        .collect::<HashSet<_>>();
     Some(ids.len())
 }
 
@@ -4525,7 +4812,13 @@ fn tagged_output(cli: &Cli, path: PathBuf) -> PathBuf {
     }
 }
 
-fn fallback_output_path(cli: &Cli, job: &Job, folder: &Path, meeting: Option<&str>) -> PathBuf {
+fn fallback_output_path(
+    cli: &Cli,
+    job: &Job,
+    folder: &Path,
+    meeting: Option<&str>,
+    segment: Option<u32>,
+) -> PathBuf {
     let name = folder.file_name().unwrap_or_default().to_string_lossy();
     let name = &name[..name.floor_char_boundary(200)];
     let extension = format_extension(cli.format);
@@ -4537,6 +4830,10 @@ fn fallback_output_path(cli: &Cli, job: &Job, folder: &Path, meeting: Option<&st
             let name = meeting.map_or_else(|| name.to_owned(), |id| format!("{name} [{id}]"));
             folder.join(format!("{name}.zoom.{extension}"))
         }
+    };
+    let path = match segment {
+        Some(number) => append_tag(&path, &format!("segment-{number}")),
+        None => path,
     };
     tagged_output(cli, path)
 }
@@ -4755,16 +5052,10 @@ fn is_audio_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 fn expand_home(path: &Path) -> PathBuf {
-    let raw = path.to_string_lossy();
-    if (raw == "~" || raw.starts_with("~/"))
-        && let Ok(home) = std::env::var("HOME")
-        && !home.trim().is_empty()
+    if let Ok(relative) = path.strip_prefix("~")
+        && let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty())
     {
-        return if raw == "~" {
-            PathBuf::from(home)
-        } else {
-            PathBuf::from(home).join(raw.trim_start_matches("~/"))
-        };
+        return PathBuf::from(home).join(relative);
     }
     path.to_path_buf()
 }
@@ -4782,6 +5073,25 @@ fn positive_f32(value: &str) -> std::result::Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aligned_word_stays_inside_its_source_chunk() {
+        let chunk = 16_001..32_003;
+        let sampled = |start_time, end_time| {
+            let word = AlignedWord {
+                text: "word".into(),
+                start_time,
+                end_time,
+            }
+            .on_chunk_timeline(&chunk);
+            (word.start_time, word.end_time)
+        };
+        let start = 16_001.0 / 16_000.0;
+        let end = 32_003.0 / 16_000.0;
+        assert_eq!(sampled(-1.0, 45.0), (start, end));
+        assert_eq!(sampled(4.0, 5.0), (end, end));
+        assert_eq!(sampled(0.5, 0.25), (start + 0.5, start + 0.5));
+    }
 
     #[test]
     fn model_name_is_path_free() {
@@ -4870,8 +5180,19 @@ mod tests {
 
     #[test]
     fn resampling_keeps_nonempty_short_audio() {
-        assert_eq!(resample(vec![0.5], 192_000, TARGET_SAMPLE_RATE), vec![0.5]);
-        assert!(resample(Vec::new(), 192_000, TARGET_SAMPLE_RATE).is_empty());
+        assert_eq!(
+            resample(vec![0.5], 192_000, TARGET_SAMPLE_RATE).unwrap(),
+            vec![0.5]
+        );
+        assert_eq!(
+            resample(vec![0.5; 3], u32::MAX, TARGET_SAMPLE_RATE).unwrap(),
+            vec![0.5]
+        );
+        assert!(
+            resample(Vec::new(), 192_000, TARGET_SAMPLE_RATE)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn tone(frequency: f32, rate: u32, seconds: f32) -> Vec<f32> {
@@ -4889,17 +5210,17 @@ mod tests {
         for rate in [44_100, 48_000] {
             // 12 kHz is above the 8 kHz output Nyquist; linear interpolation folds it to 4 kHz
             // at nearly full amplitude.
-            let alias = resample(tone(12_000.0, rate, 1.0), rate, TARGET_SAMPLE_RATE);
+            let alias = resample(tone(12_000.0, rate, 1.0), rate, TARGET_SAMPLE_RATE).unwrap();
             assert_eq!(alias.len(), TARGET_SAMPLE_RATE as usize);
             assert!(rms(&alias[800..15_200]) < 0.02, "{rate} Hz aliasing");
-            let speech = resample(tone(1_000.0, rate, 1.0), rate, TARGET_SAMPLE_RATE);
+            let speech = resample(tone(1_000.0, rate, 1.0), rate, TARGET_SAMPLE_RATE).unwrap();
             let level = rms(&speech[800..15_200]);
             assert!(
                 (level - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.02,
                 "{level}"
             );
         }
-        let upsampled = resample(vec![0.25; 800], 8_000, TARGET_SAMPLE_RATE);
+        let upsampled = resample(vec![0.25; 800], 8_000, TARGET_SAMPLE_RATE).unwrap();
         assert_eq!(upsampled.len(), 1_600);
         assert!(upsampled.iter().all(|sample| (sample - 0.25).abs() < 1e-3));
     }
@@ -4922,12 +5243,44 @@ mod tests {
         assert!(ranges.last().is_some_and(|range| range.len() >= rate));
     }
 
+    #[test]
+    fn uniform_audio_uses_the_latest_equally_quiet_cut() {
+        let rate = TARGET_SAMPLE_RATE as usize;
+        let samples = vec![0.0; 25 * rate];
+        let ranges = chunk_ranges(&samples, 10 * rate);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].end, 10 * rate - rate / 20);
+    }
+
     fn span(start_seconds: f32, end_seconds: f32, speaker_id: usize) -> SpeakerSpan {
         SpeakerSpan {
             start: (start_seconds * TARGET_SAMPLE_RATE as f32) as u64,
             end: (end_seconds * TARGET_SAMPLE_RATE as f32) as u64,
             speaker_id,
         }
+    }
+
+    #[test]
+    fn apple_word_labels_split_turns_and_preserve_native_text_and_times() {
+        let segments: Vec<Segment> = serde_json::from_value(serde_json::json!([{
+            "start": 0.1, "end": 1.8, "text": "Yes. We can.", "words": [
+                {"start": 0.1, "end": 0.45, "text": "Yes."},
+                {"start": 1.1, "end": 1.8, "text": " We can."}
+            ]
+        }, {"start":2.0,"end":2.5,"text":"Untimed cue","words":[]}]))
+        .unwrap();
+        let labeled = label_native_segments(segments, &[span(0.0, 0.5, 2), span(1.0, 3.0, 1)]);
+        assert_eq!(labeled.len(), 3);
+        assert_eq!(labeled[0].speaker, Some(2));
+        let word = &labeled[1].words[0];
+        assert_eq!(
+            (word.text.as_str(), word.start, word.end, word.speaker),
+            (" We can.", 1.1, 1.8, Some(1))
+        );
+        assert_eq!(
+            (labeled[2].text.as_deref(), labeled[2].speaker),
+            (Some("Untimed cue"), Some(1))
+        );
     }
 
     #[test]
@@ -4972,6 +5325,14 @@ mod tests {
         assert_eq!(all.len(), 4);
         let ids = all.iter().map(|span| span.speaker_id).collect::<Vec<_>>();
         assert_eq!(ids, vec![0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn speaker_ids_follow_start_time_with_input_order_breaking_ties() {
+        let spans = vec![span(1.0, 2.0, 3), span(0.0, 1.0, 7), span(0.0, 1.0, 3)];
+        let kept = limit_speakers(spans, 2);
+        let ids: Vec<_> = kept.iter().map(|span| span.speaker_id).collect();
+        assert_eq!(ids, [1, 0, 1]);
     }
 
     #[test]
@@ -5182,6 +5543,7 @@ mod tests {
             [
                 "audio1656027999.m4a + audio2656027999.m4a",
                 "C [Carl Grey] -> C.merged.json",
+                "audio2878787878.m4a",
                 "D [Dana Reyes, Hana] -> D.merged.json",
                 "talk.m4a",
                 "F [Alice, Alice, Bob, Bob] -> F.merged.json",
@@ -5209,7 +5571,6 @@ mod tests {
                 "audio1067067067.wav",
                 "audio1878787878.m4a",
                 "audio2656027999.m4a",
-                "audio2878787878.m4a",
                 "audio_only.m4a",
                 "shared_screen_with_speaker_view1067067067.mp4",
                 "talk.mp4",
@@ -5228,10 +5589,10 @@ mod tests {
             out.as_os_str(),
         ]);
         let progress = ProgressLog::open(None, false).unwrap();
-        let Unit::Single(memo) = &units[10] else {
+        let Unit::Single(memo) = &units[11] else {
             panic!("not a file")
         };
-        let Unit::Session(meeting) = &units[8] else {
+        let Unit::Session(meeting) = &units[9] else {
             panic!("not a session")
         };
         for job in [memo, &meeting.jobs[0]] {
@@ -5239,11 +5600,11 @@ mod tests {
             fs::create_dir_all(output.parent().unwrap()).unwrap();
             fs::write(output, "{}").unwrap();
         }
-        assert!(unit_done(&rerun, &progress, &units[10]));
-        assert!(!unit_done(&rerun, &progress, &units[8]));
+        assert!(unit_done(&rerun, &progress, &units[11]));
+        assert!(!unit_done(&rerun, &progress, &units[9]));
         assert!(may_replace(&rerun, Some(&bleed::Mask::default()), false));
         assert!(!may_replace(&rerun, None, false));
-        let Unit::Session(restarted) = &units[4] else {
+        let Unit::Session(restarted) = &units[5] else {
             panic!("not a session")
         };
         // Alice's files 1 and 3, then Bob's 2 and 4: the second segment starts where the
@@ -5549,6 +5910,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mp3_decoding_trims_encoder_delay_and_padding() {
+        let Ok(ffmpeg) = which_ffmpeg() else {
+            return;
+        };
+        let source = audio_convert::TempPath::new("wav");
+        audio_convert::write_float_wav(source.path(), &tone(440.0, 48_000, 1.0), 48_000).unwrap();
+        let encoded = audio_convert::TempPath::new("mp3");
+        let status = Command::new(ffmpeg)
+            .args(["-loglevel", "error", "-y", "-i"])
+            .arg(source.path())
+            .args(["-c:a", "libmp3lame"])
+            .arg(encoded.path())
+            .status()
+            .unwrap();
+        if status.success() {
+            let audio = decode_with_symphonia(encoded.path()).unwrap();
+            assert_eq!(audio.samples.len(), TARGET_SAMPLE_RATE as usize);
+        }
+    }
+
     fn which_ffmpeg() -> std::result::Result<PathBuf, ()> {
         ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
             .into_iter()
@@ -5650,6 +6032,29 @@ mod tests {
         let audio = decode_audio(video.path()).unwrap();
         assert!((audio.duration_seconds - 1.0).abs() < 0.1);
         assert!(rms(&audio.samples) > 0.3);
+    }
+
+    #[test]
+    fn directory_scan_reports_unreadable_root() {
+        let absent = audio_convert::TempPath::new("missing-dir");
+        let mut rejected = Vec::new();
+        assert!(input_files(absent.path(), true, &mut rejected).is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].0, absent.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_expansion_preserves_path_components_and_native_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let path = Path::new(OsStr::from_bytes(b"~//~/track-\xff.wav"));
+        let expected = PathBuf::from(home).join(OsStr::from_bytes(b"~/track-\xff.wav"));
+        assert_eq!(expand_home(path), expected);
     }
 
     #[test]

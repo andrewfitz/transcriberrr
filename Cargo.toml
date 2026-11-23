@@ -10,13 +10,16 @@ license = "MIT"
 default = []
 ## Enable the Parakeet Unified Burn/Metal backend. Diarization reuses the same crate but remains
 ## independently optional for users who only need the ASR engine.
-parakeet = ["dep:parakeet-rs"]
+parakeet = ["dep:parakeet-rs", "dep:ndarray", "dep:realfft"]
 diarization = ["parakeet", "parakeet-rs/sortformer"]
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 futures-util = { version = "0.3", features = ["sink"] }
+## The realtime listener's header-read timeout (already in the dependency tree through axum).
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 rubato = "0.16.2"
 subtle = "2.6"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -36,9 +39,17 @@ candle-core = { version = "0.9", features = ["metal"] }
 ## every frame of a 40-run speech/noise battery; a new release could swap the weights.
 rustvani-vad = "=0.1.0"
 ring = "0.17"
-parakeet-rs = { version = "0.4.1", optional = true, default-features = false, features = ["burn", "metal"] }
+## Pinned: each release generates its Burn graphs from specific ONNX exports. Bump it together
+## with PARAKEET_RS_REVISION in src/model_cache.rs, then run examples/parakeet_parity.rs.
+parakeet-rs = { version = "=0.4.4", optional = true, default-features = false, features = ["burn", "metal"] }
+## The live Parakeet stream (src/serve/parakeet_stream.rs) builds feature and encoder tensors for
+## parakeet-rs's public model API. Keep both at the versions parakeet-rs itself uses.
+ndarray = { version = "0.17", optional = true }
+realfft = { version = "3", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+## Inspect MP4 presentation edits when matching a renamed Zoom video to its mixed AAC track.
+mp4-atom = "0.17.1"
 symphonia = { version = "0.5", features = ["aac", "aiff", "caf", "flac", "isomp4", "mkv", "mp3", "ogg", "vorbis", "wav"] }
 walkdir = "2.5"
 

@@ -21,13 +21,18 @@ struct ServerOptions {
     let alignWords: Bool
 }
 
-@MainActor
+/// Keychain calls can block, for example while macOS asks whether to allow access.
+/// They run one at a time on their own queue instead of the main actor.
 private enum ServerKeychain {
-    private static let identity: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "com.transcriberrr.realtime-server",
-        kSecAttrAccount as String: "api-key"
-    ]
+    private static let queue = DispatchQueue(label: "com.transcriberrr.server-keychain")
+
+    private static var identity: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.transcriberrr.realtime-server",
+            kSecAttrAccount as String: "api-key"
+        ]
+    }
 
     struct Failure: LocalizedError {
         let status: OSStatus
@@ -37,7 +42,25 @@ private enum ServerKeychain {
         }
     }
 
-    static func read() throws -> String {
+    static func read() async throws -> String {
+        try await perform { try readNow() }
+    }
+
+    /// Stores the key unless it is already stored. A failed read stores nothing, so
+    /// a key that could not be read is never replaced.
+    static func save(_ key: String) async throws {
+        try await perform {
+            if try readNow() != key { try storeNow(key) }
+        }
+    }
+
+    private static func perform<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { continuation.resume(with: Result { try body() }) }
+        }
+    }
+
+    private static func readNow() throws -> String {
         var query = identity
         query[kSecReturnData as String] = true
         var result: CFTypeRef?
@@ -50,7 +73,7 @@ private enum ServerKeychain {
         return key
     }
 
-    static func store(_ key: String) throws {
+    private static func storeNow(_ key: String) throws {
         if key.isEmpty {
             let status = SecItemDelete(identity as CFDictionary)
             guard status == errSecSuccess || status == errSecItemNotFound else {
@@ -105,10 +128,12 @@ final class RealtimeServer: ObservableObject {
     private var input: FileHandle?
     private var outputBuffer = Data()
     private var shutdownTask: Task<Void, Never>?
+    // Saving the key to Keychain before the process launches.
+    private var launchTask: Task<Void, Never>?
 
     func start(cliURL: URL?, nativeURL: URL?, bind: String, portText: String, engine: ServerEngine, model: String,
                offline: Bool, apiKey: String, options: ServerOptions) {
-        guard process == nil else { return }
+        guard process == nil, launchTask == nil else { return }
         errorMessage = nil
         address = nil
         endpoint = nil
@@ -151,21 +176,34 @@ final class RealtimeServer: ObservableObject {
         }
         guard let cliURL else { return fail("Couldn’t find the Transcriberrr CLI.") }
 
-        do {
-            if try ServerKeychain.read() != apiKey { try ServerKeychain.store(apiKey) }
-        } catch {
-            return fail(error.localizedDescription)
-        }
-
-        let process = Process()
-        process.executableURL = cliURL
         var arguments = ["serve", "--bind", bind, "--port", String(port), "--engine", engine.rawValue, "--exit-on-stdin-eof"]
         arguments += ["--max-sessions", String(maxSessions), "--max-tracks", String(maxTracks)]
         arguments += options.originList.split { $0.isWhitespace || $0 == "," }.map { "--allow-origin=\($0)" }
-        if !model.isEmpty, engine != .apple { arguments += ["--model", model] }
+        if !model.isEmpty, engine != .apple { arguments.append("--model=\(model)") }
         if offline { arguments.append("--offline") }
         if options.diarize { arguments += ["--diarization-model", "sortformer"] }
         if options.alignWords, engine == .qwen { arguments += ["--forced-aligner", "forced-aligner"] }
+
+        // Active from here, so a second Start cannot launch another process and Stop
+        // can cancel the launch.
+        phase = .starting
+        launchTask = Task { [weak self] in
+            do {
+                try await ServerKeychain.save(apiKey)
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                self.launchTask = nil
+                return self.fail(error.localizedDescription)
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.launchTask = nil
+            self.launch(cliURL: cliURL, nativeURL: nativeURL, arguments: arguments, apiKey: apiKey)
+        }
+    }
+
+    private func launch(cliURL: URL, nativeURL: URL?, arguments: [String], apiKey: String) {
+        let process = Process()
+        process.executableURL = cliURL
         process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment["TRANSCRIBERRR_API_KEY"] = apiKey.isEmpty ? nil : apiKey
@@ -211,6 +249,13 @@ final class RealtimeServer: ObservableObject {
     }
 
     func stop() {
+        if let launchTask {
+            // Still saving the key. No process has been launched.
+            launchTask.cancel()
+            self.launchTask = nil
+            phase = .stopped
+            return
+        }
         guard let process, shutdownTask == nil else { return }
         phase = .draining
         // EOF follows the same bounded drain as a signal. The app also releases this
@@ -270,7 +315,7 @@ final class RealtimeServer: ObservableObject {
             let reported = events.split(whereSeparator: \.isNewline).reversed().lazy.compactMap { line in
                 try? JSONDecoder().decode(Event.self, from: Data(line.utf8))
             }.first { $0.event == "error" }?.message
-            let lastError = detail.split(whereSeparator: \.isNewline).last.map(String.init)
+            let lastError = Self.lastLines(of: redact(detail, key: apiKey))
             let fallback: String
             if wasStopping {
                 fallback = "The server stopped before finishing its shutdown."
@@ -279,9 +324,20 @@ final class RealtimeServer: ObservableObject {
             } else {
                 fallback = "The server exited (status \(process.terminationStatus))."
             }
-            fail(reported.map { redact($0, key: apiKey) } ?? errorMessage
-                 ?? lastError.map { redact($0, key: apiKey) } ?? fallback)
+            fail(reported.map { redact($0, key: apiKey) } ?? errorMessage ?? lastError ?? fallback)
         }
+    }
+
+    /// The last few non-empty lines of the server's standard error. A single last
+    /// line is often only a hint, such as clap's "For more information, try '--help'."
+    private static func lastLines(of text: String, count: Int = 4, limit: Int = 1_000) -> String? {
+        let lines = text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .suffix(count)
+        guard !lines.isEmpty else { return nil }
+        let joined = lines.joined(separator: "\n")
+        return joined.count > limit ? "…" + joined.suffix(limit - 1) : joined
     }
 
     private func fail(_ message: String) {
@@ -344,7 +400,11 @@ struct ServerPanel: View {
     @State private var health: Health?
     @State private var apiKey = ""
     @State private var keyError: String?
-    @State private var loadedKey = false
+    @State private var needsInitialKey = true
+    @State private var keyLoadFailed = false
+    // Until the first read finishes, the field is empty because nothing has loaded.
+    @State private var keyLoading = true
+    @State private var keyRead = 0
 
     private var model: Binding<String> { engine == .qwen ? $qwenModel : $parakeetModel }
     private var displayedKey: Binding<String> {
@@ -439,17 +499,20 @@ struct ServerPanel: View {
                         .disabled(server.phase == .draining)
                 } else {
                     Button("Start Server") {
-                        keyError = nil
-                        state.startRealtimeServer(
-                            bind: bind, port: port, engine: engine,
-                            model: model.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                            offline: offline, apiKey: apiKey,
-                            options: ServerOptions(maxSessions: maxSessions, maxTracks: maxTracks,
-                                                   originList: originList, diarize: diarize, alignWords: alignWords)
-                        )
+                        // The field is empty because the stored key could not be read.
+                        // Starting now would replace that key with no key.
+                        if keyLoadFailed && apiKey.isEmpty {
+                            Task {
+                                await loadKey()
+                                if !keyLoadFailed { startServer() }
+                            }
+                            return
+                        }
+                        startServer()
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!state.canStartRealtimeServer)
+                    // While the stored key loads, the field is empty for the same reason.
+                    .disabled(!state.canStartRealtimeServer || keyLoading)
                 }
             }
         }
@@ -459,13 +522,30 @@ struct ServerPanel: View {
             await pollHealth(server.healthURL)
         }
         .onAppear {
-            guard !loadedKey else { return }
-            loadedKey = true
-            if !server.phase.isActive { loadKey() }
+            loadInitialKeyIfIdle()
         }
         .onChange(of: server.phase.isActive) { _, active in
-            if !active { loadKey() }
+            if !active { loadInitialKeyIfIdle() }
         }
+    }
+
+    private func loadInitialKeyIfIdle() {
+        // A sheet opened while the server runs displays its active key. Read the
+        // stored key when it stops. Preserve edits across failed or canceled starts.
+        guard needsInitialKey, !server.phase.isActive else { return }
+        needsInitialKey = false
+        Task { await loadKey() }
+    }
+
+    private func startServer() {
+        keyError = nil
+        state.startRealtimeServer(
+            bind: bind, port: port, engine: engine,
+            model: model.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            offline: offline, apiKey: apiKey,
+            options: ServerOptions(maxSessions: maxSessions, maxTracks: maxTracks,
+                                   originList: originList, diarize: diarize, alignWords: alignWords)
+        )
     }
 
     private var advancedOptions: some View {
@@ -530,12 +610,30 @@ struct ServerPanel: View {
         NSPasteboard.general.setString(text, forType: .string)
     }
 
-    private func loadKey() {
+    /// Reads the stored key off the main thread.
+    private func loadKey() async {
+        keyRead += 1
+        let read = keyRead
+        let shown = apiKey
+        keyLoading = true
+        let result: Result<String, any Error>
         do {
-            apiKey = try ServerKeychain.read()
-            keyError = nil
+            result = .success(try await ServerKeychain.read())
         } catch {
+            result = .failure(error)
+        }
+        // A newer read owns the outcome.
+        guard read == keyRead else { return }
+        keyLoading = false
+        switch result {
+        case .success(let key):
+            // Keep a key typed or generated while the read ran.
+            if apiKey == shown { apiKey = key }
+            keyError = nil
+            keyLoadFailed = false
+        case .failure(let error):
             keyError = error.localizedDescription
+            keyLoadFailed = true
         }
     }
 }

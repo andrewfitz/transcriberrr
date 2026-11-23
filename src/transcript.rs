@@ -68,6 +68,9 @@ pub(crate) struct MergedTrack {
     /// Seconds added to the track's timings (where the track's segment of a restarted Zoom
     /// recording starts).
     pub(crate) offset_seconds: f32,
+    /// Length of this source part on the same clock, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) duration_seconds: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +102,9 @@ impl TranscriptDocument {
 
     pub(crate) fn collapse_words(&mut self) {
         for segment in &mut self.segments {
-            segment.text = Some(segment.content());
+            if segment.text.is_none() {
+                segment.text = Some(segment.content());
+            }
             segment.words.clear();
         }
     }
@@ -112,6 +117,12 @@ impl TranscriptDocument {
             Ok(())
         }
         timing(0.0, self.duration_seconds)?;
+        for track in &self.metadata.merged_from {
+            timing(0.0, track.offset_seconds)?;
+            if let Some(duration) = track.duration_seconds {
+                timing(0.0, duration)?;
+            }
+        }
         for segment in &self.segments {
             timing(segment.start, segment.end)?;
             if segment.text.is_some() == !segment.words.is_empty() {
@@ -200,9 +211,9 @@ pub(crate) fn preserve_word_text(text: &str, words: &mut [Word]) -> Result<()> {
     let mut spans = Vec::with_capacity(words.len());
     for word in words.iter() {
         let token = word.text.trim();
-        let letters: Vec<char> = token.chars().filter(|&c| is_word_char(c)).collect();
+        let mut letters = token.chars().filter(|&c| is_word_char(c)).peekable();
         let mut start = None;
-        if letters.is_empty() {
+        if letters.peek().is_none() {
             if token.is_empty() {
                 bail!("empty aligned word");
             }
@@ -283,14 +294,13 @@ pub(crate) fn normalize_word_timing(words: &mut [Word], duration: f32) {
     for word in words {
         // The aligner can stretch a word's start back across a long pause (one word spanned
         // 18 s in noisy audio). No spoken word is that long; keep the end, which was right.
-        if word.start.is_finite()
-            && word.end.is_finite()
-            && word.end - word.start > MAX_WORD_SECONDS
-        {
-            word.start = word.end - MAX_WORD_SECONDS;
-        }
         word.start = clamp(word.start, previous_start);
         word.end = clamp(word.end, word.start);
+        // Limit the audible interval. Padding beyond the audio must not push a valid
+        // final word's start all the way to the end of the recording.
+        if word.end - word.start > MAX_WORD_SECONDS {
+            word.start = word.end - MAX_WORD_SECONDS;
+        }
         previous_start = word.start;
     }
 }
@@ -345,6 +355,16 @@ pub(crate) fn write_output(
     overwrite: bool,
 ) -> Result<()> {
     doc.validate()?;
+    publish_atomic(path, overwrite, |writer| {
+        render_output_to(writer, doc, options)
+    })
+}
+
+pub(crate) fn publish_atomic(
+    path: &Path,
+    overwrite: bool,
+    write: impl FnOnce(&mut BufWriter<std::fs::File>) -> io::Result<()>,
+) -> Result<()> {
     let Some(destination_name) = path.file_name() else {
         bail!("output path has no file name: {}", path.display());
     };
@@ -401,7 +421,7 @@ pub(crate) fn write_output(
         }
     };
     let mut writer = BufWriter::new(file);
-    let result = render_output_to(&mut writer, doc, options).and_then(|()| writer.flush());
+    let result = write(&mut writer).and_then(|()| writer.flush());
     drop(writer);
     let result = result.and_then(|()| {
         if overwrite {
@@ -515,14 +535,15 @@ fn render_output_to(
                 text.split_whitespace().collect::<Vec<_>>().join(" ")
             ),
             OutputFormat::Srt | OutputFormat::Vtt => {
+                let (start_ms, end_ms) = subtitle_interval(start, end);
                 if !vtt {
                     writeln!(output, "{index}")?;
                 }
                 writeln!(
                     output,
                     "{} --> {}\n{}\n",
-                    timestamp(start, vtt),
-                    timestamp(end, vtt),
+                    timestamp_millis(start_ms, vtt),
+                    timestamp_millis(end_ms, vtt),
                     cue_text(&format!("{speaker}{text}"), vtt)
                 )
             }
@@ -590,7 +611,19 @@ fn speaker_turn_text(doc: &TranscriptDocument) -> String {
 }
 
 fn timestamp(seconds: f32, vtt: bool) -> String {
-    let total_ms = (seconds.max(0.0) * 1000.0).round() as u64;
+    timestamp_millis(milliseconds(seconds), vtt)
+}
+
+fn milliseconds(seconds: f32) -> u64 {
+    (f64::from(seconds.max(0.0)) * 1000.0).round() as u64
+}
+
+fn subtitle_interval(start: f32, end: f32) -> (u64, u64) {
+    let start = milliseconds(start).min(u64::MAX - 1);
+    (start, milliseconds(end).max(start + 1))
+}
+
+fn timestamp_millis(total_ms: u64, vtt: bool) -> String {
     let hours = total_ms / 3_600_000;
     let minutes = (total_ms % 3_600_000) / 60_000;
     let secs = (total_ms % 60_000) / 1000;
@@ -701,6 +734,15 @@ mod tests {
         normalize_word_timing(&mut words, 60.0);
         assert!((words[0].start - 44.02).abs() < 1e-3 && words[0].end == 45.22);
         assert!(words[1].start >= words[0].start);
+    }
+
+    #[test]
+    fn padded_word_end_preserves_audible_final_word() {
+        let mut words = words(&["end"]);
+        words[0].start = 9.5;
+        words[0].end = 15.0;
+        normalize_word_timing(&mut words, 10.0);
+        assert_eq!((words[0].start, words[0].end), (9.5, 10.0));
     }
 
     #[test]
@@ -859,6 +901,13 @@ mod tests {
             segments.iter().map(Segment::content).collect::<Vec<_>>(),
             vec!["It's 3.45pm.", " Next"]
         );
+    }
+
+    #[test]
+    fn subtitle_intervals_survive_millisecond_rounding() {
+        assert_eq!(subtitle_interval(1.0001, 1.0002), (1000, 1001));
+        assert_eq!(subtitle_interval(5.0, 5.0), (5000, 5001));
+        assert_eq!(timestamp(18_000.021, true), "05:00:00.021");
     }
 
     #[test]

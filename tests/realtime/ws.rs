@@ -280,6 +280,7 @@ impl FakeStream {
                 text: self.text.clone(),
                 start_sample: 0,
                 end_sample: 320,
+                spoken: None,
             })
             .into_iter()
             .collect();
@@ -985,4 +986,435 @@ async fn native_resume_preempts_stalled_input_and_recovers_from_server_cursor() 
         }
     }
     assert_eq!(finals, 1);
+}
+
+#[tokio::test]
+async fn standard_short_appends_survive_a_stalled_worker_through_commit() {
+    let server = TestServer::start(1, 1).await;
+    let mut socket = server.socket(false).await;
+    event(&mut socket, "session.created").await;
+    send(&mut socket, settings("gpt-live-transcribe")).await;
+    event(&mut socket, "session.updated").await;
+    append(&mut socket, 12000, 12000).await;
+    let partial = event(&mut socket, DELTA).await;
+
+    let (started, release) = server.blockade.arm();
+    append(&mut socket, 24000, 2400).await;
+    timeout(WAIT, started).await.unwrap().unwrap();
+    // 0.8 s of audio in 20 ms packets: more messages than the queue admits
+    // per track, but well inside its two seconds of audio.
+    for _ in 0..40 {
+        append(&mut socket, 12000, 480).await;
+    }
+    assert_eq!(commit(&mut socket).await["item_id"], partial["item_id"]);
+    drop(release);
+    let completion = event(&mut socket, COMPLETED).await;
+    assert_eq!(completion["item_id"], partial["item_id"]);
+    assert_eq!(completion["transcript"], "positive");
+    assert_eq!(completion["usage"]["seconds"], 33_600.0 / 24_000.0);
+}
+
+#[tokio::test]
+async fn standard_append_over_the_queue_limit_is_rejected_without_failing_the_turn() {
+    let server = TestServer::start(1, 1).await;
+    let mut socket = server.socket(false).await;
+    event(&mut socket, "session.created").await;
+    send(&mut socket, settings("gpt-live-transcribe")).await;
+    event(&mut socket, "session.updated").await;
+    append(&mut socket, 12000, 48_001).await;
+    let rejected = event(&mut socket, "error").await;
+    assert_eq!(rejected["error"]["param"], "audio");
+
+    append(&mut socket, 12000, 48_000).await;
+    let partial = event(&mut socket, DELTA).await;
+    assert_eq!(commit(&mut socket).await["item_id"], partial["item_id"]);
+    let completion = event(&mut socket, COMPLETED).await;
+    assert_eq!(completion["transcript"], "positive");
+    assert_eq!(completion["usage"]["seconds"], 2.0);
+}
+
+#[tokio::test]
+async fn standard_replies_to_a_pipelined_burst_reach_a_reading_client() {
+    let server = TestServer::start(1, 1).await;
+    let mut socket = server.socket(false).await;
+    event(&mut socket, "session.created").await;
+    let clear = json!({"type":"input_audio_buffer.clear"}).to_string();
+    for _ in 0..500 {
+        socket
+            .feed(Message::Text(clear.clone().into()))
+            .await
+            .unwrap();
+    }
+    socket.flush().await.unwrap();
+    for _ in 0..500 {
+        event(&mut socket, "input_audio_buffer.cleared").await;
+    }
+}
+
+#[tokio::test]
+async fn standard_socket_pings_and_drops_a_peer_that_stops_answering() {
+    let server = TestServer::start(1, 1).await;
+    let app = server._app_tx.borrow().clone().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let route = axum::routing::get(move |ws: axum::extract::WebSocketUpgrade| async move {
+        ws.on_upgrade(move |socket| {
+            super::openai::run_with_liveness(
+                socket,
+                app,
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            )
+        })
+    });
+    let task = tokio::spawn(async move {
+        serve(listener, axum::Router::new().route("/", route))
+            .await
+            .unwrap()
+    });
+    let (mut socket, _) = connect_async(format!("ws://{address}/")).await.unwrap();
+    event(&mut socket, "session.created").await;
+
+    // Reading answers each ping, so the session outlives the idle timeout.
+    let mut pings = 0;
+    let closed = timeout(Duration::from_millis(1_500), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Ping(_))) => pings += 1,
+                other => break other,
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_err(), "{closed:?}");
+    assert!(pings > 0);
+
+    // A peer that stops reading sends no pongs and loses the session.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let end = timeout(WAIT, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Ping(_))) => {}
+                other => break other,
+            }
+        }
+    })
+    .await
+    .expect("the idle session stayed open");
+    assert!(
+        !matches!(end, Some(Ok(Message::Text(_) | Message::Binary(_)))),
+        "{end:?}"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn frame_errors_close_the_standard_socket_with_a_reason() {
+    use tokio_tungstenite::MaybeTlsStream;
+
+    let server = TestServer::start(3, 1).await;
+    // Masked client frames, written below the client library so it cannot refuse
+    // them. The oversized frame sends only its header, so nothing is left unread.
+    let mask = [0x11, 0x22, 0x33, 0x44];
+    let mut oversized = vec![0x81, 0x80 | 127];
+    oversized.extend_from_slice(&(super::MAX_MESSAGE_BYTES as u64 + 1).to_be_bytes());
+    oversized.extend_from_slice(&mask);
+    let mut reserved_bits = vec![0xC1, 0x80];
+    reserved_bits.extend_from_slice(&mask);
+    let mut invalid_text = vec![0x81, 0x80 | 2];
+    invalid_text.extend_from_slice(&mask);
+    invalid_text.extend([0xFF ^ mask[0], 0xFE ^ mask[1]]);
+    for (frame, close_code, code) in [
+        (oversized, 1009, "message_too_large"),
+        (reserved_bits, 1002, "protocol_error"),
+        (invalid_text, 1007, "invalid_utf8"),
+    ] {
+        let mut socket = server.socket(false).await;
+        event(&mut socket, "session.created").await;
+        let MaybeTlsStream::Plain(stream) = socket.get_mut() else {
+            panic!("expected a plain TCP stream");
+        };
+        stream.write_all(&frame).await.unwrap();
+        let failure = event(&mut socket, "error").await;
+        assert_eq!(failure["error"]["code"], code, "{failure}");
+        let reply = timeout(WAIT, socket.next()).await.unwrap();
+        let Some(Ok(Message::Close(Some(close)))) = reply else {
+            panic!("expected a close frame, got {reply:?}");
+        };
+        assert_eq!(u16::from(close.code), close_code);
+    }
+}
+
+#[tokio::test]
+async fn native_oversized_frame_closes_with_a_reason_and_leaves_the_session_resumable() {
+    use tokio_tungstenite::MaybeTlsStream;
+
+    let server = TestServer::start(1, 1).await;
+    // Only the header of a masked text frame one byte over the limit.
+    let mut oversized = vec![0x81, 0x80 | 127];
+    oversized.extend_from_slice(&(super::MAX_MESSAGE_BYTES as u64 + 1).to_be_bytes());
+    oversized.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    async fn write_raw(socket: &mut Socket, frame: &[u8]) {
+        let MaybeTlsStream::Plain(stream) = socket.get_mut() else {
+            panic!("expected a plain TCP stream");
+        };
+        stream.write_all(frame).await.unwrap();
+    }
+    async fn close_code(socket: &mut Socket) -> u16 {
+        let reply = timeout(WAIT, socket.next()).await.unwrap();
+        let Some(Ok(Message::Close(Some(close)))) = reply else {
+            panic!("expected a close frame, got {reply:?}");
+        };
+        close.code.into()
+    }
+
+    // In a session, the close code carries the reason and the session survives.
+    let mut socket = server.socket(true).await;
+    let greeting = event(&mut socket, "transcriberrr.session.created").await;
+    register(&mut socket, "mic").await;
+    write_raw(&mut socket, &oversized).await;
+    assert_eq!(close_code(&mut socket).await, 1009);
+
+    // Before a session, the socket can also say why.
+    let mut resumed = server
+        .connect(
+            "&transcriberrr=1&resume=1",
+            Some(&format!("Bearer {TEST_KEY}")),
+            None,
+            "realtime",
+        )
+        .await
+        .unwrap();
+    write_raw(&mut resumed, &oversized).await;
+    let failure = event(&mut resumed, "error").await;
+    assert_eq!(failure["error"]["code"], "message_too_large", "{failure}");
+    assert_eq!(close_code(&mut resumed).await, 1009);
+
+    let mut resumed = server
+        .connect(
+            "&transcriberrr=1&resume=1",
+            Some(&format!("Bearer {TEST_KEY}")),
+            None,
+            "realtime",
+        )
+        .await
+        .unwrap();
+    send(
+        &mut resumed,
+        json!({
+            "type":"transcriberrr.session.resume", "session_id":greeting["session_id"],
+            "resume_credential":greeting["resume_credential"], "last_sequence":0
+        }),
+    )
+    .await;
+    event(&mut resumed, "transcriberrr.session.resumed").await;
+}
+
+#[tokio::test]
+async fn models_advertise_the_enforced_standard_limits() {
+    let server = TestServer::start(1, 1).await;
+    let limits = server.models().await["transcriberrr"]["limits"].clone();
+    assert_eq!(limits["sample_rate"], 24_000);
+    assert_eq!(limits["max_message_bytes"], 256 * 1024);
+    assert_eq!(limits["max_append_frames"], 2 * 24_000);
+    assert_eq!(limits["max_uncommitted_frames"], 60 * 24_000);
+    assert_eq!(limits["ping_interval_ms"], 20_000);
+    assert_eq!(limits["idle_timeout_ms"], 60_000);
+    assert_eq!(
+        super::engine_capabilities(EngineKind::Qwen3)["limits"],
+        limits
+    );
+}
+
+#[tokio::test]
+async fn native_shutdown_ends_the_session_for_a_client_that_is_still_sending() {
+    let server = TestServer::start(1, 1).await;
+    let mut socket = server.socket(true).await;
+    event(&mut socket, "transcriberrr.session.created").await;
+    register(&mut socket, "mic").await;
+    let (mut writer, mut reader) = socket.split();
+    let sending = tokio::spawn(async move {
+        // Audio keeps arriving after the session has ended and stopped reading.
+        for packet in 0..5_000_u64 {
+            let append = json!({
+                "type":"transcriberrr.track.append", "track_id":"mic",
+                "start_frame":packet * 480, "audio":pcm(0, 480)
+            });
+            if writer
+                .send(Message::Text(append.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    server.shutdown.send_replace(true);
+
+    let mut ended = false;
+    let close = timeout(WAIT, async {
+        loop {
+            match reader.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    ended |= event["type"] == "transcriberrr.session.ended";
+                }
+                Some(Ok(Message::Close(frame))) => break frame,
+                Some(Ok(_)) => {}
+                other => panic!("connection ended without a close frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(ended);
+    assert_eq!(u16::from(close.unwrap().code), 1000);
+    sending.abort();
+}
+
+async fn native_liveness_route(
+    server: &TestServer,
+    ping_interval: Duration,
+    idle_timeout: Duration,
+) -> (String, JoinHandle<()>) {
+    let app = server._app_tx.borrow().clone().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let route = axum::routing::get(move |ws: axum::extract::WebSocketUpgrade| async move {
+        ws.on_upgrade(move |socket| {
+            tracks::run_with_liveness(socket, app, false, ping_interval, idle_timeout)
+        })
+    });
+    let task = tokio::spawn(async move {
+        serve(listener, axum::Router::new().route("/", route))
+            .await
+            .unwrap()
+    });
+    (format!("ws://{address}/"), task)
+}
+
+#[tokio::test]
+async fn native_socket_pings_and_detaches_a_peer_that_stops_answering() {
+    let server = TestServer::start(1, 1).await;
+    let (url, task) =
+        native_liveness_route(&server, Duration::from_millis(100), Duration::from_secs(1)).await;
+    let (mut socket, _) = connect_async(&url).await.unwrap();
+    let greeting = event(&mut socket, "transcriberrr.session.created").await;
+    let track = register(&mut socket, "mic").await;
+
+    // Reading answers each ping, so the socket outlives the idle timeout.
+    let mut pings = 0;
+    let closed = timeout(Duration::from_millis(1_500), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Ping(_))) => pings += 1,
+                other => break other,
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_err(), "{closed:?}");
+    assert!(pings > 0);
+
+    // A peer that stops reading sends no pongs and loses the socket.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let end = timeout(WAIT, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Ping(_))) => {}
+                other => break other,
+            }
+        }
+    })
+    .await
+    .expect("the idle socket stayed open");
+    match &end {
+        Some(Ok(Message::Close(Some(frame)))) => assert_eq!(u16::from(frame.code), 1001),
+        Some(Ok(Message::Text(_) | Message::Binary(_))) => panic!("{end:?}"),
+        _ => {}
+    }
+
+    // The session detached as for any other disconnect, so it can resume.
+    let (mut next, _) = connect_async(&url).await.unwrap();
+    resume(&mut next, &greeting, 0, false).await;
+    let resumed = event(&mut next, "transcriberrr.session.resumed").await;
+    assert_eq!(resumed["next_expected_frames"], json!({"mic": 0}));
+    assert_eq!(receive(&mut next).await, track);
+    task.abort();
+}
+
+#[tokio::test]
+async fn native_idle_timeout_excludes_time_the_server_stops_reading() {
+    let server = TestServer::with_engine(1, 1, EngineKind::Qwen3).await;
+    let (url, task) =
+        native_liveness_route(&server, Duration::from_millis(100), Duration::from_secs(2)).await;
+    let (mut socket, _) = connect_async(&url).await.unwrap();
+    event(&mut socket, "transcriberrr.session.created").await;
+    register_role(&mut socket, "mic", "mixed_audio").await;
+    let (started, release) = server.blockade.arm();
+    append_track(&mut socket, "mic", 0, 24_000, 24_000).await;
+    timeout(WAIT, started).await.unwrap().unwrap();
+
+    // Fill the worker queue, the capture buffer, and the session's command
+    // queue, so the server stops reading this socket and its pongs.
+    const PACKET: u64 = 24_000;
+    const PACKETS: u64 = 40;
+    let (mut writer, mut reader) = socket.split();
+    let sending = tokio::spawn(async move {
+        for start in (1..PACKETS).map(|packet| packet * PACKET) {
+            let append = json!({
+                "type":"transcriberrr.track.append", "track_id":"mic",
+                "start_frame":start, "audio":pcm(12_000, PACKET as usize)
+            });
+            writer
+                .send(Message::Text(append.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let end = json!({"type":"transcriberrr.session.end"});
+        writer
+            .send(Message::Text(end.to_string().into()))
+            .await
+            .unwrap();
+        writer
+    });
+    let mut backlog = false;
+    let held = timeout(Duration::from_secs(4), async {
+        loop {
+            match reader.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    assert_ne!(event["type"], "error", "{event}");
+                    backlog |= event["type"] == "transcriberrr.track.backlog";
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                other => break other,
+            }
+        }
+    })
+    .await;
+    assert!(held.is_err(), "paused socket was dropped: {held:?}");
+    assert!(backlog);
+    drop(release);
+
+    // Forty seconds of queued audio take a while to drain on a loaded machine.
+    let ended = timeout(4 * WAIT, async {
+        loop {
+            match reader.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    assert_ne!(event["type"], "error", "{event}");
+                    if event["type"] == "transcriberrr.session.ended" {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                other => panic!("connection ended before the session: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the session did not end after reads resumed");
+    let _writer = timeout(WAIT, sending).await.unwrap().unwrap();
+    task.abort();
 }

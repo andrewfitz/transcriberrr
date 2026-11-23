@@ -169,7 +169,7 @@ struct TranscriptionPass: Codable, Identifiable, Equatable {
 
     var defaultModel: String {
         switch engine {
-        case "parakeet-v3": "eschmidbauer/parakeet-unified-en-0.6b-onnx"
+        case "parakeet-v3": "altunenes/parakeet-rs/parakeet-unified-en-0.6b"
         case "apple-native": "Apple SpeechTranscriber"
         default: "Qwen/Qwen3-ASR-1.7B"
         }
@@ -317,6 +317,7 @@ private final class ProgressReader {
     // multibyte UTF-8 character, and decoding each chunk independently would
     // silently discard that partial event.
     private var remainder = Data()
+    private var canonicalPaths: [String: String] = [:]
     private(set) var events: [String: ProgressEvent] = [:]
     private let decoder = JSONDecoder()
 
@@ -334,7 +335,13 @@ private final class ProgressReader {
             let line = combined[lineStart..<index]
             lineStart = combined.index(after: index)
             guard let event = try? decoder.decode(ProgressEvent.self, from: line) else { continue }
-            let key = canonicalPath(event.input)
+            let key: String
+            if let cached = canonicalPaths[event.input] {
+                key = cached
+            } else {
+                key = canonicalPath(event.input)
+                canonicalPaths[event.input] = key
+            }
             events[key] = event
             changes[key] = event
         }
@@ -501,6 +508,7 @@ final class AppState: ObservableObject {
     @Published private(set) var addOperations = 0
 
     private var pendingSave: Task<Void, Never>?
+    private var queueRecoveryURL: URL?
     private var serverActivity: AnyCancellable?
     private var activeProcess: Process?
     private var queueStartedAt: TimeInterval?
@@ -525,7 +533,7 @@ final class AppState: ObservableObject {
                 self.pendingSave?.cancel()
                 self.server.stop()
                 if let process = self.activeProcess, process.isRunning { process.terminate() }
-                self.writeQueue()
+                if self.queueRecoveryURL == nil || self.pendingSave != nil { self.writeQueue() }
             }
         }
     }
@@ -538,7 +546,7 @@ final class AppState: ObservableObject {
     }
 
     var selectedItems: [AudioItem] { items.filter(\.selected) }
-    var supportsDiarization: Bool { engine != "apple-native" || additionalPasses.contains { !$0.usesApple } }
+    var offersDeviceSelection: Bool { engine != "apple-native" || additionalPasses.contains { !$0.usesApple } }
     var selectedCount: Int {
         let selected = selectedItems
         return selected.filter { $0.zoomMeeting == nil }.count + Set(selected.compactMap(\.zoomMeeting)).count
@@ -729,7 +737,7 @@ final class AppState: ObservableObject {
 
     @discardableResult
     private func applyPlan(_ plan: QueuePlan, selectingMeetings: Bool = false, tag: String? = nil,
-                           preserveDiarization: Bool = false, preserveInclusion: Bool = false) -> [AudioItem] {
+                           preserveInclusion: Bool = false) -> [AudioItem] {
         var known = itemsByPath(items)
         let unchecked = Set(items.filter { !$0.selected }.compactMap(\.zoomMeeting))
         let includedMeetings = Set(plan.files.compactMap { file in
@@ -819,7 +827,7 @@ final class AppState: ObservableObject {
                 item.outputURL = nil
             } else if file.error == nil && file.skip == nil {
                 if let iso = file.iso, selectingMeetings || item.isoOverride == nil { item.isoTrack = iso }
-                if selectingMeetings && !preserveDiarization, let diarize = file.diarize { item.diarize = diarize }
+                if selectingMeetings, let diarize = file.diarize { item.diarize = diarize }
             }
             if let tag, let output = file.output, file.error == nil && file.skip == nil {
                 let history = ModelOutput(tag: tag, path: output)
@@ -1174,7 +1182,7 @@ final class AppState: ObservableObject {
                 let label = isLocalModelPath(model) ? URL(fileURLWithPath: model).lastPathComponent : model
                 return PassOutcome(id: tag ?? String(index), label: label, modelTag: tag, phase: .waiting)
             }
-            for target in runTargets { outcomes[target] = pendingOutcomes }
+            outcomes.merge(runTargets.map { ($0, pendingOutcomes) }, uniquingKeysWith: { _, pending in pending })
 
             for (index, pass) in passes.enumerated() {
                 if isCancelling { break }
@@ -1256,7 +1264,7 @@ final class AppState: ObservableObject {
         do {
             let plan = try await preview(manifest, format: format, pass: pass, tag: tag)
             if isCancelling { throw CancellationError() }
-            planned = applyPlan(plan, selectingMeetings: true, tag: tag, preserveDiarization: pass.usesApple,
+            planned = applyPlan(plan, selectingMeetings: true, tag: tag,
                                 preserveInclusion: scopedRetry)
             runScopeIDs.formUnion(planned.map(\.id))
             for item in planned {
@@ -1404,13 +1412,13 @@ final class AppState: ObservableObject {
 
     @discardableResult
     private func updatePassOutcomes(ending: Bool = false, targets: Set<RunTarget>? = nil) -> Bool {
-        var next = outcomes
+        var changed: [(RunTarget, PassOutcome)] = []
         var finished = false
         for target in targets.map(Array.init) ?? Array(currentPassWork.keys) {
-            guard let work = currentPassWork[target], var outcome = next[target]?[passIndex] else { continue }
+            guard let work = currentPassWork[target], var outcome = outcomes[target]?[passIndex] else { continue }
             let prior = outcome
             let merge = work.mergePath.flatMap { mergeResults[$0] }
-            let failure = work.items.compactMap { item -> String? in
+            let failure = work.items.lazy.compactMap { item -> String? in
                 guard case .failed(let error) = item.state else { return nil }
                 return error
             }.first
@@ -1441,11 +1449,17 @@ final class AppState: ObservableObject {
                 outcome.message = nil
             }
             if outcome != prior {
-                next[target]?[passIndex] = outcome
+                changed.append((target, outcome))
                 finished = finished || [.completed, .failed, .canceled].contains(outcome.phase)
             }
         }
-        if next != outcomes { outcomes = next }
+        if changed.count == 1, let (target, outcome) = changed.first {
+            outcomes[target]?[passIndex] = outcome
+        } else if !changed.isEmpty {
+            var next = outcomes
+            for (target, outcome) in changed { next[target]?[passIndex] = outcome }
+            outcomes = next
+        }
         return finished
     }
 
@@ -1515,7 +1529,6 @@ final class AppState: ObservableObject {
     }
 
     private func requiredModelDownloads(for pending: [AudioItem], pass: TranscriptionPass) async -> [String] {
-        guard !pass.usesApple else { return [] }
         var candidates: [String] = []
         func append(_ value: String) {
             // Local paths cannot be downloaded; the CLI reports a missing one itself.
@@ -1523,7 +1536,7 @@ final class AppState: ObservableObject {
             candidates.append(value)
         }
         let model = pass.modelArgument
-        append(pass.engine == "parakeet-v3" && isQwenModel(model) ? pass.defaultModel : model)
+        if !pass.usesApple { append(pass.engine == "parakeet-v3" && isQwenModel(model) ? pass.defaultModel : model) }
         let diarizing = pending.contains(where: { $0.diarize || $0.speakerCount != nil })
         // The CLI loads the aligner for diarization too: speakers attach to word timings.
         // Subtitles always get sentence timing (main.rs), which needs the aligner too, and
@@ -1874,7 +1887,7 @@ final class AppState: ObservableObject {
     }
 
     private func manifestItem(for item: AudioItem, input: String, output: String?, pass: TranscriptionPass) -> ManifestItem {
-        ManifestItem(input: input, diarize: !pass.usesApple && item.diarize, speakers: pass.usesApple ? nil : item.speakerCount, output: output,
+        ManifestItem(input: input, diarize: item.diarize, speakers: item.speakerCount, output: output,
                      outputDir: outputFolder.path, outputLocation: cliOutputLocation, isoTrack: item.isoOverride)
     }
 
@@ -1925,7 +1938,7 @@ final class AppState: ObservableObject {
             if format == "txt" && speakerTurns {
                 arguments.append("--speaker-turns")
             }
-            if !pass.usesApple && items.contains(where: { $0.diarize || $0.speakerCount != nil }) {
+            if items.contains(where: { $0.diarize || $0.speakerCount != nil }) {
                 arguments += ["--diarization-model", diarizationModelArgument]
             }
             let process = Process()
@@ -1978,7 +1991,7 @@ final class AppState: ObservableObject {
             }
             let result = await withCheckedContinuation { continuation in
                 process.terminationHandler = { process in
-                    let message = errors.finish()
+                    let message = errors.finish(waitForEOF: false)
                     Task { @MainActor in
                         if self.activeProcess === process { self.activeProcess = nil }
                     }
@@ -1988,7 +2001,11 @@ final class AppState: ObservableObject {
                     let reason = process.terminationReason == .uncaughtSignal
                         ? "Transcriber stopped unexpectedly (signal \(process.terminationStatus))." + advice
                         : message
-                    continuation.resume(returning: (process.terminationStatus, reason))
+                    // Foundation reports the raw signal number for a signaled child.
+                    // Normalize it to the exit convention consumed by applyBulk.
+                    let status = process.terminationReason == .uncaughtSignal
+                        ? 128 + process.terminationStatus : process.terminationStatus
+                    continuation.resume(returning: (status, reason))
                 }
                 launch(process) { error in
                     _ = errors.finish()
@@ -2013,7 +2030,17 @@ final class AppState: ObservableObject {
     }
 
     private func loadQueue() {
-        guard let data = try? Data(contentsOf: queueFile), let saved = try? JSONDecoder().decode(SavedQueue.self, from: data) else { return }
+        let saved: SavedQueue
+        do {
+            saved = try JSONDecoder().decode(SavedQueue.self, from: Data(contentsOf: queueFile))
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return
+        } catch {
+            queueRecoveryURL = queueFile.deletingLastPathComponent()
+                .appendingPathComponent("queue-recovery-\(UUID().uuidString).json")
+            planningError = "Couldn’t load the saved queue. The original file will be preserved when you save a new queue.\n\(queueFile.path)\n\(error.localizedDescription)"
+            return
+        }
         outputFolder = URL(fileURLWithPath: saved.outputFolder)
         outputDestination = OutputDestination(rawValue: saved.outputDestination) ?? .folder
         modelID = saved.modelID
@@ -2066,7 +2093,7 @@ final class AppState: ObservableObject {
             item.speakerName = value.speakerName
             item.sessionLabel = value.sessionLabel
             item.state = value.state == "done" ? .done : value.state == "processing" ? .queued : value.state == "canceled" ? .canceled : value.state == "failed" ? .failed(value.error ?? "Transcription failed") : .queued
-            item.progress = value.progress
+            item.progress = value.state == "processing" ? 0 : value.progress
             item.selected = value.selected
             item.outputURL = value.outputPath.map(URL.init(fileURLWithPath:))
             item.modelOutputs = value.modelOutputHistory ?? (value.modelOutputs ?? [:]).map { ModelOutput(tag: $0.key, path: $0.value) }
@@ -2083,13 +2110,6 @@ final class AppState: ObservableObject {
             }
         }
         pruneOutcomes()
-        if !supportsDiarization {
-            diarize = false
-            items.forEach {
-                $0.diarize = false
-                $0.speakerCount = nil
-            }
-        }
     }
 
     func saveQueue() {
@@ -2126,9 +2146,21 @@ final class AppState: ObservableObject {
             appendModelID: appendModelID,
             passOutcomes: outcomes
         )
-        guard let data = try? JSONEncoder().encode(saved) else { return }
-        try? FileManager.default.createDirectory(at: queueFile.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: queueFile, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(saved)
+            try FileManager.default.createDirectory(at: queueFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let recovery = queueRecoveryURL {
+                let attributes = try FileManager.default.attributesOfItem(atPath: queueFile.path)
+                guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+                try FileManager.default.copyItem(at: queueFile, to: recovery)
+                queueRecoveryURL = nil
+            }
+            try data.write(to: queueFile, options: .atomic)
+        } catch {
+            planningError = "Couldn’t save the queue to \(queueFile.path).\n\(error.localizedDescription)"
+        }
     }
 
     private var cliURL: URL? {
@@ -2147,18 +2179,26 @@ final class AppState: ObservableObject {
     /// paths relative to `ui/`, so `swift run` works without a PATH lookup.
     private func executable(_ name: String, override: String, development: [String]) -> URL? {
         let fileManager = FileManager.default
-        if let value = ProcessInfo.processInfo.environment[override], !value.isEmpty,
-           fileManager.isExecutableFile(atPath: value) {
-            return URL(fileURLWithPath: value)
+        func isExecutable(_ url: URL) -> Bool {
+            (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+                && fileManager.isExecutableFile(atPath: url.path)
+        }
+        if let value = ProcessInfo.processInfo.environment[override], !value.isEmpty {
+            let url = URL(fileURLWithPath: value)
+            if isExecutable(url) { return url }
         }
         let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/\(name)")
-        if fileManager.isExecutableFile(atPath: helper.path) { return helper }
+        if isExecutable(helper) { return helper }
+        // SwiftPM places products together, including debug and custom scratch builds.
+        if Bundle.main.bundleURL.pathExtension != "app",
+           let sibling = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(name),
+           isExecutable(sibling) { return sibling }
         // Three components up from this file is `ui/`.
         let ui = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         return development
             .map { ui.appendingPathComponent($0).standardizedFileURL }
-            .first { fileManager.isExecutableFile(atPath: $0.path) }
+            .first(where: isExecutable)
     }
 
     private func isLocalModelPath(_ value: String) -> Bool {

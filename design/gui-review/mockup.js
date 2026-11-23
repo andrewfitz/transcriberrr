@@ -10,8 +10,8 @@ const presets = new Map([
     ["qwen3-asr-1.7b", "qw"], ["qwen-1.7b", "qw"], ["Qwen/Qwen3-ASR-1.7B", "qw"],
     ["qwen3-asr-0.6b", "qw06"], ["qwen-0.6b", "qw06"], ["Qwen/Qwen3-ASR-0.6B", "qw06"],
     ["parakeet-v3", "pk"], ["parakeet-unified", "pk"], ["parakeet-unified-en", "pk"],
-    ["nvidia/parakeet-unified-en-0.6b", "pk"], ["eschmidbauer/parakeet-unified-en-0.6b-onnx", "pk"],
-    ["parakeet-tdt-v3", "pkt"], ["istupakov/parakeet-tdt-0.6b-v3-onnx", "pkt"]
+    ["nvidia/parakeet-unified-en-0.6b", "pk"], ["altunenes/parakeet-rs/parakeet-unified-en-0.6b", "pk"],
+    ["parakeet-tdt-v3", "pkt"], ["altunenes/parakeet-rs/parakeet-tdt-0.6b-v3", "pkt"]
 ]);
 const icons = {
     audio: "M3 10v4m4-7v10m5-14v18m5-14v10m4-7v4",

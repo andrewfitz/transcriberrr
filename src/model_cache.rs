@@ -20,21 +20,64 @@ use std::time::Duration;
 pub const QWEN3_ASR_17B: &str = "Qwen/Qwen3-ASR-1.7B";
 pub const QWEN3_ASR_06B: &str = "Qwen/Qwen3-ASR-0.6B";
 pub const QWEN3_ALIGNER_06B: &str = "Qwen/Qwen3-ForcedAligner-0.6B";
-/// Latest English Parakeet Unified RNNT ONNX export compatible with parakeet-rs.
-pub const PARAKEET_UNIFIED_EN: &str = "eschmidbauer/parakeet-unified-en-0.6b-onnx";
-/// Legacy multilingual TDT v3 ONNX export, retained for explicit `--model` overrides.
-pub const PARAKEET_TDT_V3: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
-/// Sortformer v3 ONNX export compatible with parakeet-rs. The repository also contains unrelated
-/// exports, so the downloader below fetches only the compatible graph.
-pub const SORTFORMER_4SPK: &str = "altunenes/parakeet-rs";
-const SORTFORMER_FILE: &str = "nemotron-3-diarization/nemotron3_diar_v3.onnx";
-const UNIFIED_FILES: &[&str] = &[
-    "onnx_fp32/encoder.onnx",
-    "onnx_fp32/encoder.onnx.data",
-    "onnx_fp32/decoder_joint.onnx",
-    "onnx_fp32/decoder_joint.onnx.data",
-    "onnx_fp32/tokenizer.model",
+/// The repository that publishes the ONNX exports parakeet-rs generates its Burn graphs from.
+/// A Burn graph loads only the export it was generated from, so every Parakeet model comes
+/// from one revision of this repository. Change the revision together with the parakeet-rs
+/// version in `Cargo.toml`, then run `examples/parakeet_parity.rs`.
+const PARAKEET_RS_REPO: &str = "altunenes/parakeet-rs";
+const PARAKEET_RS_REVISION: &str = "26684938ff242cb4f7a65fad712476c6015a4477";
+/// English Parakeet Unified RNN-T.
+pub const PARAKEET_UNIFIED_EN: &str = "altunenes/parakeet-rs/parakeet-unified-en-0.6b";
+/// Multilingual Parakeet TDT v3, for explicit `--model` overrides.
+pub const PARAKEET_TDT_V3: &str = "altunenes/parakeet-rs/parakeet-tdt-0.6b-v3";
+/// Sortformer v3 (Nemotron-3) diarization.
+pub const SORTFORMER_4SPK: &str = "altunenes/parakeet-rs/nemotron-3-diarization";
+
+/// One model folder of the pinned parakeet-rs repository. Its ID is the repository followed
+/// by the folder, so several models share the repository's cache directory.
+struct PinnedModel {
+    id: &'static str,
+    folder: &'static str,
+    files: &'static [&'static str],
+    /// The file inference loads, or `None` when it loads the folder.
+    entry: Option<&'static str>,
+}
+
+const PINNED_MODELS: &[PinnedModel] = &[
+    PinnedModel {
+        id: PARAKEET_UNIFIED_EN,
+        folder: "parakeet-unified-en-0.6b",
+        files: &[
+            "encoder.onnx",
+            "encoder.onnx.data",
+            "decoder_joint.onnx",
+            "tokenizer.model",
+        ],
+        entry: None,
+    },
+    PinnedModel {
+        id: PARAKEET_TDT_V3,
+        folder: "parakeet-tdt-0.6b-v3",
+        files: &[
+            "encoder-model.onnx",
+            "encoder-model.onnx.data",
+            "decoder_joint-model.onnx",
+            "vocab.txt",
+        ],
+        entry: None,
+    },
+    PinnedModel {
+        id: SORTFORMER_4SPK,
+        folder: "nemotron-3-diarization",
+        files: &["nemotron3_diar_v3.onnx"],
+        entry: Some("nemotron3_diar_v3.onnx"),
+    },
 ];
+
+fn pinned_model(id: &str) -> Option<&'static PinnedModel> {
+    PINNED_MODELS.iter().find(|model| model.id == id)
+}
+
 const SNAPSHOT_MANIFEST: &str = ".transcriberrr-snapshot.json";
 const INCOMPLETE_MARKER: &str = ".transcriberrr-incomplete";
 
@@ -64,12 +107,12 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: PARAKEET_UNIFIED_EN,
         kind: "asr",
-        description: "Parakeet Unified English 0.6B ONNX (latest)",
+        description: "Parakeet Unified English 0.6B ONNX",
     },
     ModelSpec {
         id: PARAKEET_TDT_V3,
         kind: "asr",
-        description: "Parakeet TDT v3 0.6B ONNX (legacy)",
+        description: "Parakeet TDT v3 0.6B ONNX (multilingual)",
     },
     ModelSpec {
         id: SORTFORMER_4SPK,
@@ -175,6 +218,24 @@ impl ModelCache {
         directory: &Path,
         api: &Api,
     ) -> Result<PathBuf> {
+        if let Some(model) = pinned_model(id) {
+            let repo = api.repo(Repo::with_revision(
+                PARAKEET_RS_REPO.to_owned(),
+                RepoType::Model,
+                PARAKEET_RS_REVISION.to_owned(),
+            ));
+            let snapshot = directory.join("snapshots").join(PARAKEET_RS_REVISION);
+            let files: Vec<String> = model
+                .files
+                .iter()
+                .map(|file| format!("{}/{file}", model.folder))
+                .collect();
+            let files: Vec<&str> = files.iter().map(String::as_str).collect();
+            // Each folder has its own marker and manifest, so fetching one model leaves
+            // the repository's other models usable.
+            let state = snapshot.join(model.folder);
+            return download_files(&repo, id, &snapshot, &state, &files, repair);
+        }
         let info = api
             .repo(Repo::new(id.to_owned(), RepoType::Model))
             .info()
@@ -182,16 +243,12 @@ impl ModelCache {
         if info.sha.len() != 40 || !info.sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("Hugging Face repository {id:?} returned an invalid revision");
         }
-        let files: Vec<&str> = match id {
-            SORTFORMER_4SPK => vec![SORTFORMER_FILE],
-            PARAKEET_UNIFIED_EN => UNIFIED_FILES.to_vec(),
-            _ => info
-                .siblings
-                .iter()
-                .map(|file| file.rfilename.as_str())
-                .filter(|file| is_model_asset(file))
-                .collect(),
-        };
+        let files: Vec<&str> = info
+            .siblings
+            .iter()
+            .map(|file| file.rfilename.as_str())
+            .filter(|file| is_model_asset(file))
+            .collect();
         if files.is_empty() || files.iter().any(|file| !is_relative_asset(file)) {
             bail!("Hugging Face repository {id:?} has no usable model file listing");
         }
@@ -203,25 +260,7 @@ impl ModelCache {
             revision.clone(),
         ));
         let snapshot = directory.join("snapshots").join(&revision);
-        fs::create_dir_all(&snapshot)?;
-        let incomplete = snapshot.join(INCOMPLETE_MARKER);
-        fs::write(&incomplete, b"").with_context(|| format!("writing {}", incomplete.display()))?;
-        let manifest_path = snapshot.join(SNAPSHOT_MANIFEST);
-        let previous = read_manifest(&manifest_path).unwrap_or_default();
-        let mut downloaded = BTreeMap::new();
-        for file in files {
-            let path = snapshot.join(file);
-            let size = get_file(&repo, id, file, &path, previous.get(file).copied(), repair)
-                .with_context(|| format!("downloading {id}/{file}"))?;
-            downloaded.insert(file, size);
-        }
-
-        let entry = snapshot_entry(id, &snapshot)
-            .with_context(|| format!("model {id:?} has missing or invalid inference files"))?;
-        crate::check_cancelled()?;
-        atomic_write(&manifest_path, &serde_json::to_vec(&downloaded)?)?;
-        fs::remove_file(&incomplete)
-            .with_context(|| format!("removing {}", incomplete.display()))?;
+        let entry = download_files(&repo, id, &snapshot, &snapshot, &files, repair)?;
         atomic_write(&directory.join("refs/main"), revision.as_bytes())?;
         // Older builds used one marker for the whole repository. Clear it only once
         // the new, validated snapshot is published.
@@ -256,8 +295,9 @@ impl ModelCache {
     }
 
     fn repo_dir(&self, id: &str) -> PathBuf {
+        let repo = pinned_model(id).map_or(id, |_| PARAKEET_RS_REPO);
         self.root
-            .join(Repo::new(id.to_owned(), RepoType::Model).folder_name())
+            .join(Repo::new(repo.to_owned(), RepoType::Model).folder_name())
     }
 
     fn cached_path(&self, id: &str) -> Option<PathBuf> {
@@ -265,6 +305,14 @@ impl ModelCache {
             return None;
         }
         let directory = self.repo_dir(id);
+        if let Some(model) = pinned_model(id) {
+            // Only the pinned revision counts, and only once its manifest is written.
+            let snapshot = directory.join("snapshots").join(PARAKEET_RS_REVISION);
+            let state = snapshot.join(model.folder);
+            return (state.join(SNAPSHOT_MANIFEST).exists() && manifest_matches(&snapshot, &state))
+                .then(|| snapshot_entry(id, &snapshot))
+                .flatten();
+        }
         if directory.join(INCOMPLETE_MARKER).exists() {
             return None;
         }
@@ -274,22 +322,61 @@ impl ModelCache {
             return None;
         }
         let snapshot = directory.join("snapshots").join(revision);
-        if snapshot.join(INCOMPLETE_MARKER).exists() {
+        if !manifest_matches(&snapshot, &snapshot) {
             return None;
-        }
-        let manifest_path = snapshot.join(SNAPSHOT_MANIFEST);
-        if manifest_path.exists() {
-            let files = read_manifest(&manifest_path)?;
-            if files.is_empty()
-                || files.iter().any(|(file, size)| {
-                    !is_relative_asset(file) || file_size(&snapshot.join(file)) != Some(*size)
-                })
-            {
-                return None;
-            }
         }
         snapshot_entry(id, &snapshot)
     }
+}
+
+/// Whether the download recorded in `state` finished and its files are still whole. A snapshot
+/// from before manifests existed has none and passes.
+fn manifest_matches(snapshot: &Path, state: &Path) -> bool {
+    if state.join(INCOMPLETE_MARKER).exists() {
+        return false;
+    }
+    let manifest_path = state.join(SNAPSHOT_MANIFEST);
+    if !manifest_path.exists() {
+        return true;
+    }
+    read_manifest(&manifest_path).is_some_and(|files| {
+        !files.is_empty()
+            && files.iter().all(|(file, size)| {
+                is_relative_asset(file) && file_size(&snapshot.join(file)) == Some(*size)
+            })
+    })
+}
+
+/// Download `files`, named relative to `snapshot`, from one revision and validate the model.
+/// `state` holds the download's marker and manifest: the snapshot itself, or one model's
+/// folder when several models share the snapshot.
+fn download_files(
+    repo: &ApiRepo,
+    id: &str,
+    snapshot: &Path,
+    state: &Path,
+    files: &[&str],
+    repair: bool,
+) -> Result<PathBuf> {
+    fs::create_dir_all(state)?;
+    let incomplete = state.join(INCOMPLETE_MARKER);
+    fs::write(&incomplete, b"").with_context(|| format!("writing {}", incomplete.display()))?;
+    let manifest_path = state.join(SNAPSHOT_MANIFEST);
+    let previous = read_manifest(&manifest_path).unwrap_or_default();
+    let mut downloaded = BTreeMap::new();
+    for file in files {
+        let path = snapshot.join(file);
+        let size = get_file(repo, id, file, &path, previous.get(*file).copied(), repair)
+            .with_context(|| format!("downloading {id}/{file}"))?;
+        downloaded.insert(*file, size);
+    }
+
+    let entry = snapshot_entry(id, snapshot)
+        .with_context(|| format!("model {id:?} has missing or invalid inference files"))?;
+    crate::check_cancelled()?;
+    atomic_write(&manifest_path, &serde_json::to_vec(&downloaded)?)?;
+    fs::remove_file(&incomplete).with_context(|| format!("removing {}", incomplete.display()))?;
+    Ok(entry)
 }
 
 fn lock_repository(directory: &Path, id: &str) -> Result<File> {
@@ -476,31 +563,29 @@ fn cached_asset_size(path: &Path, expected: Option<u64>) -> Option<u64> {
 
 fn snapshot_entry(id: &str, snapshot: &Path) -> Option<PathBuf> {
     let has = |file: &str| file_size(&snapshot.join(file)).is_some_and(|size| size > 0);
-    match id {
-        SORTFORMER_4SPK => return has(SORTFORMER_FILE).then(|| snapshot.join(SORTFORMER_FILE)),
-        PARAKEET_UNIFIED_EN => {
-            return UNIFIED_FILES
-                .iter()
-                .all(|file| has(file))
-                .then(|| snapshot.join("onnx_fp32"));
-        }
-        PARAKEET_TDT_V3 => {
-            let encoder = has("encoder-model.onnx") || has("encoder.onnx");
-            let decoder = [
-                "decoder_joint-model.onnx",
-                "decoder_joint.onnx",
-                "decoder-model.onnx",
-            ]
-            .into_iter()
-            .any(has);
-            return (encoder && decoder && has("vocab.txt")).then(|| snapshot.to_path_buf());
-        }
-        QWEN3_ASR_17B | QWEN3_ASR_06B | QWEN3_ALIGNER_06B
-            if !has("tokenizer.json") && !has("vocab.json") =>
-        {
-            return None;
-        }
-        _ => {}
+    if let Some(model) = pinned_model(id) {
+        let folder = snapshot.join(model.folder);
+        return model
+            .files
+            .iter()
+            .all(|file| has(&format!("{}/{file}", model.folder)))
+            .then(|| model.entry.map_or(folder.clone(), |file| folder.join(file)));
+    }
+    if matches!(id, QWEN3_ASR_17B | QWEN3_ASR_06B | QWEN3_ALIGNER_06B) {
+        // The Qwen loader prefers a single safetensors file, then a sharded index.
+        // ONNX and PyTorch entries in a shared Hub snapshot cannot satisfy it.
+        let usable_tokenizer = if snapshot.join("tokenizer.json").exists() {
+            has("tokenizer.json")
+        } else {
+            has("vocab.json")
+        };
+        let usable_weights = if snapshot.join("model.safetensors").exists() {
+            has("model.safetensors")
+        } else {
+            valid_shards(&snapshot.join("model.safetensors.index.json"), &has)
+        };
+        return (has("config.json") && usable_tokenizer && usable_weights)
+            .then(|| snapshot.to_path_buf());
     }
 
     let indices = [
@@ -566,6 +651,9 @@ fn is_model_id(id: &str) -> bool {
             && !part.contains("..")
             && !part.contains("--")
     };
+    if pinned_model(id).is_some() {
+        return true;
+    }
     match id.split_once('/') {
         Some((owner, name)) => valid(owner) && valid(name),
         None => valid(id),
@@ -721,6 +809,146 @@ mod tests {
             cache.lookup(&root.display().to_string()),
             Some(root.clone())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn publish_pinned(snapshot: &Path, model: &PinnedModel) {
+        let mut manifest = BTreeMap::new();
+        for file in model.files {
+            let name = format!("{}/{file}", model.folder);
+            atomic_write(&snapshot.join(&name), b"weights").unwrap();
+            manifest.insert(name, 7_u64);
+        }
+        atomic_write(
+            &snapshot.join(model.folder).join(SNAPSHOT_MANIFEST),
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pinned_models_share_one_repository_and_cache_separately() {
+        let root =
+            env::temp_dir().join(format!("transcriberrr-pinned-cache-{}", std::process::id()));
+        let cache = ModelCache::new(Some(root.clone()), true);
+        let directory = cache.repo_dir(PARAKEET_UNIFIED_EN);
+        assert_eq!(directory, root.join("models--altunenes--parakeet-rs"));
+        assert_eq!(directory, cache.repo_dir(SORTFORMER_4SPK));
+        let snapshot = directory.join("snapshots").join(PARAKEET_RS_REVISION);
+        let diarization = snapshot.join("nemotron-3-diarization/nemotron3_diar_v3.onnx");
+        let unified = snapshot.join("parakeet-unified-en-0.6b");
+
+        // A revision other than the pinned one is never used, whatever `refs/main` names.
+        atomic_write(&directory.join("refs/main"), b"older").unwrap();
+        atomic_write(
+            &directory.join("snapshots/older/nemotron-3-diarization/nemotron3_diar_v3.onnx"),
+            b"old graph",
+        )
+        .unwrap();
+        assert_eq!(cache.lookup("sortformer"), None);
+
+        publish_pinned(&snapshot, pinned_model(SORTFORMER_4SPK).unwrap());
+        assert_eq!(cache.lookup("sortformer"), Some(diarization.clone()));
+        assert_eq!(cache.lookup("parakeet-v3"), None);
+
+        // A second model arriving in the same snapshot is hidden until it completes, and
+        // does not hide the first.
+        atomic_write(&unified.join(INCOMPLETE_MARKER), b"").unwrap();
+        publish_pinned(&snapshot, pinned_model(PARAKEET_UNIFIED_EN).unwrap());
+        assert_eq!(cache.lookup("parakeet-v3"), None);
+        assert_eq!(cache.lookup("sortformer"), Some(diarization.clone()));
+        fs::remove_file(unified.join(INCOMPLETE_MARKER)).unwrap();
+        assert_eq!(cache.lookup("parakeet-v3"), Some(unified.clone()));
+
+        // Offline, a cached model resolves and a missing one fails.
+        assert_eq!(cache.ensure("parakeet-v3").unwrap(), unified);
+        assert_eq!(cache.ensure("sortformer").unwrap(), diarization);
+        let missing = cache.ensure("parakeet-tdt-v3").unwrap_err();
+        assert!(format!("{missing:#}").contains("--offline"));
+
+        // A truncated file un-caches only its own model.
+        fs::write(unified.join("tokenizer.model"), b"x").unwrap();
+        assert_eq!(cache.lookup("parakeet-v3"), None);
+        assert_eq!(cache.lookup("sortformer"), Some(diarization));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_download_fetches_one_folder_of_the_pinned_revision() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        const GRAPH_SHA: &str = "eef93e1d14482804277fca0172464032d1a4fdbcc338524059fa1e861454ad4d";
+        let root = env::temp_dir().join(format!(
+            "transcriberrr-pinned-hub-cache-{}",
+            std::process::id()
+        ));
+        let cache = ModelCache::new(Some(root.clone()), false);
+        let directory = cache.repo_dir(SORTFORMER_4SPK);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            // The revision is pinned, so there is no repository listing request: only the
+            // size probe and the file itself.
+            for probe in [true, false] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                        break;
+                    }
+                }
+                assert!(request.starts_with(&format!(
+                    "GET /altunenes/parakeet-rs/resolve/{PARAKEET_RS_REVISION}/nemotron-3-diarization/nemotron3_diar_v3.onnx "
+                )));
+                let data = if probe { "g" } else { "graph" };
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nX-Repo-Commit: {PARAKEET_RS_REVISION}\r\nETag: {GRAPH_SHA}\r\nContent-Range: bytes 0-{}/5\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",
+                    data.len() - 1,
+                    data.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let api = ApiBuilder::from_cache(Cache::new(root.clone()))
+            .with_token(None)
+            .with_endpoint(endpoint)
+            .build()
+            .unwrap();
+        let entry = cache
+            .download_snapshot(SORTFORMER_4SPK, false, &directory, &api)
+            .unwrap();
+        server.join().unwrap();
+        let snapshot = directory.join("snapshots").join(PARAKEET_RS_REVISION);
+        assert_eq!(
+            entry,
+            snapshot.join("nemotron-3-diarization/nemotron3_diar_v3.onnx")
+        );
+        assert_eq!(fs::read(&entry).unwrap(), b"graph");
+        assert_eq!(cache.cached_path(SORTFORMER_4SPK), Some(entry));
+        assert_eq!(cache.cached_path(PARAKEET_UNIFIED_EN), None);
+        assert!(!directory.join("refs/main").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn qwen_requires_its_own_config_tokenizer_and_weights() {
+        let root = env::temp_dir().join(format!("transcriberrr-qwen-cache-{}", std::process::id()));
+        atomic_write(&root.join("model.onnx"), b"graph").unwrap();
+        atomic_write(&root.join("tokenizer.json"), b"{}").unwrap();
+        assert_eq!(snapshot_entry(QWEN3_ASR_17B, &root), None);
+        atomic_write(&root.join("config.json"), b"{}").unwrap();
+        atomic_write(&root.join("pytorch_model.bin"), b"weights").unwrap();
+        assert_eq!(snapshot_entry(QWEN3_ASR_17B, &root), None);
+        atomic_write(&root.join("model.safetensors"), b"weights").unwrap();
+        assert_eq!(snapshot_entry(QWEN3_ASR_17B, &root), Some(root.clone()));
         fs::remove_dir_all(root).unwrap();
     }
 

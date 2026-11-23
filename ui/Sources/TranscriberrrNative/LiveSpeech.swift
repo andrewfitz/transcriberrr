@@ -10,6 +10,7 @@ import Synchronization
 enum LiveSpeech {
     private enum StreamError: LocalizedError {
         case malformedPacket, audioConversion, inputOverloaded, streamLimit
+        case parentMismatch(expected: pid_t, actual: pid_t)
 
         var errorDescription: String? {
             switch self {
@@ -17,6 +18,9 @@ enum LiveSpeech {
             case .audioConversion: "Could not convert audio for Apple Speech"
             case .inputOverloaded: "Apple Speech input queue is full"
             case .streamLimit: "Apple Speech helper stream limit reached"
+            case let .parentMismatch(expected, actual):
+                "Apple Speech helper expected parent process \(expected) from TRANSCRIBERRR_NATIVE_PARENT_PID, "
+                    + "but its parent is \(actual). The launcher exited or the helper was started through another process"
             }
         }
     }
@@ -66,7 +70,7 @@ enum LiveSpeech {
     }
 
     static func run(offline: Bool) async throws {
-        let parentWatcher = watchParent()
+        let parentWatcher = try watchParent()
         defer { parentWatcher?.cancel() }
         let locale = try await locale()
         let module = transcriber(locale: locale, lowLatency: true)
@@ -103,7 +107,7 @@ enum LiveSpeech {
         }) {}
     }
 
-    private static func watchParent() -> (any DispatchSourceProcess)? {
+    private static func watchParent() throws -> (any DispatchSourceProcess)? {
         guard let value = ProcessInfo.processInfo.environment["TRANSCRIBERRR_NATIVE_PARENT_PID"],
               let parent = pid_t(value), parent > 1
         else { return nil }
@@ -111,8 +115,14 @@ enum LiveSpeech {
         let watcher = DispatchSource.makeProcessSource(identifier: parent, eventMask: .exit)
         watcher.setEventHandler { exit(0) }
         watcher.activate()
-        // The launcher may have exited before the helper registered the watcher.
-        if getppid() != parent { exit(0) }
+        // The launcher may have exited before the helper registered the watcher, or an
+        // intermediate process started the helper. The caller reports the error on stdout
+        // and stderr and exits non-zero, so the server's startup error names the cause.
+        let actual = getppid()
+        if actual != parent {
+            watcher.cancel()
+            throw StreamError.parentMismatch(expected: parent, actual: actual)
+        }
         return watcher
     }
 
@@ -136,7 +146,9 @@ enum LiveSpeech {
                 case 1, 5:
                     streams = streams.filter { !$0.value.completion.finished.withLock { $0 } }
                     guard streams[id] == nil else { throw StreamError.malformedPacket }
-                    guard streams.count < 64 else { throw StreamError.streamLimit }
+                    // The server admits 64 tracks. A bleed re-decode opens a committed
+                    // stream beside them, so leave room for it.
+                    guard streams.count < 72 else { throw StreamError.streamLimit }
                     let stream = try Stream(
                         id: id, locale: locale, lowLatency: operation == 1, source: source,
                         preferred: preferred, options: options
@@ -207,7 +219,10 @@ enum LiveSpeech {
             let module = transcriber(locale: locale, lowLatency: lowLatency)
             let analyzer = SpeechAnalyzer(modules: [module], options: options)
             self.analyzer = analyzer
-            let (sequence, input) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .bufferingOldest(256))
+            // Live audio arrives in 32 ms packets, so the longest turn (60 s) is 1,875 of
+            // them. A replay after a reconnect can deliver all of it before the analyzer
+            // reads any, and a full queue discards the turn.
+            let (sequence, input) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .bufferingOldest(2048))
             self.input = input
             let completion = completion
             task = Task {

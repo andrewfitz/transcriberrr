@@ -125,6 +125,10 @@ fn capabilities_and_stdin_plan_are_read_only_and_report_offline_requirements() {
     );
     assert_eq!(capabilities["automation"]["events"], "--jsonl");
     assert_eq!(
+        capabilities["automation"]["zoom_iso_inventory"],
+        serde_json::json!(["--plan", "--inventory-only", "--offline"])
+    );
+    assert_eq!(
         capabilities["engines"][1]["included"],
         cfg!(feature = "parakeet")
     );
@@ -659,6 +663,16 @@ fn an_explicitly_missing_participant_cannot_produce_a_partial_merge() {
     let files = plan["files"].as_array().unwrap();
     assert_eq!(files.len(), 4);
     assert!(files.iter().all(|file| file["error"].is_string()));
+    // A mixed-only segment is independent of the failed participant merge.
+    let later = "meeting/audio2067067067.m4a";
+    fixture.track(later);
+    let plan = fixture.plan(&[alice, bob, later]);
+    let files = plan["files"].as_array().unwrap();
+    let fallback = files
+        .iter()
+        .find(|f| f["path"].as_str().unwrap().ends_with(later))
+        .unwrap();
+    assert!(fallback["output"].is_string() && fallback["error"].is_null());
 }
 
 #[test]
@@ -686,6 +700,123 @@ fn ambiguous_and_unconverted_exports_do_not_block_other_meetings() {
     };
     assert!(error_for("Shared/zoom_0.mp4").contains("several meetings"));
     assert!(error_for("Converting/audio1067067067.m4a").contains("still converting"));
+}
+
+#[test]
+fn iso_inventory_identifies_each_recordings_segment() {
+    let fixture = Fixture::new();
+    let video = "Call/video2067067067.mp4";
+    for path in [
+        video,
+        "Call/Audio Record/audioAlice11067067067.wav",
+        "Call/Audio Record/audioAlice22067067067.wav",
+    ] {
+        fixture.track(path);
+    }
+    let plan = fixture.plan(&["--inventory-only", video]);
+    let files = plan["files"].as_array().unwrap();
+    assert_eq!(files.len(), 3);
+    for row in files {
+        let path = row["path"].as_str().unwrap();
+        let expected = if path.contains("Alice11") { 1 } else { 2 };
+        assert_eq!(row["zoom_segment"], expected, "{path}");
+    }
+}
+
+#[test]
+fn mixed_only_segments_remain_runnable_beside_the_participant_merge() {
+    let fixture = Fixture::new();
+    let first = "Call/video1067067067.mp4";
+    let uncovered = "Call/audio2067067067.wav";
+    let participant = "Call/Audio Record/audioAlice11067067067.wav";
+    let other_view = "Call/zoom_2.mp4";
+    for input in [first, uncovered, participant, other_view] {
+        fixture.track(input);
+    }
+    let args = ["Call", "-o", "out", "--engine", "apple-native"];
+    let plan = fixture.plan(&args);
+    let files = plan["files"].as_array().unwrap();
+    let row = |name: &str| {
+        files
+            .iter()
+            .find(|f| f["path"].as_str().unwrap().ends_with(name))
+            .unwrap()
+    };
+    assert_eq!(row(first)["zoom_segment"], 1);
+    assert_eq!(
+        row(first)["covered_by"],
+        serde_json::json!([row(participant)["path"]])
+    );
+    assert!(row(uncovered)["meeting"].is_null());
+    assert_eq!(
+        row(other_view)["covered_by"],
+        serde_json::json!([row(uncovered)["path"]])
+    );
+    let mixed_output = Path::new(row(uncovered)["output"].as_str().unwrap());
+    assert_ne!(mixed_output, destination(&plan));
+    let tagged = fixture.plan(&[&args[..], &["--model-suffix"]].concat());
+    assert!(tagged["files"].as_array().unwrap().iter().any(|f| {
+        f["path"] == row(uncovered)["path"]
+            && f["output"]
+                .as_str()
+                .unwrap()
+                .ends_with(".segment-2.ap.json")
+    }));
+    let helper = fixture.fake_native_helper();
+    success(
+        &fixture
+            .command(&args)
+            .env("TRANSCRIBERRR_NATIVE", helper)
+            .output()
+            .unwrap(),
+    );
+    for output in [mixed_output, destination(&plan)] {
+        let result: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert!(!result["segments"].as_array().unwrap().is_empty());
+    }
+    assert_eq!(fixture.calls(), 2);
+    let rerun = fixture.plan(&args);
+    assert_eq!(rerun["meetings"][0]["done"], true);
+    assert!(
+        rerun["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["output"] == mixed_output.to_str().unwrap() && f["done"] == true)
+    );
+}
+
+#[test]
+fn idless_video_uses_its_segment_and_undated_audio_remains_independent_when_ambiguous() {
+    let fixture = Fixture::new();
+    for input in [
+        "Call/zoom_1.mp4",
+        "Call/zoom_2.mp4",
+        "Call/audio_only.m4a",
+        "Call/Audio Record/audioAlice11067067067.wav",
+        "Call/Audio Record/audioBob22067067067.wav",
+    ] {
+        fixture.track(input);
+    }
+    let plan = fixture.plan(&["Call", "--inventory-only"]);
+    let files = plan["files"].as_array().unwrap();
+    for (video, expected_segment, speaker) in [("zoom_1.mp4", 1, "Alice"), ("zoom_2.mp4", 2, "Bob")]
+    {
+        let row = files
+            .iter()
+            .find(|f| f["path"].as_str().unwrap().ends_with(video))
+            .unwrap();
+        assert_eq!(row["zoom_segment"], expected_segment);
+        let covered = row["covered_by"].as_array().unwrap();
+        assert_eq!(covered.len(), 1);
+        assert!(covered[0].as_str().unwrap().contains(speaker));
+    }
+    let undated = files
+        .iter()
+        .find(|f| f["path"].as_str().unwrap().ends_with("audio_only.m4a"))
+        .unwrap();
+    assert!(undated["meeting"].is_null() && undated["covered_by"].is_null());
+    assert!(undated["output"].is_string());
 }
 
 #[test]
@@ -767,6 +898,7 @@ fn identifies_renamed_zoom_video_by_its_complete_audio_stream() {
     let mixed = "Call/audio1067067067.m4a";
     let renamed = "Call/Renamed session.mp4";
     let unrelated = "Call/Other footage.mp4";
+    let shifted = "Call/Shifted copy.mp4";
     fixture.track("Call/Audio Record/audioAlice11067067067.wav");
     let encode = |args: &[&str]| {
         success(
@@ -816,6 +948,22 @@ fn identifies_renamed_zoom_video_by_its_complete_audio_stream() {
         unrelated,
     ]);
 
+    encode(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=s=32x32:d=3",
+        "-itsoffset",
+        "1",
+        "-i",
+        mixed,
+        "-c:v",
+        "mpeg4",
+        "-c:a",
+        "copy",
+        shifted,
+    ]);
+
     let plan = fixture.plan(&["Call", "-o", "out"]);
     let output = destination(&plan);
     fs::create_dir_all(output.parent().unwrap()).unwrap();
@@ -832,6 +980,7 @@ fn identifies_renamed_zoom_video_by_its_complete_audio_stream() {
         };
         let video = named(renamed).unwrap();
         assert_eq!(video["meeting"], plan["meetings"][0]["id"]);
+        assert_eq!(video["zoom_audio_copy_clock_verified"], true);
         assert!(
             video["skip"]
                 .as_str()
@@ -840,8 +989,10 @@ fn identifies_renamed_zoom_video_by_its_complete_audio_stream() {
         );
         assert!(video["output"].is_null());
         if input == "Call" {
-            let other = named(unrelated).unwrap();
-            assert!(other["skip"].is_null() && other["output"].is_string());
+            for path in [unrelated, shifted] {
+                let other = named(path).unwrap();
+                assert!(other["skip"].is_null() && other["output"].is_string());
+            }
         } else {
             assert!(named(unrelated).is_none());
         }

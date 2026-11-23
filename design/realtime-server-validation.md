@@ -2,6 +2,155 @@
 
 The acceptance runs streamed synthetic voices over loopback at capture speed on an Apple M4 Max with 48 GiB of unified memory, running macOS 27.0.1 (26A434). The fixtures and their phrase cues can be regenerated locally. The packaged app launches the same Rust server as the headless CLI. Clients own audio capture.
 
+## Parakeet caption latency
+
+The native multitrack protocol decodes Parakeet in 0.96 s hops with 0.64 s of left context and 0.16 s of right context. An utterance decodes one hop at a time until it has its first text. After that, when more of the track's audio is already queued behind the recognizer, the utterance decodes up to three hops (2.88 s) in one encoder window, always ending on the 0.96 s grid. Audio within 4.84 s of a forced rollover decodes one hop at a time, which keeps word timing identical on both sides of the cut. Both standard OpenAI aliases keep their 1.44 s hop and never combine hops. A forced native rollover retains 1.44 s of preceding audio. The 1.92 s profile that 0.4.0 chose for a backlogged utterance is removed.
+
+One encoder call costs 60–85 ms on Metal for any window from 0.3 s to 4 s, so the server keeps up easily until other GPU or CPU work delays encoder calls. Encoder time was 89% of the slow calls traced. With a fixed hop, a delayed call leaves the same number of calls still to run, and the first use of each window length in a process costs a further 0.15–1 s. Combining hops removes calls from a track that is behind. The listener now runs the encoder once at every window length a stream can produce before it reports ready. It became ready 8.5–9.7 s after launch on a lightly loaded host, against 3.6–4.7 s when only the full-hop lengths were prepared first and the rest followed on a background thread. That thread was removed: a background call still in flight when the first stream opened held the model for seconds on a busy host. In contended 4× runs that started at the ready line, three of eight runs with background warm-up had later-revision p95 between 11.3 s and 13.6 s, and none of four runs without it exceeded 6.6 s. That sample is small and the host was busy. In the seven later rounds reported below, the build without the background thread reached 7.08 s once on the same measure, at a one-minute load above 100, and its first drafts were consistently earlier than the 0.4.1 build's.
+
+The streaming loop is `src/serve/parakeet_stream.rs`. It calls the public model API of parakeet-rs, which stays an unmodified crates.io dependency. `examples/parakeet_parity.rs` compares the loop token for token with parakeet-rs's own streaming and should be run after upgrading the crate. It matched on 480 of 480 decodes (160 Mini LibriSpeech utterances at three hops). On those utterances, three-hop windows scored 3.16% word error against 5.12% for single 0.96 s hops (3,166 words).
+
+The build pins parakeet-rs to 0.4.4, the latest release, and downloads every Parakeet model from one pinned revision (`26684938ff242cb4f7a65fad712476c6015a4477`) of `altunenes/parakeet-rs`, the repository whose exports the crate generates its Burn graphs from: `parakeet-unified-en-0.6b`, `parakeet-tdt-0.6b-v3` and `nemotron-3-diarization`. A Burn graph loads only the export it was generated from. parakeet-rs 0.4.4 rejects the `eschmidbauer/parakeet-unified-en-0.6b-onnx`, `istupakov/parakeet-tdt-0.6b-v3-onnx` and earlier Sortformer files that 0.4.0 downloaded, so those are no longer used and can be deleted from the model cache. The crate version and the revision change together, followed by `examples/parakeet_parity.rs`. The upgrade needed one added argument at the encoder call (`run_encoder(&features, None)`). On 0.4.4 with the new English export the loop matched parakeet-rs's own streaming on 480 of 480 decodes, with the same word error rates as before (5.12% for single 0.96 s hops, 3.16% for three-hop windows). All three models downloaded through the app's downloader, resolved offline and transcribed. One encoder call costs the same on the new export (steady median 58–68 ms against 61–67 ms on the old one, flat from 0.3 s to 4 s windows).
+
+### Final build measurements
+
+These runs measure the packaged helper built with parakeet-rs 0.4.4, the pinned exports, the corrected word times and the warm-up before ready (SHA-256 `dee678704f7fde09cc0900fe050646ff392264e1996fe17bcf7821898018d29d`). It ran interleaved with the signed 0.4.0 helper (`e9a0ec77…`) and the 0.4.1 follow-up helper of the next section (`cbd55451…`) on the same M4 Max, with the same fixtures and contention. The worktree also holds unrelated changes from other work, so each comparison is between builds as a whole.
+
+Published word times now end 0.3–0.4 s earlier (see Parakeet word timing). A latency keyed on the last timed word therefore reads higher for this build although captions arrive no later. Where builds are compared here, draft latency is the time from sending the packet that holds the last audio a draft covers (its `end_frame`) to receiving the draft. The two helpers sent the same drafts over the same audio: in the quiet natural-speech pair and both quiet 306 s pairs all 573 drafts matched one for one, each with the same revision number and the same `end_frame`. First-draft latency on the paced fixture is measured from the annotated onset and does not depend on word times.
+
+Two voices each supplied 46.1 s of continuous speech at 4× capture speed with contention throughout. Values are per round. Another session's test run overlapped round 1.
+
+| Measure | Signed 0.4.0 | 0.4.1 follow-up | Final |
+| --- | --- | --- | --- |
+| Later draft p95, from covered audio | 5.50 / 4.83 / 4.88 / 5.17 s | 3.14 / 2.08 / 2.21 / 2.63 s | 3.31 / 2.76 / 2.69 / 3.59 s |
+| Later revision p95, from last timed word | 5.82 / 5.11 / 5.18 / 5.29 s | 3.31 / 2.28 / 2.47 / 2.84 s | 3.56 / 3.00 / 2.94 / 3.80 s |
+| First draft median, from covered audio (four items) | 0.18 / 0.14 / 0.20 / 0.20 s | 1.05 / 0.45 / 0.55 / 0.65 s | 0.19 / 0.13 / 0.16 / 0.22 s |
+| Wall time for 11.5 s of sends | 21.3 / 19.8 / 19.4 / 19.0 s | 15.9 / 15.2 / 15.5 / 15.7 s | 16.6 / 15.8 / 16.0 / 16.7 s |
+| Maximum interval between packet groups | 0.93 / 0.72 / 0.75 / 0.66 s | 0.50 / 0.03 / 0.03 / 0.18 s | 0.51 / 0.17 / 0.28 / 0.92 s |
+| Slower track’s commit acknowledgment | 3.90 / 3.79 / 3.68 / 4.67 s | 2.70 / 2.39 / 2.66 / 2.79 s | 3.15 / 2.84 / 2.86 / 2.80 s |
+| Word edits across 325 reference words | 1 / 1 / 1 / 1 | 1 / 1 / 1 / 1 | 1 / 1 / 1 / 1 |
+
+All twelve sessions ended normally with exact rollover boundaries and zero gap frames. The final helper was ahead of the signed helper in every round and behind the 0.4.1 helper by 0.2–1.0 s at p95. Three further rounds with the recognition trace on did not reproduce that order: later-draft p95 was 2.49 / 2.19 / 6.74 s for the final helper against 2.86 / 2.72 / 4.20 s for the 0.4.1 helper, with the one-minute load rising from 50 to 122 across the rounds because of other work on the host. In those rounds the two builds made the same number of encoder calls (149 and 147) at the same cost (median 196 ms against 221 ms for a single hop and 313 ms against 293 ms for a three-hop window, under contention). The trace shows no step that is slower on 0.4.4, so the difference in the first four rounds is not attributed. The first draft of each track was earlier on the final helper in all seven rounds (median 0.12–0.46 s against 0.45–1.28 s). That is consistent with finishing the warm-up before ready: two builds of the same tree that differ only in that showed the same order in four of four earlier rounds (0.16–1.26 s against 0.71–1.40 s), and the first single-hop call of a traced run took 60–172 ms on the final helper against 436–937 ms on the 0.4.1 helper. Without added contention the three builds were equal at 4× (later-draft p95 0.11–0.13 s in two rounds each).
+
+The paced two-microphone fixture ran for 126 s at capture speed with a late join, a deliberate one-second gap and a reconnect with replay. Contention ran for 8 s of every 20 s. Three rounds per build are pooled (126 annotated utterances each). One-minute load was 12–29.
+
+| Measure | Signed 0.4.0 | 0.4.1 follow-up | Final |
+| --- | --- | --- | --- |
+| First draft from sending the onset packet, p50 / p95 / max | 1.09 / 1.22 / 1.93 s | 1.09 / 1.21 / 1.97 s | 1.09 / 1.25 / 1.88 s |
+| First-draft p95 per round | 1.27 / 1.20 / 1.21 s | 1.21 / 1.21 / 1.20 s | 1.25 / 1.25 / 1.24 s |
+| Later draft from covered audio, p50 / p95 / max | 0.18 / 0.40 / 1.07 s | 0.18 / 0.27 / 0.75 s | 0.18 / 0.34 / 0.60 s |
+| Later revision from last timed word, p50 / p95 / max | 0.59 / 1.00 / 1.47 s | 0.59 / 0.99 / 1.85 s | 0.86 / 1.20 / 1.61 s |
+| Drafts before the end-of-speech packet | 126 of 126 | 126 of 126 | 126 of 126 |
+| Backlog events | 5 | 1 | 1 |
+| Word edits across 990 scored words | 0 | 0 | 0 |
+
+Every run had zero unexpected gaps, no duplicate or open items, and observed all replayed events. At this load the three builds delivered first drafts equally. The first-draft gain of the next section appeared under heavier host load (one-minute load up to 65) and was not repeated here.
+
+Without added contention, 306 s runs in signed/final/final/signed order were equal: first-draft p95 1.20 s for both, later-draft p95 from covered audio 0.19 s against 0.21 s, 204 of 204 drafts before the end of speech for both, and zero edits across 880 scored words in every run. Measured from the last timed word, later-revision p95 was 1.18 s against 0.98 s.
+
+Natural read speech (two Mini LibriSpeech speakers, 150 s, 460 reference words) gave the same 26 finals with identical text on both builds in all six runs, with 34 edits against the LibriSpeech transcripts and zero unexpected gaps.
+
+| Run | Build | First draft p95 / max | Later draft p95 / max | Backlog events |
+| --- | --- | --- | --- | --- |
+| No added contention | Signed 0.4.0 | 0.26 / 0.26 s | 0.26 / 0.39 s | 0 |
+| No added contention | Final | 0.26 / 0.26 s | 0.27 / 0.41 s | 0 |
+| Scheduled contention, round 1 | Signed 0.4.0 | 0.53 / 0.53 s | 0.50 / 0.87 s | 0 |
+| Scheduled contention, round 1 | Final | 0.54 / 0.63 s | 0.64 / 0.90 s | 0 |
+| Scheduled contention, round 2 | Signed 0.4.0 | 0.45 / 0.49 s | 0.81 / 1.33 s | 4 |
+| Scheduled contention, round 2 | Final | 0.40 / 0.51 s | 0.68 / 0.94 s | 2 |
+
+These are measured from covered audio. Measured from the last timed word, the quiet runs read 1.47 s p95 for the final helper against 1.16 s for the signed helper.
+
+The 30m18s soak on the final helper finished in 30m32s. All 606 annotated utterances had a draft before their end-of-speech packet. First-draft latency from the onset packet was 1.10 s median, 1.26 s p95 and 1.83 s maximum. The 705 later drafts took 0.18 s median, 0.38 s p95 and 0.72 s maximum from covered audio (0.88 s, 1.20 s and 1.54 s from the last timed word). There were zero edits across 5,500 scored words, zero unexpected gaps, zero backlog events and a recognition queue depth of at most ten. The longest packet-group send took 0.31 s and the drain took 0.01 s. Resident memory stayed between 134 and 275 MiB. One-minute host load ranged from 4 to 36, and other sessions ran release builds and test suites for 21 minutes of the run. The fixture sender trailed an uninterrupted capture clock by 13.5 s at the end (0.64 ms per 100 ms block plus 1.9 s from nineteen pauses). Measured against an uninterrupted clock as an estimate, first drafts were 8.76 s median and 13.78 s p95, almost all of it sender drift. No physical microphone latency was measured.
+
+On the standard socket the final helper returned the reference sentence for both aliases, with no drafts before commit for `gpt-transcribe` and three stable deltas before commit for `gpt-live-transcribe`. Interleaved 30 s turns at capture speed completed 1.03–1.08 s after commit on the final helper and 1.01–1.02 s on the signed helper for `gpt-transcribe` (four turns each), and 0.06–0.09 s on both for `gpt-live-transcribe`.
+
+As in the next section, the final helper retracts one mic-two item as bleed in the first cycle, which deliberately removes one second of mic-two input and is excluded from scoring. The signed helper does not.
+
+The remaining limit is unchanged: encoder time under GPU contention. Under continuous 4× contention one encoder call took 0.2–0.3 s at the median and up to 0.9 s, against 60–85 ms on a free GPU, and work waited 0.5–0.9 s at the median for the call ahead of it.
+
+### Follow-up measurements on parakeet-rs 0.4.1
+
+These runs predate the upgrade to parakeet-rs 0.4.4, the warm-up before ready and the corrected word times. They compare the signed 0.4.0 helper (SHA-256 `e9a0ec77d0436d04edd1e6be5d1f464dada5c0a7607d9175890579710018872a`) with the packaged follow-up helper (`cbd5545168e994f35a0533e4be354f7a222313e62373c6dae374ecff5c42fba6`) on the same M4 Max, interleaved within each round. The follow-up helper was built from a worktree that also holds unrelated changes from other work, so the comparison is between the two builds as a whole. Added contention is four processes running the Parakeet encoder on Metal plus 32 CPU spinners.
+
+Two voices each supplied 46.1 s of continuous speech at 4× capture speed, with the contention running throughout. Values are per round.
+
+| Measure | Signed 0.4.0 | Follow-up |
+| --- | --- | --- |
+| Later caption revision p95 | 4.86 / 4.66 / 5.56 / 5.69 s | 2.34 / 2.22 / 2.33 / 3.30 s |
+| Wall time for 11.5 s of sends | 19.1 / 18.4 / 19.4 / 20.3 s | 14.6 / 14.7 / 14.9 / 16.3 s |
+| Maximum interval between packet groups | 0.61 / 0.71 / 1.00 / 1.32 s | 0.03 / 0.03 / 0.03 / 0.43 s |
+| Slower track’s commit acknowledgment | 5.16 / 3.55 / 3.56 / 4.10 s | 2.21 / 2.23 / 2.37 / 3.49 s |
+| Word edits across 325 reference words | 1 / 1 / 1 / 1 | 1 / 1 / 1 / 1 |
+
+All eight sessions ended normally with exact rollover boundaries and zero gap frames. Without added contention the two builds were equal at 4× (later-revision p95 0.32–0.33 s in two rounds each).
+
+One measurement build with the hop policy as a switch isolates the cause from the other changes in the worktree. In four contended 4× rounds its later-revision p95 was 9.06 / 6.68 / 9.93 / 6.65 s with a fixed 0.96 s hop, 8.84 / 6.19 / 16.67 / 5.23 s with the 0.4.0 policy and 5.10 / 1.37 / 1.93 / 0.97 s when combining hops. The signed helper gave 7.92 / 5.83 / 5.09 / 5.74 s in the same rounds.
+
+The paced two-microphone fixture ran for 126 s at capture speed with a late join, a deliberate one-second gap and a reconnect with replay. Contention ran for 8 s of every 20 s. Four rounds per build are pooled (168 annotated utterances each).
+
+| Measure | Signed 0.4.0 | Follow-up |
+| --- | --- | --- |
+| First draft from sending the onset packet, p50 / p95 / max | 1.10 / 1.55 / 2.77 s | 1.09 / 1.22 / 2.09 s |
+| First-draft p95 per round | 1.31 / 2.01 / 1.35 / 1.55 s | 1.19 / 1.22 / 1.24 / 1.22 s |
+| Later revision, p50 / p95 / max | 0.60 / 1.24 / 2.52 s | 0.59 / 0.99 / 1.42 s |
+| Drafts before the end-of-speech packet | 164 of 168 | 167 of 168 |
+| Backlog events | 36 | 0 |
+| Word edits across 1,320 scored words | 0 | 0 |
+
+Every run had zero unexpected gaps, no duplicate or open items, and observed all replayed events. An earlier round of the same experiment under heavier host load (one-minute load 47–74) gave a signed first-draft p95 of 6.19 s and a later-revision maximum of 6.96 s, against 2.81 s and 1.86 s for an earlier measurement build that combined hops. A further round under light contention showed no first-draft difference between hop policies. The gain is in the tails under contention.
+
+Without added contention, 306 s runs in signed/follow-up/follow-up/signed order were equal: first-draft p95 1.20 s against 1.18 s, later-revision p95 0.98 s against 0.97 s, 204 of 204 drafts before the end of speech for both, and zero edits across 880 scored words in every run.
+
+Natural read speech went through the same socket as two Mini LibriSpeech speakers on separate tracks, 150 s at capture speed with 460 reference words. Captions were scored against the LibriSpeech transcripts after removing case and punctuation only. Caption latency is the time from sending the packet that holds a draft's last word to receiving the draft.
+
+| Run | Build | Draft p95 / max | First text p95 | Backlog events | Edits |
+| --- | --- | --- | --- | --- | --- |
+| No added contention | Signed 0.4.0 | 1.16 / 2.47 s | 1.17 s | 0 | 34 |
+| No added contention | Follow-up | 1.18 / 2.49 s | 1.18 s | 0 | 34 |
+| Scheduled contention, round 1 | Signed 0.4.0 | 1.68 / 2.53 s | 1.70 s | 13 | 34 |
+| Scheduled contention, round 1 | Follow-up | 1.17 / 2.47 s | 1.67 s | 0 | 34 |
+| Scheduled contention, round 2 | Signed 0.4.0 | 2.40 / 4.66 s | 1.88 s | 21 | 34 |
+| Scheduled contention, round 2 | Follow-up | 2.26 / 3.71 s | 1.97 s | 28 | 30 |
+
+All six runs ended normally with zero unexpected gaps and 26 finals. The follow-up build was clearly ahead in one of the two contended rounds, and first-text latency did not improve. Its final text was identical to the signed helper's in every run except contended round 2, where one combined window corrected a phrase the single-hop decode got wrong.
+
+The 30m18s soak on the packaged follow-up helper finished in 30m33s. All 606 annotated utterances had a draft before their end-of-speech packet. First-draft latency was 1.08 s median, 1.20 s p95 and 2.74 s maximum. The 705 later revisions took 0.58 s median, 0.97 s p95 and 1.43 s maximum. There were zero edits across 5,500 scored words, zero unexpected gaps, zero backlog events and a recognition queue depth of at most nine. The longest packet-group send took 0.50 s and the drain took 0.01 s. Resident memory stayed between 143 and 291 MiB. One-minute host load ranged from 7 to 35 during the run. The same soak on 0.4.0 took 31m08s with a first-draft p95 of 3.85 s, a maximum of 34.08 s and 540 early drafts, under different host load.
+
+The fixture sender rebases its clock after every late wake, so it trails an uninterrupted capture clock even when the server never stalls it. In the soak it trailed by 15.2 s at the end: 12.7 s accumulated at 0.7 ms per 100 ms block and 2.5 s came from twelve pauses longer than 50 ms. Measured against an uninterrupted clock as an estimate, first drafts in the soak were therefore 10.3 s median and 15.2 s p95, almost all of it sender drift. In the 306 s runs the same estimate was 2.82 s p95 for the signed helper and 1.94 s for the follow-up. No physical microphone latency was measured.
+
+On the standard socket, the follow-up helper returned the reference sentence for both aliases, with no drafts before commit for `gpt-transcribe` and three stable deltas before commit for `gpt-live-transcribe`. Commit-to-completed time showed no measurable difference. Five 30 s `gpt-transcribe` turns sent at capture speed completed in 1.28–1.78 s on the follow-up helper and 1.27–1.65 s on the signed helper, and a 10 s turn in 0.48 s and 0.97 s. The runs were not interleaved. `gpt-live-transcribe` completed 10 s and 30 s turns 0.06–0.07 s after commit on both builds.
+
+In the first cycle, which deliberately removes one second of mic-two input and is excluded from scoring, the follow-up build retracts one mic-two item as bleed and the signed helper does not. Fixed-hop measurement builds of the same worktree do the same, so this comes from the worktree's live-bleed changes.
+
+The remaining limit is encoder time under GPU contention. A track that is behind still waits for the encoder call in progress, and an utterance's first text still needs one full 0.96 s hop plus 0.16 s of right context.
+
+### 0.4.0 measurements
+
+The 0.4.0 release used a 0.96 s hop for a new utterance while its track had at most one second of admitted audio awaiting recognition, and a 1.92 s hop above that threshold. Each utterance kept its chosen hop through completion.
+
+On an M4 Max, two different voices each supplied 46.1 s of continuous speech through the native WebSocket at 4× capture speed. The old and signed adaptive builds ran in old/new/new/old order. Revision latency measures elapsed time from sending the packet containing the last timed word to receiving the updated caption, excluding the first draft. Single runs are shown in order within each build.
+
+| Measure | Previous build | Adaptive build |
+| --- | --- | --- |
+| Later caption revision p95 | 5.65 s / 6.76 s | 0.42 s / 0.39 s |
+| Maximum interval between packet groups | 0.88 s / 1.73 s | 0.038 s / 0.038 s |
+| Slower track’s commit acknowledgment | 2.00 s / 6.32 s | 0.35 s / 0.24 s |
+| Word edits across 325 reference words | 3 / 3 | 1 / 1 |
+| Unexpected gap frames | 0 / 0 | 0 / 0 |
+
+These four tests used the signed candidate prior to the standard-alias compatibility correction. Both tracks reached their exact final frame and matched the reference words spanning each forced rollover in all four runs. Host load varied during the sequence. The 4× replay measures headroom when two speakers talk continuously.
+
+The 30m18s native two-mic candidate run completed in 31m08s wall time. All 606 annotated utterances produced drafts. First-draft latency measured from sending the onset packet was 1.22 s median, 3.85 s p95 and 34.08 s maximum. For 540 utterances, the draft arrived before the end-of-speech packet. There were zero unexpected gaps, zero duplicate terminal items and zero edits across 5,500 scored words. Scoring excludes the first cycle, which deliberately removes one second of mic-two input. Both tracks ended and the reconnect recovered all replay events.
+
+The earlier fixed-hop 30-minute replay reached 46.98 s p95 and 74.30 s maximum, with 205 early drafts. Measured one-minute host load was lower in the adaptive run (median 43.85 vs 80.14). In the adaptive run, the longest client write stalled for 21.13 s. The fixture sender rebases its clock after stalls. Using a continuously advancing source clock from the first packet as an estimate gives 49.55 s p95 from nominal capture time, compared with 325.79 s in the earlier run. No physical microphone latency was measured.
+
+A separate standard live-alias check found that applying the 0.96 s native hop there omitted “The” and repeated “morning” on an existing SDK fixture. The compatibility build keeps adaptive decoding on the native protocol and restores the established standard window.
+
+The final packaged CLI returned the expected text on the standard fixture for both model aliases, with three live deltas before commit. The subsequent 4× native stress repeat on this binary gave later-revision p95s of 11.10 s and 10.16 s versus 8.36 s and 8.58 s for the fixed-hop controls. This repeat reversed the latency result from the first sequence. All four sessions ended normally with zero unexpected gaps and exact rollover boundaries. The adaptive build had one word edit per 325 words and the controls had three. The 4× trials do not establish a consistent sustained-overload latency gain.
+
+In the final 306 s capture-paced comparison, median first-draft latency improved from 1.74 s to 1.23 s. The p95 rose from 2.88 s to 4.04 s, with median host load rising from 39.67 to 48.90. Early drafts rose from 85 to 88 of 102 cues. The final build delivered drafts for all 102 cues and matched all 880 scored words with zero unexpected gaps. The 30-minute measurement above belongs to the earlier signed candidate. The final DMG SHA-256 is `67356c6e015e8fb9dede199874ac5899a8aec468212e2e29458758e1e7956bea`. The app signature, disk image, checksum, 288 all-feature tests, 261 minimal tests and strict Clippy passed.
+
 ## Astra audit and performance verification
 
 The previous build reproduced overload on a 90-second, two-track replay at capture speed. It dropped 19.7 s from the first track and 19.1 s from the second, in addition to a deliberately omitted second of input. When the two-second worker queue filled, the session had already advanced its input clock. Subsequent packets were discarded until the queue fell below the lower backlog threshold.
@@ -22,9 +171,23 @@ Other regressions cover partial and overlapping packets, multiple reorder deadli
 
 The signed candidate completed the same 90-second replay with zero overload gaps and zero word errors across 220 scored words. Scoring excludes the first cycle, which contains the deliberate one-second input gap. First-text p95 rose from 5.07 s across 20 observed drafts to 12.54 s across 29 of 30 utterances. Six candidate drafts arrived before the end of speech. The 45.1-second continuous replay preserved all 155 words, including all ten at the forced boundary, with zero audio gaps. Both standard model aliases returned the expected text, and the live alias emitted three deltas before commit.
 
-On the packaged Apple Speech and CPU Sortformer path, all three ASR finals arrived. Both audio consumers reported zero dropped frames. The first two speaker assignments were correct. The third was unavailable at the publication deadline, so integrated A/B/A speaker acceptance remains open. One inference window took 4.605 s in that run.
+On the original packaged Apple Speech and CPU Sortformer path, both consumers received every audio frame. One inference window took 4.605 s, and the third final lost all speaker labels despite having decisions for most of its words.
+
+The revised release CLI and bundled Apple helper identified both speakers in A/B/A order in three capture-speed replays of the same 19.158 s mixed fixture. All nine ASR finals arrived, every session ended normally, and the server reported zero audio gaps. Counts below show unambiguously labeled words across the three captions, which contain 16, 12 and 16 words respectively.
+
+| Per-track speaker wait | Words labeled in A/B/A | Finals with partial coverage | Third final after fixture speech ended |
+| --- | --- | ---: | ---: |
+| Default, 2 seconds | 15 / 10 / 13 | 2 | 2.310 s |
+| 10 seconds | 15 / 10 / 15 | 0 | 3.050 s |
+| Zero | 12 / 8 / 9 | 3 | 0.300 s |
+
+The default run again reached frame 504,852 before the third caption's deadline, with the caption ending at frame 521,748. The revised final retained 13 confirmed labels and left the crossing and undecided words unlabeled. Coverage later reached the fixture's last frame, 549,920, in all three runs. These trials used the release CLI with SHA-256 `1be442d82939f5f5be7d54ace7517310fafea151f0f208ecb7c9eb3fd9f492f5` on a shared M4 Max.
 
 The first long replay exposed a client heartbeat failure after 390 s of capture. While the native server paused reads under pressure, its writer continued delivering new finals, but the reference client disconnected when a pong timed out behind the queued audio. The native reference client now disables automatic pings. A paused-transport regression reproduced the previous WebSocket 1011 and passed with all 6,000 frames after the fix.
+
+A follow-up run was interrupted by a host reboot after 24m36s of input. The completed post-reboot run replayed the entire 30m18s native Parakeet fixture in 35m46s wall time on the same M4 Max. Both tracks ended normally with zero unexpected gap frames, zero duplicate terminal items and zero open items. The only gap was the one second deliberately withheld on mic two. The session resumed with zero unobserved replay events. The 100 uninterrupted cycles scored 0 edits across 2,600 mic-one words and 2,900 mic-two words. All 607 final captions carried the correct track label.
+
+On the 605 of 606 annotated utterances with a measured first draft, latency from sending the onset packet to receiving the first draft was 3.26 s median, 46.98 s p95 and 74.30 s maximum. Only 205 drafts arrived before the corresponding end-of-speech packet. A send stalled for up to 22.47 s, and final drain took 3.41 s. These timings start at the paced sender. A physical microphone capturing continuously would also need to buffer audio while writes stall.
 
 The release passed 219 all-feature Rust tests, 205 minimal-build Rust tests, eight Python socket tests, strict Clippy, formatting and the Swift release build. The ad-hoc signed arm64 DMG passed image and signature verification. Its SHA-256 is `41961f46ad32653557bda62599e64748b8bcccf129aed74273724b82789ae4de`.
 
@@ -79,7 +242,7 @@ The optimized Parakeet Unified server was tested with two isolated English voice
 
 **The tuned release server met both proposed two-second p95 targets in the repeated two-mic WebSocket test.** After a warm-up pair it delivered pre-commit drafts and post-commit finals on all eight turns. First-text p50/p95 were 1.777/1.839 s. Commit-to-final p50/p95 were 1.325/1.413 s. There were zero gaps and four word edits in 260 reference words (1.54% WER).
 
-The server now uses **1.44 s chunks, 0.64 s of left context, and 0.16 s of right context**. In the optimized inference benchmark, two tracks completed two turns each with zero edits over 130 reference words. Across those four turns first-text p50/p95 were 2.04/2.28 s and commit-to-final p50/p95 were 0.28/1.11 s. This measurement includes the recognizer and its input queues. The original-profile table below includes the full WebSocket, gating, and bleed path.
+That release used **1.44 s chunks, 0.64 s of left context, and 0.16 s of right context**. In the optimized inference benchmark, two tracks completed two turns each with zero edits over 130 reference words. Across those four turns first-text p50/p95 were 2.04/2.28 s and commit-to-final p50/p95 were 0.28/1.11 s. This measurement includes the recognizer and its input queues. The original-profile table below includes the full WebSocket, gating, and bleed path.
 
 | Measurement | Result with the original Parakeet profile |
 | --- | --- |
@@ -105,6 +268,23 @@ Paired replays of the original PCM reproduced three omitted words or word starts
 On the final pre-roll build, the 129 s paired replay produced a clean forced boundary at 89.70 s on each track. Both ten-word passages spanning the cuts matched their references, and the next drafts started within their own audio. The same run reported 30 overload gaps, losing roughly 9–10% of the input under load. A separate single-track playback crossed the original 28.40 s seam and recovered “the river just after sunrise” exactly once. Its second cut at 56.24 s also preserved the reference passage. Across 217 words it had zero edits and zero gaps.
 
 The 30-minute Parakeet soak used the tuned build immediately preceding the forced-rollover pre-roll change. The client completed 1,818 s of source audio over 1,957 s of wall time. The server returned 543 distinct finals, 46 retractions, and correctly deduplicated a replayed final. It also reported 143 overload gaps, losing 206.4 s and 204.2 s of the two tracks. Of 606 annotated utterances, 499 had a matching first draft and 290 received one before the voice ended. First-text p50/p95 on the 499 observed drafts were 2.177/4.157 s. Word error rates excluding the first deliberately interrupted cycle were 15.0% and 18.48%. Host one-minute load had a median of 56.8, with roughly 49 GiB of swap in use. This run demonstrates recovery and falls short of sustained two-track quality.
+
+## Parakeet word timing
+
+The streaming decoder stamps a word with the encoder frame that emitted its first token and gives it one or two 80 ms frames of length. That stamp trails the word. The listener keeps it for rollover cuts and bleed decisions, and sends clients and speaker labelling the time the word was spoken instead. The spoken time is the stamp less a latency that depends on how much audio the decoding window held before the token: 0.41 s with only the 0.64 s left context, 10 ms less for each further encoder frame, and never below 0.30 s. A stream's first window has no left context and trails by 0.50 s, falling 70 ms per frame after its ninth. A word ends at the next word's start, or before a pause after a length estimated from its spelling, as in batch transcription.
+
+Each run sent two Mini LibriSpeech speakers through the native socket for 150 s at capture speed. The reference is the Qwen3 forced aligner on the same recordings, which reports times in 80 ms steps. Batch Parakeet word starts differ from it by −1 and −31 ms on the two fitted recordings (standard deviation 62 and 63 ms), so about 60 ms of the spread below belongs to the reference. Values are the mean and standard deviation of published time minus reference.
+
+| Measure | Decoder stamps, 0.4.0 export | Spoken times, fitted pair | Spoken times, held-out pair |
+| --- | --- | --- | --- |
+| Word start | +364 ms, 84 ms | −6 ms, 65 ms | −4 ms, 74 ms |
+| Word end | +207 ms, 148 ms | +2 ms, 73 ms | −4 ms, 85 ms |
+| First word of an item | +516 ms, 62 ms | +23 ms, 68 ms | +70 ms, 138 ms |
+| Words compared | 421 | 426 | 506 |
+
+The latency constants were fitted on the first pair with the 0.4.4 English export. The held-out pair is two other speakers. On the synthetic two-microphone fixture, whose onsets are annotated from the audio, the first word of a phrase started 20 ms early (standard deviation 54 ms, 11 phrases) and the last word ended 30 ms late (55 ms, 12 phrases). A run of the fitted pair while four processes ran the Parakeet encoder on Metal, which delayed finals by up to 43 s and made windows span several hops, gave −7 ms for starts (63 ms) and +2 ms for ends (74 ms) over 433 words.
+
+Bleed decisions stay on the decoder's stamps. With spoken times, the fixture's first cycle published two words of the other speaker on microphone two that the stamps mute: "The" in the plain run and "Apples" in the run with a late join and a gap. A short word at the start of a phrase can end before the bleed is measurable, and the stamp falls a few hundred milliseconds into the phrase. Which clock mutes better on natural overlapping speech has not been measured.
 
 ## Apple Speech
 

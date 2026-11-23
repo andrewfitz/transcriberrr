@@ -310,7 +310,7 @@ fn title_case(text: &str) -> String {
 /// capitalizes all-lowercase words but keeps deliberate casing ("McDonald").
 fn generic_name(stem: &str) -> Option<String> {
     let words = stem
-        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .split(|c: char| !c.is_alphanumeric() && !is_mark(c) && c != '\'' && c != '’')
         .filter(|word| {
             let letters = word.trim_end_matches(|c: char| c.is_ascii_digit());
             !letters.is_empty() && !NOISE_WORDS.contains(&letters.to_lowercase().as_str())
@@ -435,6 +435,9 @@ pub(crate) fn select_session(
     if zoom.is_empty() {
         if let Some(session) = session {
             bail!("no Zoom participant tracks for session {session}");
+        }
+        if anchor.is_some() {
+            bail!("no Zoom participant tracks for the selected recording");
         }
         for (path, input) in others {
             speakers.insert(path);
@@ -691,12 +694,23 @@ pub(crate) fn merge_tracks(
         ));
     }
     // Two people guessed to the same name stay distinct speakers.
+    let reserved: HashSet<String> = speakers
+        .iter()
+        .map(|speaker| speaker.name.clone())
+        .collect();
     let mut seen: HashMap<String, usize> = HashMap::new();
     for speaker in &mut speakers {
         let count = seen.entry(speaker.name.clone()).or_default();
         *count += 1;
         if *count > 1 {
-            speaker.name = format!("{} ({count})", speaker.name);
+            loop {
+                let candidate = format!("{} ({count})", speaker.name);
+                if !reserved.contains(&candidate) {
+                    speaker.name = candidate;
+                    break;
+                }
+                *count += 1;
+            }
         }
     }
 
@@ -719,6 +733,7 @@ pub(crate) fn merge_tracks(
                 source: input.doc.source.clone(),
                 speaker: id,
                 offset_seconds: offset,
+                duration_seconds: Some(input.doc.duration_seconds),
             });
             let target = if input.mixed {
                 &mut mixed_words
@@ -760,8 +775,10 @@ pub(crate) fn merge_tracks(
     if !mixed_words.is_empty() {
         let covered = speech_spans(&words);
         mixed_words.retain(|word| !overlaps(&covered, word.start, word.end));
-        words.append(&mut mixed_words);
-        words.sort_by(|a, b| a.start.total_cmp(&b.start));
+        if !mixed_words.is_empty() {
+            words.append(&mut mixed_words);
+            words.sort_by(|a, b| a.start.total_cmp(&b.start));
+        }
     }
     separate_speakers(&mut words);
     // Like Sortformer's count: speakers who said something.
@@ -1012,6 +1029,8 @@ mod tests {
         assert_eq!(name("bob_iso_mic2").as_deref(), Some("Bob"));
         assert_eq!(name("Track 3 - McDonald").as_deref(), Some("McDonald"));
         assert_eq!(name("audio1234").as_deref(), None);
+        assert_eq!(name("rene\u{301}_iso").as_deref(), Some("Rene\u{301}"));
+        assert_eq!(name("O’Brien_mic").as_deref(), Some("O’Brien"));
     }
 
     #[test]
@@ -1303,6 +1322,31 @@ mod tests {
         let b = track("b.wav", 2.0, &[("Hello.", 1.0)]);
         let (doc, _) = merge_tracks(vec![a, b]).unwrap();
         assert_eq!(doc.speaker_names, ["Andrew", "B"]);
+    }
+
+    #[test]
+    fn duplicate_speaker_suffixes_preserve_existing_names() {
+        let inputs = ["Alice", "Alice", "Alice (2)", "Alice"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut input = track(&format!("track{index}.wav"), 1.0, &[("Hi.", 0.0)]);
+                input.name = Some(name.to_owned());
+                input
+            })
+            .collect();
+        let (doc, _) = merge_tracks(inputs).unwrap();
+        assert_eq!(
+            doc.speaker_names,
+            ["Alice", "Alice (3)", "Alice (2)", "Alice (4)"]
+        );
+    }
+
+    #[test]
+    fn mixed_anchor_cannot_select_unrelated_generic_tracks() {
+        let candidates = ["audio1067067067.m4a", "alice.wav", "bob.wav"]
+            .map(|source| track(source, 1.0, &[("Hi.", 0.0)]));
+        assert!(select_session(candidates.into(), Some("audio1067067067.m4a.json"), None).is_err());
     }
 
     fn folder() -> Vec<TrackInput> {

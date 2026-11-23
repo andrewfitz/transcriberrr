@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "clock": "session",
+  "sample_rate": 16000,
+  "job_id": "job-1",
+  "fingerprint": "fingerprint-1",
+  "tracks": [
+    {
+      "id": "mic",
+      "name": "Host mic",
+      "origin": {
+        "numerator": 1,
+        "denominator": 48000
+      },
+      "session_start": {
+        "numerator": -1,
+        "denominator": 900
+      },
+      "coverage": "recognized",
+      "role": "isolated_mic",
+      "activity": [
+        {
+          "start_sample": 0,
+          "end_sample": 320,
+          "level": 0.5
+        }
+      ],
+      "stream_evidence": {
+        "payload": "123",
+        "stamp": 9223372036854775807
+      },
+      "speakers": [
+        {
+          "id": "local-0",
+          "name": "Local speaker"
+        }
+      ],
+      "words": [
+        {
+          "id": "mic-w0",
+          "text": "Hello",
+          "start_sample": 1,
+          "end_sample": 17,
+          "precision": "word",
+          "speaker_id": "local-0",
+          "utterance_id": "mic-u0"
+        }
+      ],
+      "source_id": "camera-a",
+      "stream_index": 1,
+      "channel": null,
+      "error": null,
+      "warning": null
+    },
+    {
+      "id": "room",
+      "name": "Room",
+      "origin": {
+        "numerator": 0,
+        "denominator": 1
+      },
+      "session_start": {
+        "numerator": 0,
+        "denominator": 1
+      },
+      "coverage": "skipped",
+      "role": "mixed_audio",
+      "activity": [
+        {
+          "start_sample": 0,
+          "end_sample": 320,
+          "level": 0.2
+        }
+      ],
+      "source_id": "camera-b",
+      "stream_index": 1,
+      "channel": null,
+      "error": null,
+      "warning": null,
+      "stream_evidence": null,
+      "words": [],
+      "speakers": []
+    }
+  ],
+  "speakers": [
+    {
+      "id": "host",
+      "name": "Host"
+    }
+  ],
+  "words": [
+    {
+      "id": "w0",
+      "text": "Hello",
+      "start_sample": -17,
+      "end_sample": 0,
+      "precision": "word",
+      "speaker_id": "host",
+      "observations": [
+        {
+          "track_id": "mic",
+          "word_id": "mic-w0",
+          "text": "Hello",
+          "start_sample": 1,
+          "end_sample": 17,
+          "evidence": "recognized",
+          "speaker_id": "host",
+          "basis": null
+        }
+      ],
+      "utterance_id": "u0"
+    }
+  ]
+}

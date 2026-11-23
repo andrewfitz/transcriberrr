@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::Instant;
 
@@ -28,6 +28,7 @@ pub(super) struct Attribution {
     pub speaker: Option<String>,
     pub speaker_spans: Vec<SpeakerSpan>,
     pub words: Vec<Option<String>>,
+    pub partial_coverage: Option<Vec<(u64, u64)>>,
 }
 
 #[derive(Default)]
@@ -39,6 +40,10 @@ struct Timeline {
 }
 
 impl Timeline {
+    fn decided_past(&self, end: u64) -> bool {
+        self.coverage.last().is_some_and(|&(_, last)| last >= end)
+    }
+
     fn cover(&mut self, start: u64, end: u64) {
         if start >= end {
             return;
@@ -84,25 +89,45 @@ impl Timeline {
         }
     }
 
-    fn attribute(&self, start: u64, end: u64, words: &[(u64, u64)]) -> Option<Attribution> {
-        if start >= end
-            || !self
-                .coverage
-                .iter()
-                .any(|&(first, last)| start >= first && end <= last)
-        {
+    fn attribute(
+        &self,
+        start: u64,
+        end: u64,
+        words: &[(u64, u64)],
+        allow_partial: bool,
+    ) -> Option<Attribution> {
+        if start >= end {
             return None;
         }
-        let mut speaker_spans: Vec<_> = self
-            .spans
+        let first = self.coverage.partition_point(|&(_, last)| last <= start);
+        let intervals = &self.coverage[first..];
+        let &(first_start, first_end) = intervals.first()?;
+        if first_start >= end {
+            return None;
+        }
+        let complete = first_start <= start && first_end >= end;
+        if !complete && !allow_partial {
+            return None;
+        }
+        let coverage: Vec<_> = intervals
             .iter()
-            .filter(|span| start < span.end_frame && end > span.start_frame)
-            .map(|span| SpeakerSpan {
-                speaker: span.speaker.clone(),
-                start_frame: span.start_frame.max(start),
-                end_frame: span.end_frame.min(end),
-            })
+            .take_while(|&&(a, _)| a < end)
+            .map(|&(a, b)| (a.max(start), b.min(end)))
             .collect();
+        let mut speaker_spans = Vec::new();
+        for span in &self.spans {
+            let first = coverage.partition_point(|&(_, b)| b <= span.start_frame);
+            for &(a, b) in coverage[first..]
+                .iter()
+                .take_while(|&&(a, _)| a < span.end_frame)
+            {
+                speaker_spans.push(SpeakerSpan {
+                    speaker: span.speaker.clone(),
+                    start_frame: span.start_frame.max(a),
+                    end_frame: span.end_frame.min(b),
+                });
+            }
+        }
         speaker_spans.sort_by(|lhs, rhs| {
             (lhs.start_frame, lhs.end_frame, &lhs.speaker).cmp(&(
                 rhs.start_frame,
@@ -112,23 +137,14 @@ impl Timeline {
         });
         let words: Vec<_> = words
             .iter()
-            .map(|&(first, last)| {
-                let mut overlap = speaker_spans
-                    .iter()
-                    .filter(|span| first < span.end_frame && last > span.start_frame);
-                let span = overlap.next()?;
-                (first < last
-                    && span.start_frame <= first
-                    && span.end_frame >= last
-                    && overlap.next().is_none())
-                .then(|| span.speaker.clone())
-            })
+            .map(|&word| word_speaker(word, &coverage, &speaker_spans))
             .collect();
         let speaker = words
             .first()
             .and_then(Option::as_ref)
             .filter(|speaker| {
-                words.iter().all(|word| word.as_ref() == Some(*speaker))
+                complete
+                    && words.iter().all(|word| word.as_ref() == Some(*speaker))
                     && speaker_spans.iter().all(|span| &span.speaker == *speaker)
             })
             .cloned();
@@ -136,8 +152,76 @@ impl Timeline {
             speaker,
             speaker_spans,
             words,
+            partial_coverage: (!complete).then_some(coverage),
         })
     }
+}
+
+/// A word in a pause between speaker spans takes the nearest span this close:
+/// three 80 ms Sortformer output frames at the 24 kHz track rate.
+const GAP_TOLERANCE: u64 = 3 * 1_920;
+
+/// Label a word only when one speaker is in reach of it: every span the word
+/// overlaps, or in a pause every span within `GAP_TOLERANCE`, names the same
+/// speaker. A word two speakers touch stays unlabelled. Only decided audio names
+/// a speaker, and a capture gap starts a new speaker namespace, so the word and
+/// its candidate spans must lie in one coverage interval. A word without a
+/// positive duration has no reliable timing.
+fn word_speaker(
+    (first, last): (u64, u64),
+    coverage: &[(u64, u64)],
+    spans: &[SpeakerSpan],
+) -> Option<String> {
+    if first >= last {
+        return None;
+    }
+    let interval = coverage.partition_point(|&(_, end)| end <= first);
+    let &(low, high) = coverage.get(interval)?;
+    if first < low || last > high {
+        return None;
+    }
+    // Attribution clips spans to coverage and sorts them by start. Spans
+    // starting before this interval or beyond the tolerance cannot label it.
+    let begin = spans.partition_point(|span| span.start_frame < low);
+    let limit = last.saturating_add(GAP_TOLERANCE).min(high);
+    let count = spans[begin..].partition_point(|span| span.start_frame <= limit);
+    let candidates = || {
+        spans[begin..begin + count]
+            .iter()
+            .filter(|span| span.end_frame <= high)
+    };
+    let distance = |span: &SpeakerSpan| {
+        span.start_frame
+            .saturating_sub(last)
+            .max(first.saturating_sub(span.end_frame))
+    };
+    let overlaps = |span: &&SpeakerSpan| first < span.end_frame && last > span.start_frame;
+    let spoken = candidates().any(|span| overlaps(&span));
+    let mut near = candidates().filter(|span| {
+        if spoken {
+            overlaps(span)
+        } else {
+            distance(span) <= GAP_TOLERANCE
+        }
+    });
+    let speaker = &near.next()?.speaker;
+    near.all(|span| &span.speaker == speaker)
+        .then(|| speaker.clone())
+}
+
+/// Recover a mutex a panicking thread left poisoned. Every critical section here
+/// leaves its data consistent between statements, and a panic must not spread
+/// from the diarizer to the session or from a session to the shared worker.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ReserveError {
+    /// Another stream holds the single live diarizer.
+    Busy,
+    /// The worker thread exited or panicked; no stream can use it again.
+    Stopped,
 }
 
 pub(super) struct Stream {
@@ -145,26 +229,51 @@ pub(super) struct Stream {
     worker: Arc<Worker>,
 }
 
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // Release explicitly: the worker may still hold this timeline for an
+        // in-flight job, which must not keep the diarizer reserved. Obsolete
+        // queued PCM is discarded with the reservation.
+        let mut queue = lock(&self.worker.queue);
+        if queue.reserved && std::ptr::eq(queue.target.as_ptr(), Arc::as_ptr(&self.timeline)) {
+            *queue = Queue::default();
+        }
+    }
+}
+
 impl Stream {
+    /// Takes everything queued, as the worker does once it catches up.
+    #[cfg(test)]
+    pub(super) fn script_drain(&self) {
+        let mut queue = lock(&self.worker.queue);
+        while queue.pop().is_some() {}
+    }
+
     #[cfg(test)]
     pub(super) fn script_coverage(&self, interval: (u64, u64), spans: Vec<SpeakerSpan>) {
-        let mut timeline = self.timeline.lock().unwrap();
+        let mut timeline = self.timeline();
         timeline.cover(interval.0, interval.1);
         for span in spans {
             timeline.push_span(span);
         }
     }
 
+    /// A poisoned timeline means the worker panicked mid-publish: fail the stream.
+    fn timeline(&self) -> MutexGuard<'_, Timeline> {
+        self.timeline.lock().unwrap_or_else(|poisoned| {
+            let mut timeline = poisoned.into_inner();
+            timeline.failed = true;
+            timeline
+        })
+    }
+
     /// A full queue leaves the entire packet with the session for a later retry.
     /// Once the diarizer fails, ASR can continue and use the unavailable-label fallback.
     pub(super) fn try_append(&self, start: u64, samples: &[i16]) -> bool {
-        if samples.is_empty()
-            || self.worker.ready.is_closed()
-            || self.timeline.lock().unwrap().failed
-        {
+        if samples.is_empty() || self.worker.ready.is_closed() || self.timeline().failed {
             return true;
         }
-        if !self.worker.queue.lock().unwrap().try_append(start, samples) {
+        if !lock(&self.worker.queue).try_append(start, samples) {
             return false;
         }
         self.notify();
@@ -172,12 +281,25 @@ impl Stream {
     }
 
     pub(super) fn finish(&self) {
-        self.worker.queue.lock().unwrap().finish();
+        lock(&self.worker.queue).finish();
         self.notify();
     }
 
+    /// Whether the worker has taken everything queued. After the session drops audio
+    /// for a diarizer that fell behind, it resumes here so that labelled stretches
+    /// stay long instead of alternating with gaps.
+    pub(super) fn caught_up(&self) -> bool {
+        lock(&self.worker.queue).commands.is_empty()
+    }
+
+    /// Coverage only grows forward. Once it has passed `end`, a hole before `end` is
+    /// audio the diarizer never received, and waiting cannot fill it.
+    pub(super) fn decided_past(&self, end: u64) -> bool {
+        self.timeline().decided_past(end)
+    }
+
     pub(super) fn is_finished(&self) -> bool {
-        let timeline = self.timeline.lock().unwrap();
+        let timeline = self.timeline();
         timeline.finished || timeline.failed || self.worker.ready.is_closed()
     }
 
@@ -186,14 +308,18 @@ impl Stream {
         start: u64,
         end: u64,
         words: &[(u64, u64)],
+        allow_partial: bool,
     ) -> Option<Attribution> {
-        self.timeline.lock().ok()?.attribute(start, end, words)
+        self.timeline
+            .lock()
+            .ok()?
+            .attribute(start, end, words, allow_partial)
     }
 
     pub(super) fn report_timeout(&self, start: u64, end: u64) {
         if self.worker.diagnostics {
-            let queued = self.worker.queue.lock().unwrap().frames;
-            let timeline = self.timeline.lock().unwrap();
+            let queued = lock(&self.worker.queue).frames;
+            let timeline = self.timeline();
             let accepted_end = timeline.coverage.last().map(|&(_, end)| end);
             eprintln!(
                 "live diarization deadline: start_frame={start} end_frame={end} decided_through={accepted_end:?} queued_frames={queued} failed={}",
@@ -208,7 +334,7 @@ impl Stream {
         if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
             self.worker.ready.try_send(())
         {
-            self.timeline.lock().unwrap().failed = true;
+            self.timeline().failed = true;
         }
     }
 }
@@ -226,6 +352,8 @@ enum Command {
 
 #[derive(Default)]
 struct Queue {
+    /// Set while a `Stream` exists for `target`; cleared when it drops.
+    reserved: bool,
     target: Weak<Mutex<Timeline>>,
     commands: VecDeque<Command>,
     frames: usize,
@@ -291,6 +419,18 @@ impl Worker {
         })
     }
 
+    /// A worker whose thread has exited.
+    #[cfg(test)]
+    pub(super) fn stopped() -> Arc<Self> {
+        let worker = Self::scripted();
+        Arc::new(Self {
+            ready: worker.ready.clone(),
+            queue: Arc::default(),
+            diagnostics: false,
+            _scripted_receiver: None,
+        })
+    }
+
     pub(super) fn start(path: PathBuf, device: crate::DeviceKind) -> Result<Arc<Self>> {
         let (ready, incoming) = mpsc::channel(1);
         let queue = Arc::new(Mutex::new(Queue::default()));
@@ -330,17 +470,31 @@ impl Worker {
         }))
     }
 
+    /// False once the worker thread has exited or panicked. No stream can use it again.
+    pub(super) fn is_running(&self) -> bool {
+        !self.ready.is_closed()
+    }
+
+    #[cfg(test)]
     pub(super) fn reserve(self: &Arc<Self>) -> Option<Stream> {
-        let mut queue = self.queue.lock().ok()?;
-        if self.ready.is_closed() || queue.target.strong_count() > 0 {
-            return None;
+        self.try_reserve().ok()
+    }
+
+    pub(super) fn try_reserve(self: &Arc<Self>) -> Result<Stream, ReserveError> {
+        let mut queue = lock(&self.queue);
+        if self.ready.is_closed() {
+            return Err(ReserveError::Stopped);
+        }
+        if queue.reserved {
+            return Err(ReserveError::Busy);
         }
         let timeline = Arc::new(Mutex::new(Timeline::default()));
         *queue = Queue {
+            reserved: true,
             target: Arc::downgrade(&timeline),
             ..Queue::default()
         };
-        Some(Stream {
+        Ok(Stream {
             timeline,
             worker: Arc::clone(self),
         })
@@ -386,7 +540,7 @@ fn run(
     let mut owner = Weak::new();
     let mut live: Option<Live> = None;
     loop {
-        let pending = queue.lock().unwrap().pop();
+        let pending = lock(queue).pop();
         let Some((pending, command, queued_frames)) = pending else {
             if incoming.blocking_recv().is_none() {
                 break;
@@ -403,7 +557,7 @@ fn run(
             model.reset_state();
             live = None;
         }
-        if target.lock().unwrap().failed {
+        if lock(&target).failed {
             continue;
         }
         let started = Instant::now();
@@ -439,7 +593,7 @@ fn run(
             },
         };
         if matches!(command, Command::Finish) && result.is_ok() {
-            target.lock().unwrap().finished = true;
+            lock(&target).finished = true;
         }
         match result {
             Ok(()) if diagnostics => {
@@ -452,8 +606,7 @@ fn run(
                         Command::Append(..) => "append",
                         Command::Finish => "finish",
                     };
-                    let decided_through =
-                        target.lock().unwrap().coverage.last().map(|&(_, end)| end);
+                    let decided_through = lock(&target).coverage.last().map(|&(_, end)| end);
                     eprintln!(
                         "live diarization {phase}: elapsed_ms={} decided_through={decided_through:?} queued_frames={queued_frames}",
                         started.elapsed().as_millis(),
@@ -465,7 +618,7 @@ fn run(
                 if diagnostics {
                     eprintln!("live diarization worker error: {error:#}");
                 }
-                target.lock().unwrap().failed = true;
+                lock(&target).failed = true;
             }
         }
     }
@@ -568,7 +721,7 @@ impl ModelClock {
     }
 
     fn publish(&self, target: &Mutex<Timeline>, spans: Vec<SpeakerSegment>, decided: u64) {
-        let mut timeline = target.lock().unwrap();
+        let mut timeline = lock(target);
         timeline.cover(self.frame(self.decided), decided);
         for segment in spans {
             let (start_frame, end_frame) = (self.frame(segment.start), self.frame(segment.end));
@@ -681,6 +834,168 @@ mod tests {
     }
 
     #[test]
+    fn released_reservation_is_free_while_the_worker_finishes_its_job() {
+        let worker = Worker::scripted();
+        let original = worker.reserve().unwrap();
+        assert!(original.try_append(0, &[1, 2, 3]));
+        // The worker upgrades the target and holds it for the whole inference.
+        let (pending, _, _) = worker.queue.lock().unwrap().pop().unwrap();
+        let in_flight = pending.upgrade().unwrap();
+        drop(original);
+
+        let replacement = worker.reserve().unwrap();
+        assert!(worker.reserve().is_none());
+        assert!(!Arc::ptr_eq(&in_flight, &replacement.timeline));
+        drop(in_flight);
+        drop(replacement);
+        assert!(worker.reserve().is_some());
+    }
+
+    #[test]
+    fn stopped_worker_is_not_reported_busy_and_finishes_open_streams() {
+        let (ready, incoming) = mpsc::channel(1);
+        let worker = Arc::new(Worker {
+            ready,
+            queue: Arc::default(),
+            diagnostics: false,
+            _scripted_receiver: None,
+        });
+        let stream = worker.try_reserve().unwrap();
+        assert!(matches!(worker.try_reserve(), Err(ReserveError::Busy)));
+        assert!(!stream.is_finished());
+        // The worker thread owns the receiver; a panic drops it while unwinding.
+        let dead = thread::spawn(move || {
+            let _incoming = incoming;
+            panic!("inference panicked");
+        });
+        assert!(dead.join().is_err());
+
+        // Finals stop waiting for labels and ASR keeps its PCM flowing.
+        assert!(stream.is_finished());
+        assert!(stream.try_append(0, &[1, 2]));
+        assert!(matches!(worker.try_reserve(), Err(ReserveError::Stopped)));
+        drop(stream);
+        assert!(matches!(worker.try_reserve(), Err(ReserveError::Stopped)));
+        assert!(worker.reserve().is_none());
+    }
+
+    #[test]
+    fn poisoned_timeline_fails_the_stream_without_panicking_the_session() {
+        let worker = Worker::scripted();
+        let stream = worker.reserve().unwrap();
+        let timeline = Arc::clone(&stream.timeline);
+        let poisoner = thread::spawn(move || {
+            let _guard = timeline.lock().unwrap();
+            panic!("worker panicked while publishing");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(stream.is_finished());
+        assert!(stream.try_append(0, &[1]));
+        stream.finish();
+        stream.report_timeout(0, 1);
+        assert!(stream.attribution(0, 1, &[], true).is_none());
+        drop(stream);
+        assert!(worker.reserve().is_some());
+    }
+
+    #[test]
+    fn words_reaching_past_a_span_keep_its_speaker_unless_another_speaker_is_there() {
+        let timeline = Timeline {
+            spans: vec![span("speaker_1", 0, 500), span("speaker_2", 600, 1_000)],
+            coverage: vec![(0, 1_000)],
+            ..Timeline::default()
+        };
+        let result = timeline
+            .attribute(
+                0,
+                1_000,
+                &[(450, 560), (450, 650), (590, 700), (100, 100)],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            result.words,
+            vec![
+                // Ends in the pause after its only speaker.
+                Some("speaker_1".into()),
+                // Straddles the turn: two speakers touch it.
+                None,
+                Some("speaker_2".into()),
+                // Zero-length timing stays unlabelled, as before.
+                None,
+            ]
+        );
+
+        // Simultaneous speakers leave a word unlabelled however the overlap splits.
+        let overlap = Timeline {
+            spans: vec![span("speaker_1", 0, 600), span("speaker_2", 400, 1_000)],
+            coverage: vec![(0, 1_000)],
+            ..Timeline::default()
+        };
+        let result = overlap
+            .attribute(0, 1_000, &[(450, 550), (350, 550), (100, 300)], false)
+            .unwrap();
+        assert_eq!(result.words, vec![None, None, Some("speaker_1".into())]);
+    }
+
+    #[test]
+    fn words_in_small_gaps_take_the_only_speaker_in_reach_within_one_coverage_interval() {
+        let timeline = Timeline {
+            spans: vec![
+                span("speaker_1", 0, 24_000),
+                span("speaker_2", 48_000, 72_000),
+            ],
+            coverage: vec![(0, 72_000)],
+            ..Timeline::default()
+        };
+        let result = timeline
+            .attribute(
+                0,
+                72_000,
+                &[(25_000, 26_000), (34_000, 38_000), (44_000, 46_000)],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            result.words,
+            vec![Some("speaker_1".into()), None, Some("speaker_2".into())]
+        );
+
+        // A short pause between two speakers belongs to neither.
+        let handoff = Timeline {
+            spans: vec![
+                span("speaker_1", 0, 24_000),
+                span("speaker_2", 28_000, 72_000),
+            ],
+            coverage: vec![(0, 72_000)],
+            ..Timeline::default()
+        };
+        let result = handoff
+            .attribute(0, 72_000, &[(25_000, 27_000)], false)
+            .unwrap();
+        assert_eq!(result.words, vec![None]);
+
+        // A capture gap starts a new speaker namespace: never label across it.
+        let gapped = Timeline {
+            spans: vec![
+                span("speaker_1", 0, 30_000),
+                span("speaker_5", 40_000, 72_000),
+            ],
+            coverage: vec![(0, 30_000), (31_000, 72_000)],
+            ..Timeline::default()
+        };
+        let result = gapped
+            .attribute(
+                0,
+                72_000,
+                &[(31_500, 32_000), (29_000, 32_000), (38_000, 39_000)],
+                true,
+            )
+            .unwrap();
+        assert_eq!(result.words, vec![None, None, Some("speaker_5".into())]);
+    }
+
+    #[test]
     fn joins_window_boundaries_and_preserves_discontinuities() {
         let mut timeline = Timeline::default();
         timeline.cover(0, 100);
@@ -691,8 +1006,8 @@ mod tests {
         timeline.push_span(span("speaker_1", 100, 170));
         timeline.push_span(span("speaker_9", 250, 390));
         assert_eq!(timeline.spans[0], span("speaker_1", 0, 170));
-        assert!(timeline.attribute(170, 270, &[]).is_none());
-        let recovered = timeline.attribute(255, 380, &[(300, 350)]).unwrap();
+        assert!(timeline.attribute(170, 270, &[], false).is_none());
+        let recovered = timeline.attribute(255, 380, &[(300, 350)], false).unwrap();
         assert_eq!(recovered.speaker, Some("speaker_9".into()));
     }
 
@@ -705,17 +1020,79 @@ mod tests {
         timeline.retain_last(100);
         timeline.cover(200, 230);
         assert_eq!(timeline.coverage, vec![(100, 230)]);
-        assert!(timeline.attribute(90, 110, &[]).is_none());
+        assert!(timeline.attribute(90, 110, &[], false).is_none());
         assert_eq!(
-            timeline.attribute(100, 230, &[]).unwrap().speaker_spans,
+            timeline
+                .attribute(100, 230, &[], false)
+                .unwrap()
+                .speaker_spans,
             vec![span("speaker_2", 100, 150)]
         );
-        assert!(timeline.attribute(120, 120, &[]).is_none());
+        assert!(timeline.attribute(120, 120, &[], false).is_none());
 
         timeline.cover(1_000_000, 1_000_010);
         timeline.retain_last(100);
         assert_eq!(timeline.coverage, vec![(140, 230), (1_000_000, 1_000_010)]);
-        assert!(timeline.attribute(140, 150, &[]).is_some());
+        assert!(timeline.attribute(140, 150, &[], false).is_some());
+    }
+
+    #[test]
+    fn a_hole_the_diarizer_has_passed_is_reported_without_waiting() {
+        let mut timeline = Timeline::default();
+        timeline.cover(0, 100);
+        timeline.push_span(span("speaker_1", 0, 100));
+        // The caption runs past everything decided so far: its labels may still come.
+        assert!(!timeline.decided_past(250));
+        // Audio from 100 to 200 never reached the diarizer, which has now decided
+        // past the caption. Waiting out the deadline could not fill the hole.
+        timeline.cover(200, 300);
+        timeline.push_span(span("speaker_5", 200, 300));
+        assert!(timeline.decided_past(250));
+        let result = timeline.attribute(50, 250, &[(60, 90), (120, 150)], true);
+        let result = result.unwrap();
+        assert_eq!(result.partial_coverage, Some(vec![(50, 100), (200, 250)]));
+        assert_eq!(result.words, vec![Some("speaker_1".into()), None]);
+        assert_eq!(result.speaker, None);
+        // A caption still ahead of the diarizer keeps waiting.
+        assert!(!timeline.decided_past(350));
+    }
+
+    #[test]
+    fn partial_coverage_does_not_bridge_gaps_or_label_crossing_words() {
+        let timeline = Timeline {
+            coverage: vec![(100, 150), (175, 230)],
+            spans: vec![span("speaker_1", 100, 230), span("speaker_2", 190, 200)],
+            ..Timeline::default()
+        };
+        let result = timeline
+            .attribute(
+                110,
+                220,
+                &[(120, 125), (140, 180), (185, 195), (201, 210)],
+                true,
+            )
+            .unwrap();
+        assert_eq!(result.partial_coverage, Some(vec![(110, 150), (175, 220)]));
+        assert_eq!(result.speaker, None);
+        assert_eq!(
+            result.words,
+            vec![
+                Some("speaker_1".into()),
+                None,
+                None,
+                Some("speaker_1".into())
+            ]
+        );
+        assert_eq!(
+            result.speaker_spans,
+            vec![
+                span("speaker_1", 110, 150),
+                span("speaker_1", 175, 220),
+                span("speaker_2", 190, 200)
+            ]
+        );
+        assert!(timeline.attribute(155, 170, &[], true).is_none());
+        assert!(timeline.attribute(110, 220, &[], false).is_none());
     }
 
     #[test]
@@ -726,7 +1103,7 @@ mod tests {
             ..Timeline::default()
         };
         let result = timeline
-            .attribute(10, 280, &[(10, 30), (80, 120), (200, 250)])
+            .attribute(10, 280, &[(10, 30), (80, 120), (200, 250)], false)
             .unwrap();
         assert_eq!(result.speaker, None);
         assert_eq!(
@@ -738,10 +1115,16 @@ mod tests {
             vec![span("speaker_1", 10, 200), span("speaker_2", 100, 280)]
         );
         assert_eq!(
-            timeline.attribute(20, 90, &[(20, 90)]).unwrap().speaker,
+            timeline
+                .attribute(20, 90, &[(20, 90)], false)
+                .unwrap()
+                .speaker,
             Some("speaker_1".into())
         );
-        assert_eq!(timeline.attribute(20, 90, &[]).unwrap().speaker, None);
-        assert!(timeline.attribute(20, 400, &[(20, 40)]).is_none());
+        assert_eq!(
+            timeline.attribute(20, 90, &[], false).unwrap().speaker,
+            None
+        );
+        assert!(timeline.attribute(20, 400, &[(20, 40)], false).is_none());
     }
 }

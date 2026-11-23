@@ -70,6 +70,8 @@ impl LevelMeter {
     }
 
     pub(crate) fn push(&mut self, sample: f32) {
+        // A nonfinite sample must not poison the filter for the rest of the track.
+        let sample = if sample.is_finite() { sample } else { 0.0 };
         self.previous_output = sample - self.previous_input + self.pole * self.previous_output;
         self.previous_input = sample;
         self.energy += f64::from(self.previous_output).powi(2);
@@ -266,16 +268,14 @@ pub(crate) fn percentile(values: &mut [f32], fraction: f32) -> f32 {
 /// silent.
 pub(crate) fn masks(levels: &[Vec<f32>], starts: &[f32]) -> Vec<Mask> {
     let tracks = levels.len();
-    let offsets = starts
+    let offsets = levels
         .iter()
-        .map(|&start| (start.max(0.0) * FRAMES_PER_SECOND).round() as usize)
+        .enumerate()
+        .map(|(track, values)| {
+            let start = starts.get(track).copied().unwrap_or_default();
+            ((start.max(0.0) * FRAMES_PER_SECOND).round() as usize).min(usize::MAX - values.len())
+        })
         .collect::<Vec<_>>();
-    let frames = levels
-        .iter()
-        .zip(&offsets)
-        .map(|(track, offset)| offset + track.len())
-        .max()
-        .unwrap_or(0);
     // By session frame.
     let level = |track: usize, frame: usize| {
         frame
@@ -304,10 +304,11 @@ pub(crate) fn masks(levels: &[Vec<f32>], starts: &[f32]) -> Vec<Mask> {
     // frames where that speaker leads. Measured from the bleed itself, this absorbs mic gains,
     // distances, and loud or soft talkers alike.
     let mut differences = vec![vec![Vec::new(); tracks]; tracks];
-    for frame in 0..frames {
-        for leader in 0..tracks {
-            let value = level(leader, frame);
-            if active(leader, frame)
+    // Visit recorded frames only. Restarted recordings may have large gaps.
+    for (leader, values) in levels.iter().enumerate() {
+        for (local_frame, &value) in values.iter().enumerate() {
+            let frame = offsets[leader] + local_frame;
+            if value > floors[leader] + ACTIVE_DB
                 && (0..tracks)
                     .all(|other| other == leader || value >= level(other, frame) + MARGIN_DB)
             {
@@ -420,6 +421,23 @@ mod tests {
     use super::*;
 
     const RATE: usize = TARGET_SAMPLE_RATE as usize;
+
+    #[test]
+    fn meter_recovers_after_a_nonfinite_sample() {
+        let mut samples = vec![0.0; FRAME_SAMPLES * 2];
+        samples[0] = f32::NAN;
+        samples[FRAME_SAMPLES] = 1.0;
+        let levels = frame_levels(&samples);
+        assert_eq!(levels[0], SILENCE_DB);
+        assert!(levels[1] > LOWEST_FLOOR_DB);
+    }
+
+    #[test]
+    fn widely_separated_tracks_keep_their_own_audio() {
+        let track = vec![-60.0, -60.0, -10.0];
+        let masks = masks(&[track.clone(), track], &[0.0, f32::MAX]);
+        assert!(masks.iter().all(|mask| mask.muted == [false; 3]));
+    }
 
     #[test]
     fn long_muted_stretches_are_cut_and_words_put_back() {

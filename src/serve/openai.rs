@@ -11,13 +11,14 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{sleep, timeout},
+    time::{Instant, MissedTickBehavior, interval_at, sleep, timeout},
 };
 
 use super::{
     AppState,
     pipeline::{
-        PipelineEvent, PipelineUpdate, QueueError, RecognitionWorker, TrackHandle, TrackSettings,
+        MAX_QUEUED_FRAMES, PipelineEvent, PipelineUpdate, QueueError, RecognitionWorker,
+        TrackHandle, TrackSettings,
     },
     recognizer::{Capabilities, RecognitionOptions},
 };
@@ -248,6 +249,16 @@ fn audio(value: &Value) -> Result<Vec<i16>, ClientError> {
     let encoded = value
         .as_str()
         .ok_or_else(|| ClientError::invalid("audio", "Expected base64 PCM16 audio"))?;
+    // Reject oversized appends before allocating decoded bytes and PCM samples.
+    const MAX_PCM_BYTES: usize = MAX_QUEUED_FRAMES * 2;
+    if encoded.len() > MAX_PCM_BYTES.div_ceil(3) * 4
+        || encoded.trim_end_matches('=').len() > (MAX_PCM_BYTES * 4).div_ceil(3)
+    {
+        return Err(ClientError::invalid(
+            "audio",
+            "An append can carry at most 2 seconds of audio",
+        ));
+    }
     decode_pcm(encoded).map_err(|error| {
         let message = match error {
             PcmError::Base64 => "Invalid base64 audio",
@@ -258,13 +269,36 @@ fn audio(value: &Value) -> Result<Vec<i16>, ClientError> {
 }
 
 const MAX_TURN_FRAMES: u64 = 60 * 24_000;
+// The recognition queue counts messages as well as frames. Short appends are
+// combined into the worker's 100 ms quantum so that its two seconds of audio,
+// not 32 small packets, is the bound a stalled worker reaches.
+const COALESCE_FRAMES: usize = 2_400;
+// A peer that vanishes without closing the connection would otherwise hold its
+// session slot until the server restarts.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_PENDING_TURNS: usize = 64;
 const OUTBOUND_EVENTS: usize = 64;
 pub(super) const SLOW_READER: u16 = 4008;
 
+/// The limits a standard connection enforces, for clients to discover.
+pub(super) fn limits() -> Value {
+    json!({
+        "sample_rate": 24_000,
+        "max_message_bytes": super::MAX_MESSAGE_BYTES,
+        "max_append_frames": MAX_QUEUED_FRAMES,
+        "max_uncommitted_frames": MAX_TURN_FRAMES,
+        "max_pending_turns": MAX_PENDING_TURNS,
+        "ping_interval_ms": PING_INTERVAL.as_millis() as u64,
+        "idle_timeout_ms": IDLE_TIMEOUT.as_millis() as u64,
+    })
+}
+
 #[derive(Default)]
 struct Turn {
     frames: u64,
+    // Frames handed to the recognition queue. The rest wait in `Session::carry`.
+    queued: u64,
     stable: String,
     failed: bool,
 }
@@ -280,6 +314,7 @@ struct Session {
     actual_model: String,
     worker: RecognitionWorker,
     track: TrackHandle,
+    carry: Vec<i16>,
 }
 
 impl Session {
@@ -300,6 +335,7 @@ impl Session {
             capabilities,
             actual_model: model.to_owned(),
             worker,
+            carry: Vec::new(),
         }
     }
 
@@ -397,24 +433,52 @@ impl Session {
             (id, Turn::default())
         });
         let id = *id;
-        let start = turn.frames;
         turn.frames += samples.len() as u64;
-        let failure = if turn.frames > MAX_TURN_FRAMES {
-            Some((
+        if turn.frames > MAX_TURN_FRAMES {
+            turn.failed = true;
+            self.carry.clear();
+            let _ = self.track.clear(id);
+            return Some(failed(
+                self.id,
+                id,
                 "input_audio_buffer_limit",
                 "Uncommitted audio exceeded the 60-second limit",
-            ))
+            ));
+        }
+        // Joined to the carry, a long append could exceed what an idle queue accepts.
+        if self.carry.len() + samples.len() > MAX_QUEUED_FRAMES
+            && let Some(failure) = self.flush()
+        {
+            return Some(failure);
+        }
+        if self.carry.is_empty() {
+            self.carry = samples;
         } else {
-            self.track.append(start, samples, id).err().map(queue_error)
-        };
-        failure.map(|(code, message)| {
-            turn.failed = true;
-            let _ = self.track.clear(id);
-            failed(self.id, id, code, message)
-        })
+            self.carry.extend(samples);
+        }
+        (self.carry.len() >= COALESCE_FRAMES)
+            .then(|| self.flush())
+            .flatten()
+    }
+
+    /// Queues the carried audio of the active turn. Returns the failure event if
+    /// the queue refuses it.
+    fn flush(&mut self) -> Option<Value> {
+        let samples = std::mem::take(&mut self.carry);
+        let (id, turn) = self.active.as_mut()?;
+        if samples.is_empty() || turn.failed {
+            return None;
+        }
+        let start = turn.queued;
+        turn.queued += samples.len() as u64;
+        let (code, message) = queue_error(self.track.append(start, samples, *id).err()?);
+        turn.failed = true;
+        let _ = self.track.clear(*id);
+        Some(failed(self.id, *id, code, message))
     }
 
     fn clear(&mut self) {
+        self.carry.clear();
         if let Some((id, turn)) = self.active.take()
             && !turn.failed
         {
@@ -423,6 +487,7 @@ impl Session {
     }
 
     fn commit(&mut self) -> Result<Vec<Value>, ClientError> {
+        let unqueued = self.flush();
         let (id, turn) = self.active.take().ok_or_else(|| {
             ClientError::new(
                 "input_audio_buffer_commit_empty",
@@ -447,7 +512,9 @@ impl Session {
                 },
             }),
         ];
-        if !turn.failed {
+        if let Some(failure) = unqueued {
+            events.push(failure);
+        } else if !turn.failed {
             let committed = if self.pending.len() >= MAX_PENDING_TURNS {
                 Err(QueueError::Full)
             } else {
@@ -587,6 +654,15 @@ fn queue_error(error: QueueError) -> (&'static str, &'static str) {
 }
 
 pub(super) async fn run(socket: WebSocket, state: Arc<AppState>) {
+    run_with_liveness(socket, state, PING_INTERVAL, IDLE_TIMEOUT).await;
+}
+
+pub(super) async fn run_with_liveness(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    ping_interval: Duration,
+    idle_timeout: Duration,
+) {
     let (sink, mut incoming) = socket.split();
     let (outbound, events) = mpsc::channel(OUTBOUND_EVENTS);
     let (close, closing) = oneshot::channel();
@@ -595,14 +671,22 @@ pub(super) async fn run(socket: WebSocket, state: Arc<AppState>) {
     let mut shutdown = state.shutdown.clone();
     let drain_deadline = sleep(Duration::from_secs(8));
     tokio::pin!(drain_deadline);
+    let mut heartbeat = interval_at(Instant::now() + ping_interval, ping_interval);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_heard = Instant::now();
 
     let mut output = vec![session.session_event("session.created")];
     let mut draining = false;
+    // Replies to the client's own messages wait for the writer, which holds back
+    // further reads. Buffered commands are parsed faster than replies are written,
+    // so a count limit would disconnect a client that is reading normally.
+    let mut replying = false;
     loop {
-        if !send_events(&outbound, &mut output, draining).await {
+        if !send_events(&outbound, &mut output, draining || replying).await {
             let _ = close.send(WriterEnd::SlowReader);
             break;
         }
+        replying = false;
         if draining && session.pending.is_empty() {
             break;
         }
@@ -616,7 +700,7 @@ pub(super) async fn run(socket: WebSocket, state: Arc<AppState>) {
             }
             _ = shutdown.changed(), if !draining => {
                 draining = true;
-                drain_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(8));
+                drain_deadline.as_mut().reset(Instant::now() + Duration::from_secs(8));
                 output.extend(session.shutdown());
             }
             update = session.track.recv() => {
@@ -637,7 +721,16 @@ pub(super) async fn run(socket: WebSocket, state: Arc<AppState>) {
                     }
                 }
             }
+            _ = heartbeat.tick(), if !draining => {
+                // Any frame counts, including the pong a live peer returns.
+                if last_heard.elapsed() >= idle_timeout {
+                    break;
+                }
+                let _ = outbound.try_send(Message::Ping(Default::default()));
+            }
             message = incoming.next() => {
+                last_heard = Instant::now();
+                replying = true;
                 match message {
                     Some(Ok(Message::Text(text))) if !draining => output = session.handle_message(&text),
                     Some(Ok(Message::Binary(_))) if !draining => {
@@ -647,7 +740,24 @@ pub(super) async fn run(socket: WebSocket, state: Arc<AppState>) {
                         let _ = close.send(WriterEnd::PeerClose);
                         break;
                     }
-                    Some(Err(_)) | None => break,
+                    Some(Err(error)) => {
+                        // The socket cannot be read past a refused frame. Explain the
+                        // close through the writer's queue, after the earlier events.
+                        if let Some(failure) = super::frame_failure(&error) {
+                            let mut events = vec![
+                                ClientError::new(failure.code, "", failure.message).wire(None),
+                            ];
+                            if send_events(&outbound, &mut events, true).await {
+                                let frame = CloseFrame {
+                                    code: failure.close_code,
+                                    reason: failure.reason.into(),
+                                };
+                                let _ = outbound.send(Message::Close(Some(frame))).await;
+                            }
+                        }
+                        break;
+                    }
+                    None => break,
                     Some(Ok(_)) => {}
                 }
             }
@@ -661,14 +771,15 @@ pub(super) async fn run(socket: WebSocket, state: Arc<AppState>) {
 async fn send_events(
     outbound: &mpsc::Sender<Message>,
     events: &mut Vec<Value>,
-    draining: bool,
+    wait: bool,
 ) -> bool {
     for mut event in events.drain(..) {
         event["event_id"] = json!(format!("event_{}", next_id()));
         let message = Message::Text(event.to_string().into());
         // Shutdown or worker loss can fail every outstanding turn in one batch.
-        // Give the bounded writer time to deliver those terminal events.
-        let sent = if draining {
+        // Give the bounded writer time to deliver those terminal events. The
+        // writer's own deadline ends the wait for a reader that has stalled.
+        let sent = if wait {
             outbound.send(message).await.is_ok()
         } else {
             outbound.try_send(message).is_ok()
@@ -685,6 +796,8 @@ enum WriterEnd {
     PeerClose,
     SlowReader,
     Disconnected,
+    // The session queued its own close frame, which has been sent.
+    Closed,
 }
 
 async fn write_events(
@@ -694,7 +807,9 @@ async fn write_events(
 ) {
     let delivery = async {
         while let Some(event) = events.recv().await {
+            let closing = matches!(event, Message::Close(_));
             match timeout(Duration::from_secs(2), sink.send(event)).await {
+                Ok(Ok(())) if closing => return WriterEnd::Closed,
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return WriterEnd::Disconnected,
                 Err(_) => return WriterEnd::SlowReader,
@@ -709,6 +824,7 @@ async fn write_events(
     };
     let _ = timeout(Duration::from_millis(250), async {
         let (code, reason) = match end {
+            WriterEnd::Closed => return,
             WriterEnd::PeerClose | WriterEnd::Disconnected => {
                 // The WebSocket queues the peer's echo. A cancelled send may
                 // still occupy SplitSink's slot and fail before that flush.
@@ -869,6 +985,22 @@ mod tests {
         assert!(audio(&json!("AA==")).is_err());
         assert!(audio(&json!("#")).is_err());
     }
+    #[test]
+    fn accepts_exactly_two_seconds_and_rejects_larger_appends() {
+        let mut bytes = vec![0; MAX_QUEUED_FRAMES * 2];
+        assert_eq!(
+            audio(&json!(STANDARD.encode(&bytes))).unwrap().len(),
+            MAX_QUEUED_FRAMES
+        );
+        bytes.extend([0, 0]);
+        let error = audio(&json!(STANDARD.encode(bytes))).unwrap_err();
+        assert_eq!(error.param, "audio");
+        assert_eq!(
+            error.message,
+            "An append can carry at most 2 seconds of audio"
+        );
+    }
+
     struct UnusedRecognizer;
 
     impl super::super::recognizer::Recognizer for UnusedRecognizer {

@@ -1,0 +1,282 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Transcriberrr recorded session manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "job_id",
+    "fingerprint",
+    "output",
+    "tracks"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "job_id": {
+      "$ref": "#/$defs/string"
+    },
+    "fingerprint": {
+      "$ref": "#/$defs/string"
+    },
+    "engine": {
+      "enum": [
+        "qwen3",
+        "qwen",
+        "parakeet-v3",
+        "parakeet",
+        "apple-native",
+        "apple",
+        null
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "language": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expected_speakers": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 8
+    },
+    "diarization": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Defaults to enabled for mixed tracks when the selected engine and build support diarization."
+    },
+    "output": {
+      "$ref": "#/$defs/string"
+    },
+    "tracks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/track"
+      }
+    }
+  },
+  "$defs": {
+    "string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "time": {
+      "type": "object",
+      "required": [
+        "numerator",
+        "denominator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "numerator": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        "denominator": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "required": [
+        "origin",
+        "session_start"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "stream_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "origin": {
+          "$ref": "#/$defs/time"
+        },
+        "session_start": {
+          "$ref": "#/$defs/time"
+        }
+      }
+    },
+    "track": {
+      "type": "object",
+      "required": [
+        "track_id",
+        "source_id",
+        "binding",
+        "name",
+        "role",
+        "recognize",
+        "start_frame"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "track_id": {
+          "$ref": "#/$defs/string"
+        },
+        "source_id": {
+          "$ref": "#/$defs/string"
+        },
+        "stream_evidence": {},
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "channel": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "name": {
+          "$ref": "#/$defs/string"
+        },
+        "role": {
+          "enum": [
+            "isolated_mic",
+            "mixed_audio",
+            "unknown"
+          ]
+        },
+        "speaker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recognize": {
+          "type": "boolean"
+        },
+        "start_frame": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        "audio": {
+          "$ref": "#/$defs/path"
+        },
+        "result": {
+          "$ref": "#/$defs/path"
+        },
+        "activity": {
+          "$ref": "#/$defs/path"
+        },
+        "recognition_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unavailable": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "reuse": {
+          "type": "boolean",
+          "default": false
+        },
+        "shared_cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/shared_cache"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "source_snapshot": {
+      "type": "object",
+      "required": [
+        "path",
+        "stat_values"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/string"
+        },
+        "stat_values": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "shared_cache": {
+      "type": "object",
+      "required": [
+        "source",
+        "write",
+        "restart"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/source_snapshot"
+        },
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_snapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "directory": {
+          "$ref": "#/$defs/path"
+        },
+        "write": {
+          "type": "boolean"
+        },
+        "restart": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

@@ -109,6 +109,7 @@ struct QueueScope: Equatable {
         case .failure: return []
         case nil: regex = nil
         }
+        if status == .all, literal.isEmpty, regex == nil { return rows }
         return rows.filter { row in
             guard status == .all || row.status == status else { return false }
             if let regex {
@@ -206,9 +207,18 @@ private struct QueueRow: Identifiable {
     var detailIsError = false
     var isChild = false
     var progress: Double?
-    /// Candidate transcripts, preferred first; existence is checked only when acted on.
-    var transcripts: [URL] = []
-    var transcript: URL? { transcripts.first { FileManager.default.fileExists(atPath: $0.path) } }
+    private var mergedTranscript: URL?
+    var transcript: URL? {
+        func exists(_ url: URL) -> Bool {
+            var directory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &directory) && !directory.boolValue
+        }
+        if let mergedTranscript, exists(mergedTranscript) { return mergedTranscript }
+        guard case .recording = id, let item = items.first else { return nil }
+        if let output = item.outputURL, exists(output) { return output }
+        return item.modelOutputs.sorted { ($0.tag, $0.path) > ($1.tag, $1.path) }
+            .lazy.map { URL(fileURLWithPath: $0.path) }.first(where: exists)
+    }
     /// The source file or folder to reveal in Finder.
     var source: URL?
 
@@ -259,10 +269,6 @@ private struct QueueRow: Identifiable {
         items = isChild ? [] : [item]
         children = []
         progress = item.state == .processing && !state.activePassUsesApple ? item.progress : nil
-        if !isChild {
-            transcripts = [item.outputURL].compactMap { $0 }
-                + item.modelOutputs.sorted { ($0.tag, $0.path) > ($1.tag, $1.path) }.map { URL(fileURLWithPath: $0.path) }
-        }
     }
 
     init(meeting: ZoomMeeting, tracks: [AudioItem], state: AppState) {
@@ -295,7 +301,7 @@ private struct QueueRow: Identifiable {
             progress = speakers.reduce(0) { $0 + ($1.state == .done ? 1 : $1.progress) } / Double(speakers.count)
         }
         if result?.state == "done", let path = result?.id {
-            transcripts = [URL(fileURLWithPath: path)]
+            mergedTranscript = URL(fileURLWithPath: path)
         }
         if let folder = tracks.first?.url.deletingLastPathComponent() {
             source = folder.lastPathComponent.caseInsensitiveCompare("Audio Record") == .orderedSame
@@ -320,7 +326,7 @@ private struct QueueRow: Identifiable {
         items = []
         children = []
         if session.state == "done" {
-            transcripts = [URL(fileURLWithPath: session.id)]
+            mergedTranscript = URL(fileURLWithPath: session.id)
         }
     }
 

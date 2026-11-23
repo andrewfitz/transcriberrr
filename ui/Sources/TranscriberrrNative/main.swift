@@ -103,6 +103,7 @@ enum NativeError: LocalizedError {
     case assetsNotInstalled
     case unsupportedDiarization
     case missingTimestamps
+    case outputIsInput
 
     var errorDescription: String? {
         switch self {
@@ -116,6 +117,8 @@ enum NativeError: LocalizedError {
             return "Apple SpeechTranscriber assets are not installed. Run once without --offline to install them."
         case .missingTimestamps:
             return "Apple SpeechTranscriber returned text without word timestamps"
+        case .outputIsInput:
+            return "Choose a transcript output path different from the input recording"
         case .unsupportedDiarization:
             return "Apple SpeechTranscriber does not provide speaker diarization; use the Qwen engine with --diarize"
         }
@@ -127,6 +130,10 @@ struct TranscriberrrNative {
     static func main() async {
         do {
             let arguments = Array(CommandLine.arguments.dropFirst())
+            if arguments == ["--help"] || arguments == ["-h"] {
+                print(NativeError.usage.localizedDescription)
+                return
+            }
             if arguments.first == "stream" || arguments == ["--stream-supported"] {
                 guard #available(macOS 26.0, *) else { throw NativeError.unavailable }
                 switch arguments {
@@ -145,6 +152,14 @@ struct TranscriberrrNative {
                 return
             }
             let (input, output, format, timestamps, offline) = try parseArguments()
+            if let output {
+                var source = stat()
+                var destination = stat()
+                if stat(input.path, &source) == 0, stat(output.path, &destination) == 0,
+                   source.st_dev == destination.st_dev, source.st_ino == destination.st_ino {
+                    throw NativeError.outputIsInput
+                }
+            }
             guard #available(macOS 26.0, *) else { throw NativeError.unavailable }
             let transcript = try await transcribe(input: input, offline: offline)
             let data = try render(transcript: transcript, format: format, timestamps: timestamps)
@@ -219,7 +234,9 @@ struct TranscriberrrNative {
                     index += 1
                     output += "\(index)\n"
                 }
-                output += "\(timestamp(start, format: format)) --> \(timestamp(end, format: format))\n\(cueText)\n\n"
+                let first = UInt64((max(0, start) * 1000).rounded())
+                let last = max(first + 1, UInt64((max(0, end) * 1000).rounded()))
+                output += "\(timestamp(first, format: format)) --> \(timestamp(last, format: format))\n\(cueText)\n\n"
             }
             for segment in transcript.segments {
                 if timestamps == .words {
@@ -234,8 +251,7 @@ struct TranscriberrrNative {
         }
     }
 
-    private static func timestamp(_ seconds: Double, format: OutputFormat) -> String {
-        let milliseconds = UInt64((max(0, seconds) * 1000.0).rounded())
+    private static func timestamp(_ milliseconds: UInt64, format: OutputFormat) -> String {
         let hours = milliseconds / 3_600_000
         let minutes = (milliseconds % 3_600_000) / 60_000
         let secondsPart = (milliseconds % 60_000) / 1000
@@ -314,7 +330,8 @@ struct TranscriberrrNative {
                 guard !text.isEmpty else { continue }
                 if firstRun, let previous = words.last,
                    previous.text.last?.isWhitespace == false,
-                   text.first?.isWhitespace == false {
+                   let first = text.first, !first.isWhitespace,
+                   !".,!?;:%)]}’”…。？！".contains(first) {
                     text = " " + text
                 }
                 firstRun = false
@@ -347,7 +364,8 @@ struct TranscriberrrNative {
                 ))
             }
         }
-        if !pendingPrefix.isEmpty { throw NativeError.missingTimestamps }
+        // Whitespace-only results have no timed words (for example, a silent file).
+        if pendingPrefix.contains(where: { !$0.isWhitespace }) { throw NativeError.missingTimestamps }
         return words
     }
 
