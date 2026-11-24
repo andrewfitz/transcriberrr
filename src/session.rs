@@ -21,6 +21,7 @@ use std::sync::atomic::Ordering;
 mod native_result;
 mod numbers;
 mod reconcile;
+mod repeated_word;
 pub(crate) mod shared_cache;
 pub(crate) use native_result::NativeResult;
 use reconcile::reconcile;
@@ -412,7 +413,7 @@ pub(crate) fn run(mut cli: Cli, args: SessionArgs) -> Result<()> {
         configure_model(&mut cli);
         cli.offline = !args.download;
         let _cache_claims = shared_cache::hydrate(&cli, &args, &mut manifest)?;
-        let outcomes = execute_tracks(&cli, &args, &manifest)?;
+        let mut outcomes = execute_tracks(&cli, &args, &manifest)?;
         check_cancelled()?;
         if manifest.tracks.iter().any(|track| track.recognize)
             && !outcomes
@@ -424,6 +425,15 @@ pub(crate) fn run(mut cli: Cli, args: SessionArgs) -> Result<()> {
                 .find_map(|outcome| outcome.error.as_deref())
                 .unwrap_or("no selected track produced a recognition artifact");
             anyhow::bail!("all selected tracks failed: {reason}");
+        }
+        // Apply the same acoustic check to new and reused recognition. The cached raw
+        // readings remain available if the track is later classified as a mixed recording.
+        for (track, outcome) in manifest.tracks.iter().zip(&mut outcomes) {
+            if track.role == Role::IsolatedMic
+                && let Some(artifact) = &mut outcome.artifact
+            {
+                repeated_word::remove_decay_repeats(&mut artifact.words, &artifact.activity);
+            }
         }
         let result = reconcile(&manifest, &outcomes)?;
         publish(&manifest.output, &result)?;

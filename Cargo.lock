@@ -9182,6 +9182,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "miniz_oxide 0.9.1",
  "mp4-atom",
  "ndarray 0.17.2",
  "parakeet-rs",

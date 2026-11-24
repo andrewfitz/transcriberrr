@@ -9,7 +9,12 @@ use std::io::{BufReader, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+mod exchange;
+
 const ALIGNER: &str = "Qwen/Qwen3-ForcedAligner-0.6B";
+
+/// The highest exchange file version this build reads, as `capabilities` reports it.
+pub(crate) const EXCHANGE_VERSION: u8 = exchange::VERSION;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,8 +25,12 @@ pub(super) struct Descriptor {
     directory: Option<PathBuf>,
     write: bool,
     restart: bool,
+    /// The version 1 file. The current version has the same name with its own extension.
     #[serde(skip)]
     exchange: Option<PathBuf>,
+    /// The highest exchange version that the MPCut sharing the folder reads.
+    #[serde(skip)]
+    reader_version: u8,
     #[serde(skip)]
     model_revisions: Vec<(String, String)>,
     #[serde(skip)]
@@ -152,13 +161,7 @@ struct Provenance {
 }
 
 fn artifacts_digest(result: &[u8], activity: Option<&[u8]>) -> String {
-    let mut hash = DigestContext::new(&SHA256);
-    hash.update(result);
-    hash.update(&[0]);
-    if let Some(activity) = activity {
-        hash.update(activity);
-    }
-    hex(hash.finish().as_ref())
+    hex(&exchange::digest(result, activity))
 }
 
 fn provenance_path(track: &Track) -> Result<PathBuf> {
@@ -345,6 +348,7 @@ pub(super) fn hydrate(cli: &Cli, args: &SessionArgs, manifest: &mut Manifest) ->
             let id = hash(format!("{scope}\0{key}").as_bytes());
             let lock_path = directory.join(&id);
             let exchange = directory.join(format!("{id}.json"));
+            descriptor.reader_version = exchange::reader_version(directory);
             descriptor.exchange = Some(exchange);
             paths.push(lock_path);
         }
@@ -403,8 +407,7 @@ pub(super) fn hydrate(cli: &Cli, args: &SessionArgs, manifest: &mut Manifest) ->
                 continue;
             }
             if let Some(path) = descriptor.exchange.as_deref()
-                && let Ok(bundle) = read_json_file::<Bundle>(path)
-                && let Ok((result, activity)) = validated_bundle(track, &bundle)
+                && let Some((result, activity)) = shared(track, path)
             {
                 let output = track
                     .result
@@ -420,11 +423,8 @@ pub(super) fn hydrate(cli: &Cli, args: &SessionArgs, manifest: &mut Manifest) ->
                 }
                 // The exchange may include levels even when this session only
                 // requested a transcript. Record exactly the files restored here.
-                let digest = if track.activity.is_none() && activity.is_some() {
-                    artifacts_digest(&result, None)
-                } else {
-                    bundle.digest
-                };
+                let restored = activity.as_deref().filter(|_| track.activity.is_some());
+                let digest = artifacts_digest(&result, restored);
                 save_provenance(track, settings, digest)?;
                 track.reuse = true;
                 continue;
@@ -469,6 +469,70 @@ fn validated_bundle(track: &Track, bundle: &Bundle) -> Result<(Vec<u8>, Option<V
         artifacts_digest(&result, activity.as_deref()) == bundle.digest,
         "cache artifact changed"
     );
+    validated_artifacts(track, result, activity)
+}
+
+fn validated_current(track: &Track, path: &Path) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    let (result, activity) = exchange::decode(&fs::read(path)?)?;
+    validated_artifacts(track, result, activity)
+}
+
+/// Either program may have written either version. A current file that is damaged or
+/// describes another recognition leaves the earlier one to answer.
+fn shared(track: &Track, legacy: &Path) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    validated_current(track, &legacy.with_extension(exchange::EXTENSION))
+        .or_else(|_| validated_bundle(track, &read_json_file::<Bundle>(legacy)?))
+        .ok()
+}
+
+/// Publishes a result in the version that MPCut reads, and leaves that one file. A result
+/// already shared stays the shared one: it is only written again, in version 1, for an
+/// MPCut that cannot read the version it is in.
+fn share(
+    track: &Track,
+    legacy: &Path,
+    reader_version: u8,
+    result: Vec<u8>,
+    activity: Option<Vec<u8>>,
+) -> Result<()> {
+    let current = legacy.with_extension(exchange::EXTENSION);
+    let reads_current = reader_version >= exchange::VERSION;
+    let existing = validated_current(track, &current).ok();
+    if (reads_current && existing.is_some())
+        || read_json_file::<Bundle>(legacy)
+            .and_then(|bundle| validated_bundle(track, &bundle))
+            .is_ok()
+    {
+        return Ok(());
+    }
+    if reads_current {
+        let file = exchange::encode(&result, activity.as_deref())?;
+        check_cancelled()?;
+        transcript::publish_atomic(&current, true, |writer| {
+            std::io::Write::write_all(writer, &file)
+        })?;
+        let _ = fs::remove_file(legacy);
+    } else {
+        let (result, activity) = existing.unwrap_or((result, activity));
+        let digest = artifacts_digest(&result, activity.as_deref());
+        publish(
+            legacy,
+            &Bundle {
+                result: STANDARD.encode(result),
+                activity: activity.map(|value| STANDARD.encode(value)),
+                digest,
+            },
+        )?;
+        let _ = fs::remove_file(current);
+    }
+    Ok(())
+}
+
+fn validated_artifacts(
+    track: &Track,
+    result: Vec<u8>,
+    activity: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let artifact: TrackArtifact = serde_json::from_slice(&result)?;
     validate_artifact(track, &artifact)?;
     if track.activity.is_some() {
@@ -507,21 +571,9 @@ pub(super) fn save(cli: &Cli, track: &Track, _artifact: &TrackArtifact) -> Resul
         validated_local(track)?;
         let (result, activity) = artifact_bytes(track)?;
         let digest = artifacts_digest(&result, activity.as_deref());
-        save_provenance(track, settings, digest.clone())?;
+        save_provenance(track, settings, digest)?;
         if let Some(path) = descriptor.exchange.as_deref().filter(|_| descriptor.write) {
-            if let Ok(bundle) = read_json_file::<Bundle>(path)
-                && validated_bundle(track, &bundle).is_ok()
-            {
-                return Ok(());
-            }
-            publish(
-                path,
-                &Bundle {
-                    result: STANDARD.encode(result),
-                    activity: activity.map(|value| STANDARD.encode(value)),
-                    digest,
-                },
-            )?;
+            share(track, path, descriptor.reader_version, result, activity)?;
         }
         Ok(())
     })();

@@ -39,6 +39,9 @@ candle-core = { version = "0.9", features = ["metal"] }
 ## every frame of a 40-run speech/noise battery; a new release could swap the weights.
 rustvani-vad = "=0.1.0"
 ring = "0.17"
+## Raw DEFLATE for the recognition exchange shared with MPCut, whose Compression framework
+## reads and writes the same streams (already in the dependency tree).
+miniz_oxide = "0.9"
 ## Pinned: each release generates its Burn graphs from specific ONNX exports. Bump it together
 ## with PARAKEET_RS_REVISION in src/model_cache.rs, then run examples/parakeet_parity.rs.
 parakeet-rs = { version = "=0.4.4", optional = true, default-features = false, features = ["burn", "metal"] }

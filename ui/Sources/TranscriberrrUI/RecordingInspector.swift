@@ -13,6 +13,8 @@ struct RecordingInspector: View {
     /// The selected row's status exactly as the queue shows it.
     var status: QueueRowStatus?
     @Binding var pane: InspectorPane
+    @State private var expandedSpeakerMeeting: String?
+    @State private var expandedSkippedMeeting: String?
     var editPasses: () -> Void
     var plannedOutputs: [PlannedTranscript]
     var planningOutputs: Bool
@@ -188,13 +190,20 @@ struct RecordingInspector: View {
     }
 
     private func speakerTracks(_ meeting: ZoomMeeting, items: [AudioItem]) -> some View {
-        Section("Speaker Tracks") {
-            LabeledContent("Participants", value: meeting.participants.formatted())
-            LabeledContent("Bleed reduction", value: "Automatic")
-            LabeledContent("Merge order", value: "By timestamp")
+        let tracks = items.filter { $0.skipReason == nil && $0.isoTrack }
+        return Section("Speaker Tracks") {
+            if tracks.isEmpty {
+                LabeledContent("Participants", value: meeting.participants.formatted())
+            } else if tracks.count > 4 {
+                detailsButton("All speaker recordings (\(tracks.count))", meeting: meeting.id, selection: $expandedSpeakerMeeting)
+                if expandedSpeakerMeeting == meeting.id { speakerFiles(tracks) }
+            } else {
+                speakerFiles(tracks)
+            }
             let skipped = items.filter { $0.skipReason != nil }
             if !skipped.isEmpty {
-                DisclosureGroup("Skipped Exports") {
+                detailsButton("Skipped Exports", meeting: meeting.id, selection: $expandedSkippedMeeting)
+                if expandedSkippedMeeting == meeting.id {
                     ForEach(skipped) { item in
                         VStack(alignment: .leading, spacing: 4) {
                             Text(item.url.lastPathComponent).font(.callout)
@@ -211,19 +220,53 @@ struct RecordingInspector: View {
         }
     }
 
+    private func detailsButton(_ title: String, meeting: String, selection: Binding<String?>) -> some View {
+        let expanded = selection.wrappedValue == meeting
+        return Button {
+            selection.wrappedValue = expanded ? nil : meeting
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    .frame(width: 10)
+                Text(title)
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+    }
+
+    private func speakerFiles(_ tracks: [AudioItem]) -> some View {
+        ForEach(tracks) { track in
+            let filename = track.url.lastPathComponent
+            VStack(alignment: .leading, spacing: 2) {
+                Text(track.speakerName ?? filename).fontWeight(.medium)
+                if track.speakerName != nil {
+                    Text(filename).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+            }
+            .help(track.url.path)
+        }
+    }
+
     private func trackSettings(_ item: AudioItem) -> some View {
         Section("Track Settings") {
-            Toggle("Speaker track", isOn: Binding(
+            Toggle("Single-speaker recording", isOn: Binding(
                 get: { item.isoTrack },
                 set: { state.setIsoTrack(for: item, enabled: $0) }
             ))
             .help("Use for audio containing one speaker. Tracks from the same recording session are merged.")
-            Toggle("Diarize track", isOn: Binding(
-                get: { item.diarize },
-                set: { state.setDiarization(for: item, enabled: $0) }
-            ))
-            .disabled(item.isoTrack)
-            if item.diarize {
+            if !item.isoTrack {
+                Toggle("Identify speakers in mixed audio", isOn: Binding(
+                    get: { item.diarize },
+                    set: { state.setDiarization(for: item, enabled: $0) }
+                ))
+            }
+            if item.diarize && !item.isoTrack {
                 Picker("Speakers", selection: Binding(
                     get: { item.speakerCount ?? 0 },
                     set: { state.setSpeakerCount(for: item, $0 == 0 ? nil : $0) }

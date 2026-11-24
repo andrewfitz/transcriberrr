@@ -1086,6 +1086,7 @@ fn print_capabilities() -> Result<()> {
     write_json_line(&serde_json::json!({
         "schema_version": CLI_SCHEMA_VERSION, "version": env!("CARGO_PKG_VERSION"),
         "cache_revision": session::shared_cache::provider_revision(),
+        "shared_cache_exchange_version": session::shared_cache::EXCHANGE_VERSION,
         "platform": "macos-arm64", "engines": engines, "models": model_cache::SUPPORTED_MODELS,
         "session_schema_version": session::VERSION,
         "session": {"schema_version": session::VERSION, "speaker_limit": session::diarization_limit(),
